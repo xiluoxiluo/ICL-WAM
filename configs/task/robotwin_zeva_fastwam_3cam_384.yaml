@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - override /data: robotwin
+  - override /model: zeva_fastwam
+  - _self_
+
+batch_size: 16
+num_workers: 8
+lr_scheduler_type: cosine
+learning_rate: 2.0e-4
+weight_decay: 0.0
+max_steps: 10000
+num_epochs: 1
+device: null
+gradient_accumulation_steps: 1
+log_every: 10
+save_every: 2500
+eval_every: 100000000

@@ -1,0 +1,44 @@
+defaults:
+  - fastwam
+  - _self_
+
+zeva:
+  enabled: true
+  action_only: true
+  freeze_fastwam: true
+  freeze_cte_stage2: true
+  cte:
+    checkpoint: null
+    action_dim: 14
+    action_group_size: 4
+    phase_dim: 128
+    effect_dim: 128
+  memory:
+    bit_size: 4
+    pim_top_k: 4
+    pim_max_entries: 256
+    # Provisional V1 default; tune/replace after reproducing the official
+    # Zeva merge threshold on held-out fixed-seed episodes.
+    merge_threshold: 0.85
+    beta_phase: 0.5
+    beta_effect: 0.5
+  prompt:
+    global_dim: 256
+    phase_dim: 128
+    effect_dim: 128
+    brief_length: 4
+    persistent_length: 4
+    hidden_dim: 256
+    num_heads: 4
+  adapter:
+    memory_dim: 256
+    action_horizon: 32
+    action_hidden_dim: 1024
+    num_heads: 8
+    mlp_ratio: 2.0
+    gate_init: 0.0
+    train_gate_epsilon: 1.0e-3
+  cache:
+    path: null
+    strict_manifest: true
+  transition_path: ./data/robotwin2.0/zeva_transitions
