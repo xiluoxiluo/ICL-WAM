@@ -10,4 +10,13 @@ def test_32_actions_align_to_eight_transitions_and_padding_is_masked():
     action_valid[:, 8:12] = False
     result = build_transition_view(actions, frames, action_valid=action_valid)
     assert result["transition_actions"].shape == (1, 8, 4, 14)
-    assert result["transition_valid"].tolist() == [[True, True, False, True, True, True, True, True]]
+    assert result["transition_valid"].tolist() == [[
+        [True, True, True, True],
+        [True, True, True, True],
+        [False, False, False, False],
+        [True, True, True, True],
+        [True, True, True, True],
+        [True, True, True, True],
+        [True, True, True, True],
+        [True, True, True, True],
+    ]]

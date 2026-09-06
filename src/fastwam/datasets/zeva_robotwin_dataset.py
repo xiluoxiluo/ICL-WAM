@@ -87,13 +87,19 @@ class ZevaStage2Dataset(Dataset):
     """Attach causal prompt inputs to each frozen FastWAM training window."""
 
     def __init__(self, base_dataset: Dataset, cache: PhaseEffectCache, top_k: int = 4, bit_size: int = 4):
+        if cache.manifest.schema_version != "zeva_fastwam_robotwin_cache_v3":
+            raise ValueError(
+                "Stage 2 requires zeva_fastwam_robotwin_cache_v3; older "
+                "transition-level caches are incompatible with effect-window cadence"
+            )
         self.base = ZevaRobotWinDataset(base_dataset)
         self.cache = cache
         self.top_k, self.bit_size = int(top_k), int(bit_size)
         self._cached_window_indices = tuple(sorted({
             int(row["window_index"])
             for row in cache.rows
-            if row.get("window_index") is not None and int(row.get("transition_index", -1)) == 0
+            if row.get("window_index") is not None
+            and int(row.get("effect_index", 0 if int(row.get("transition_index", -1)) == 0 else -1)) == 0
         }))
         if not self._cached_window_indices:
             raise ValueError("Stage 2 cache contains no complete window starts (transition_index=0)")
@@ -101,13 +107,13 @@ class ZevaStage2Dataset(Dataset):
         self._bit_history: dict[int, tuple[torch.Tensor, ...]] = {}
         episode_effects: dict[str, deque[torch.Tensor]] = defaultdict(lambda: deque(maxlen=self.bit_size))
         # Build the causal BIT prefix once. The cache writer emits rows in
-        # episode/window/transition order, so each transition is observed only
-        # after the current window's t=0 query has captured its prefix.
+        # episode/window/effect order, so each effect is observed only after
+        # the current window's effect-0 query has captured its prefix.
         for row_index in range(len(cache.rows)):
             item = cache.get(row_index)
             window_index = item.get("window_index")
             episode_id = str(item["episode_id"])
-            if window_index is not None and int(item["transition_index"]) == 0:
+            if window_index is not None and int(item.get("effect_index", 0 if int(item["transition_index"]) == 0 else -1)) == 0:
                 window_index = int(window_index)
                 if window_index in self._window_rows:
                     raise ValueError(f"duplicate cache window_index {window_index}")
@@ -123,15 +129,15 @@ class ZevaStage2Dataset(Dataset):
         for row_index, row in enumerate(cache.rows):
             item = cache.get(row_index)
             self.bank.add(
-                # Online PIM writes an effect together with the phase after
-                # its completed transition. Use phase_post for offline proxy
-                # candidates so retrieval sees the same representation.
-                item["phase_post"],
+                # PIM stores the phase at the beginning of the effect window;
+                # use the same phase_pre representation for offline retrieval.
+                item["phase_pre"],
                 item["effect"],
                 episode_id=item["episode_id"],
                 task_id=item["task_id"],
                 attempt_id=item["attempt_id"],
                 transition_index=item["transition_index"],
+                effect_index=item.get("effect_index"),
                 episode_step=item.get("episode_step"),
                 window_index=item.get("window_index"),
                 valid=item["valid"],

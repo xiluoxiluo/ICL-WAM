@@ -26,10 +26,13 @@ from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcess
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.zeva import (
+    CausalCTEHistory,
     CausalMemoryLifecycle,
+    FastWAMCTELatentEncoder,
     LifecycleConfig,
     CausalTransitionEncoder,
     CausalTransitionEncoderConfig,
+    validate_vae_metadata,
     PersistentInteractionMemory,
     PersistentInteractionMemoryConfig,
     task_tokens_from_context,
@@ -200,9 +203,9 @@ class WorldActionRobotWinPolicy:
             raise ValueError("zeva_mode must be base, pim_shadow, or pim_on")
         self.cte = None
         self.lifecycle = None
-        self._cte_state = None
-        self._phase = None
-        self._transition_start = None
+        self._cte_history = None
+        self._cte_frame_encoder = None
+        self._observed_effect_count = 0
         self._transition_actions: list[torch.Tensor] = []
         self.max_attempts = int(max_attempts)
         if self.max_attempts < 1:
@@ -216,19 +219,27 @@ class WorldActionRobotWinPolicy:
             if self.zeva_mode == "pim_on" and not addon_checkpoint:
                 raise ValueError("addon_checkpoint is required for Zeva evaluation")
             cte_payload = torch.load(str(cte_checkpoint), map_location="cpu", weights_only=False)
-            if int(cte_payload.get("action_dim", -1)) != 14 or tuple(cte_payload.get("camera_keys", ())) != ("cam_high", "cam_left_wrist", "cam_right_wrist"):
+            cte_values = dict(cte_payload.get("config", cte_payload.get("model_config", {})))
+            cte_values = dict(cte_values.get("cte", cte_values))
+            checkpoint_action_dim = int(cte_payload.get("action_dim", cte_values.get("action_dim", -1)))
+            if checkpoint_action_dim != 14 or tuple(cte_payload.get("camera_keys", ())) != ("cam_high", "cam_left_wrist", "cam_right_wrist"):
                 raise ValueError(
                     "CTE checkpoint metadata is incompatible with RoboTwin V1 "
                     "(action_dim=14, cameras=cam_high/cam_left_wrist/cam_right_wrist)"
                 )
-            cte_values = dict(cte_payload.get("config", {}))
-            cte_values = dict(cte_values.get("cte", cte_values))
             allowed_cte = set(CausalTransitionEncoderConfig.__dataclass_fields__)
             cte_cfg = CausalTransitionEncoderConfig(**{k: v for k, v in cte_values.items() if k in allowed_cte})
-            if cte_cfg.action_dim != 14 or cte_cfg.transition_steps != 4:
+            if (
+                cte_cfg.action_dim != 14
+                or cte_cfg.transition_steps != 4
+                or cte_cfg.effect_window_transitions != 4
+            ):
                 raise ValueError(
-                    "RoboTwin Zeva V1 requires CTE action_dim=14 and transition_steps=4; "
-                    f"got action_dim={cte_cfg.action_dim}, transition_steps={cte_cfg.transition_steps}"
+                    "RoboTwin Zeva V1 requires CTE action_dim=14, "
+                    "transition_steps=4, and effect_window_transitions=4; "
+                    f"got action_dim={cte_cfg.action_dim}, "
+                    f"transition_steps={cte_cfg.transition_steps}, "
+                    f"effect_window_transitions={cte_cfg.effect_window_transitions}"
                 )
             if cte_cfg.phase_dim != int(self.model.zeva_prompt_encoder.config.phase_dim) or cte_cfg.effect_dim != int(self.model.zeva_prompt_encoder.config.effect_dim):
                 raise ValueError(
@@ -251,6 +262,45 @@ class WorldActionRobotWinPolicy:
                 )
             self.cte = CausalTransitionEncoder(cte_cfg).to(device).eval()
             load_cte_checkpoint(str(cte_checkpoint), self.cte, map_location=device)
+            cte_input_type = str(cte_payload.get("cte_input_type", cte_values.get("input_type", "rgb_frame")))
+            if cte_input_type == "rgb_frame":
+                if cte_cfg.image_channels != 3:
+                    raise ValueError("rgb_frame CTE checkpoints must set image_channels=3")
+            elif cte_input_type == "wan_vae_latent":
+                if int(cte_payload.get("latent_channels", cte_cfg.image_channels)) != cte_cfg.image_channels:
+                    raise ValueError("CTE latent channel metadata does not match image_channels")
+                vae_metadata = dict(cte_payload.get("vae_metadata", {}))
+                required_vae_metadata = {
+                    "model_id",
+                    "vae_path",
+                    "z_dim",
+                    "temporal_downsample_factor",
+                    "upsampling_factor",
+                }
+                if not required_vae_metadata.issubset(vae_metadata):
+                    raise ValueError(
+                        "wan_vae_latent CTE checkpoints must record complete "
+                        f"VAE identity metadata: {sorted(required_vae_metadata)}"
+                    )
+                runtime_vae_metadata = {
+                    "model_id": str(model_cfg.get("model_id", "")),
+                    "z_dim": int(getattr(self.model.vae, "z_dim", -1)),
+                    "temporal_downsample_factor": int(
+                        getattr(self.model.vae, "temporal_downsample_factor", -1)
+                    ),
+                    "upsampling_factor": int(getattr(self.model.vae, "upsampling_factor", -1)),
+                }
+                if runtime_vae_metadata["model_id"]:
+                    validate_vae_metadata(vae_metadata, runtime_vae_metadata)
+                self._cte_frame_encoder = FastWAMCTELatentEncoder(
+                    self.model,
+                    expected_channels=cte_cfg.image_channels,
+                    input_range="minus_one_one",
+                ).encode_history
+            else:
+                raise ValueError(
+                    f"Unsupported CTE input type {cte_input_type!r}; expected rgb_frame or wan_vae_latent"
+                )
             if addon_checkpoint:
                 self.model.load_zeva_addon_checkpoint(
                     str(addon_checkpoint),
@@ -273,6 +323,7 @@ class WorldActionRobotWinPolicy:
                 LifecycleConfig(
                     bit_size=int(prompt_cfg.brief_length),
                     transition_steps=cte_cfg.transition_steps,
+                    effect_window_transitions=cte_cfg.effect_window_transitions,
                     action_dim=cte_cfg.action_dim,
                 ),
             )
@@ -423,17 +474,23 @@ class WorldActionRobotWinPolicy:
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
         if self.zeva_mode != "base":
-            if self._cte_state is None and self._needs_episode_reset:
+            if self._cte_history is None and self._needs_episode_reset:
                 self.lifecycle.reset_episode(instruction, episode_id=f"episode-{self.episode_count}")
                 self._needs_episode_reset = False
-                self._cte_state, self._phase = self.cte.initialize(instruction, image_tensor[0].float())
-            elif self._cte_state is None:
-                self._cte_state, self._phase = self.cte.initialize(instruction, image_tensor[0].float())
+                self._cte_history = CausalCTEHistory(self.cte, frame_encoder=self._cte_frame_encoder)
+                self._cte_history.reset(image_tensor[0].float())
+                self._observed_effect_count = 0
+            elif self._cte_history is None:
+                self._cte_history = CausalCTEHistory(self.cte, frame_encoder=self._cte_frame_encoder)
+                self._cte_history.reset(image_tensor[0].float())
+                self._observed_effect_count = 0
             with torch.no_grad():
                 context, _context_mask = self.model.encode_prompt(prompt)
                 task_dim = int(self.model.zeva_prompt_encoder.config.global_dim)
                 task_tokens = task_tokens_from_context(context, _context_mask, task_dim)
-                memory = self.lifecycle.memory_inputs(self._phase, task_tokens)
+                encoded = self._cte_history.forward()
+                phase = encoded["phase"][:, -1]
+                memory = self.lifecycle.memory_inputs(phase, task_tokens)
                 behavior_memory, behavior_memory_mask = self.model.zeva_prompt_encoder(**memory)
             infer_kwargs = {
                 "prompt": None,
@@ -494,13 +551,28 @@ class WorldActionRobotWinPolicy:
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
-        if self.zeva_mode != "base" and observation is not None and self._transition_actions and len(self._transition_actions) >= 4:
+        if self.zeva_mode != "base" and observation is not None and self._cte_history is not None:
+            # The observation is the after-frame for the oldest complete group
+            # of four actions.  RoboTwin supplies one observation per low-level
+            # action; consume at most one group so an observation is never
+            # incorrectly reused for a later group.
             next_image = self._build_robotwin_image_tensor(observation)[0].float()
-            action_group = torch.stack(self._transition_actions[:4]).to(self.model.device)
-            self._cte_state, self._phase, effect = self.cte.update(self._cte_state, action_group, self._transition_start, next_image)
-            self.lifecycle.observe_completed_transition(self._phase, effect)
-            self._transition_actions = self._transition_actions[4:]
-            self._transition_start = next_image if self._transition_actions else None
+            if len(self._transition_actions) >= self.cte.cfg.transition_steps:
+                action_group = torch.stack(self._transition_actions[: self.cte.cfg.transition_steps]).to(self.model.device)
+                self._cte_history.append_transition(action_group, next_image)
+                self._transition_actions = self._transition_actions[self.cte.cfg.transition_steps :]
+                encoded = self._cte_history.forward()
+                complete = encoded["effect_complete"][0]
+                while self._observed_effect_count < complete.shape[0]:
+                    effect_index = self._observed_effect_count
+                    if bool(complete[effect_index]):
+                        start = effect_index * self.cte.cfg.effect_window_transitions
+                        self.lifecycle.observe_completed_effect(
+                            encoded["phase"][0, start],
+                            encoded["effect_post"][0, effect_index],
+                            metadata={"source_step": start * self.cte.cfg.transition_steps},
+                        )
+                    self._observed_effect_count += 1
         if not self.pending_actions:
             if observation is None:
                 raise ValueError(
@@ -518,8 +590,6 @@ class WorldActionRobotWinPolicy:
         sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
         task_env.take_action(action, action_type="qpos")
         if self.zeva_mode != "base":
-            if self._transition_start is None:
-                self._transition_start = self._build_robotwin_image_tensor(observation)[0].float() if observation is not None else None
             raw_state = None if observation is None else np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
             self._transition_actions.append(self._normalize_action(action, raw_state))
         if self.timing_enabled:
@@ -541,9 +611,8 @@ class WorldActionRobotWinPolicy:
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()
-        self._cte_state = None
-        self._phase = None
-        self._transition_start = None
+        self._cte_history = None
+        self._observed_effect_count = 0
         self._transition_actions.clear()
         if self.zeva_mode != "base":
             # The evaluator calls reset for both new episodes and retries.  A
@@ -560,17 +629,15 @@ class WorldActionRobotWinPolicy:
         if attempt_id == 0:
             # Attempt zero always starts a new fixed episode.  The lifecycle is
             # initialized lazily once the first observation/instruction arrives.
-            self._cte_state = None
-            self._phase = None
-            self._transition_start = None
+            self._cte_history = None
+            self._observed_effect_count = 0
             self._transition_actions.clear()
             self._needs_episode_reset = True
             return
         if self.lifecycle.pim.task_cluster is not None:
             self.lifecycle.reset_attempt(attempt_id)
-        self._cte_state = None
-        self._phase = None
-        self._transition_start = None
+        self._cte_history = None
+        self._observed_effect_count = 0
         self._transition_actions.clear()
         self._needs_episode_reset = self.lifecycle.pim.task_cluster is None
 
@@ -585,21 +652,34 @@ class WorldActionRobotWinPolicy:
         if (
             self.zeva_mode == "base"
             or self.cte is None
-            or self._transition_start is None
-            or len(self._transition_actions) != 4
+            or len(self._transition_actions) != self.cte.cfg.transition_steps
         ):
             return
         terminal_obs = getattr(task_env, "now_obs", None)
         if not isinstance(terminal_obs, dict) or "observation" not in terminal_obs:
             return
+        if self._cte_history is None:
+            return
         next_image = self._build_robotwin_image_tensor(terminal_obs)[0].float()
         action_group = torch.stack(self._transition_actions).to(self.model.device)
-        self._cte_state, self._phase, effect = self.cte.update(
-            self._cte_state, action_group, self._transition_start, next_image
-        )
-        self.lifecycle.observe_completed_transition(self._phase, effect)
+        self._cte_history.append_transition(action_group, next_image)
+        encoded = self._cte_history.forward()
+        complete = encoded["effect_complete"][0]
+        while self._observed_effect_count < complete.shape[0]:
+            effect_index = self._observed_effect_count
+            if bool(complete[effect_index]):
+                start = effect_index * self.cte.cfg.effect_window_transitions
+                self.lifecycle.observe_completed_effect(
+                    encoded["phase"][0, start],
+                    encoded["effect_post"][0, effect_index],
+                    metadata={"source_step": start * self.cte.cfg.transition_steps},
+                )
+            self._observed_effect_count += 1
         self._transition_actions.clear()
-        self._transition_start = None
+        # The evaluator does not start another attempt after success.  Flush
+        # the pending phase/effect pairs now so the lifecycle has the same
+        # commit semantics as a retry boundary.
+        self.lifecycle.end_attempt()
 
 
 def encode_obs(observation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

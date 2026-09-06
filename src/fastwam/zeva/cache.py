@@ -17,6 +17,8 @@ class PhaseEffectCache:
         self.root, self.manifest, self.rows = Path(root), manifest, rows
         self._shards: dict[str, dict[str, torch.Tensor]] = {}
         required = {"episode_id", "task_id", "attempt_id", "transition_index", "window_index", "episode_step", "shard", "offset"}
+        if manifest.schema_version == "zeva_fastwam_robotwin_cache_v3":
+            required.add("effect_index")
         for index, row in enumerate(rows):
             missing = required - set(row)
             if missing:
@@ -43,6 +45,10 @@ class PhaseEffectCache:
         return {
             "episode_id": row["episode_id"], "task_id": row["task_id"],
             "attempt_id": row["attempt_id"], "transition_index": row["transition_index"],
+            # Legacy v2 rows used one record per transition and have no
+            # effect_index.  Preserve that index for backwards-compatible
+            # loading; new v3 rows write effect_index explicitly.
+            "effect_index": int(row.get("effect_index", row["transition_index"])),
             "episode_step": row.get("episode_step"),
             "window_index": row.get("window_index"),
             "phase_pre": shard["phase_pre"][offset], "phase_post": shard["phase_post"][offset],
@@ -63,7 +69,7 @@ def save_phase_effect_cache(root: str | Path, records: Iterable[dict], manifest:
     if shard_size < 1:
         raise ValueError("shard_size must be positive")
     rows: list[dict] = []; pending: list[dict] = []
-    seen_keys: set[tuple[int, int]] = set()
+    seen_keys: set[tuple[int, ...]] = set()
 
     def flush(shard_id: int, values: list[dict]) -> None:
         if not values:
@@ -94,15 +100,25 @@ def save_phase_effect_cache(root: str | Path, records: Iterable[dict], manifest:
                          "attempt_id": int(value.get("attempt_id", 0)),
                          "episode_step": None if value.get("episode_step") is None else int(value["episode_step"]),
                          "transition_index": int(value.get("transition_index", offset)),
+                         **({"effect_index": int(value.get("effect_index", value.get("transition_index", offset)))} if manifest.schema_version == "zeva_fastwam_robotwin_cache_v3" else {}),
                          "window_index": None if value.get("window_index") is None else int(value["window_index"]),
                          "shard": name, "offset": offset})
 
     shard_id = 0
     for record in records:
         if record.get("window_index") is not None:
-            key = (int(record["window_index"]), int(record.get("transition_index", 0)))
+            if manifest.schema_version == "zeva_fastwam_robotwin_cache_v3":
+                # One v3 row is one effect-window.  The effect index is the
+                # identity; transition_index is only a compatibility offset
+                # and must not permit duplicate effect rows.
+                key = (
+                    int(record["window_index"]),
+                    int(record.get("effect_index", record.get("transition_index", 0))),
+                )
+            else:
+                key = (int(record["window_index"]), int(record.get("transition_index", 0)))
             if key in seen_keys:
-                raise ValueError(f"duplicate cache row for window/transition {key}")
+                raise ValueError(f"duplicate cache row for window/effect {key}")
             seen_keys.add(key)
         pending.append(record)
         if len(pending) >= shard_size:

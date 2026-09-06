@@ -7,7 +7,7 @@ dependencies.
 
 ## Baseline audit
 
-- Repository commit at audit time: `7faa71108368fbb3b6885649f112af607427a2d4`
+- Repository commit at audit time: `192a201` (working tree contains the migration changes)
 - Branch: `main`
 - Worktree: contains the Zeva implementation changes listed in the handoff;
   no unrelated reset/checkout was performed.
@@ -23,14 +23,14 @@ dependencies.
 ## Final local validation
 
 ```text
-PYTHONPATH=src pytest -q                              29 passed
+PYTHONPATH=src pytest -q                              31 passed
 python -m compileall -q ...                           passed
 git diff --check                                      passed
 protected-file diff check                             unchanged
 Hydra train/sim overrides + all addon --help          passed
 ```
 
-The tests cover transition alignment, causal leakage, invalid/padded masks,
+The tests cover transition alignment, right-shift causal leakage, invalid/padded masks,
 BIT/PIM lifecycle, deterministic retrieval/merge, cache manifests/source
 indices, prompt masks, frozen-parameter whitelist, gate-zero equivalence, and
 fixed-seed retry/finalization hooks. The final semantic audit also checked the
@@ -41,6 +41,13 @@ The final command audit confirmed that `train`, `sim_robotwin_zeva`, and the
 fixed-attempt wrapper resolve the same `model.zeva` namespace.  A null training
 `device` now falls back to CPU/CUDA detection instead of becoming the invalid
 string device `"None"`.
+
+The CTE module follows Zeva's generic frame-tensor interface (`[B,T,C,H,W]`).
+Direct RGB runs use `C=3`; Zeva/FastWAM serving can select an explicit frozen
+Wan-VAE adapter, with input type, channel count, and VAE identity recorded in
+checkpoint/cache metadata. VAE encoding never occurs inside CTE. Cache rows are
+effect-window level (two rows per complete 32-action window), and PIM pairing
+uses pending phase plus observed `effect_post`.
 
 ## Remaining empirical gates
 

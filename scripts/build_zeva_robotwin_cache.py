@@ -10,7 +10,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset
-from fastwam.zeva import CausalTransitionEncoder, CausalTransitionEncoderConfig
+from fastwam.zeva import CausalTransitionEncoder, CausalTransitionEncoderConfig, FastWAMCTELatentEncoder, load_frozen_wan_vae, validate_vae_metadata
 from fastwam.zeva.cache import save_phase_effect_cache
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.schemas import CacheManifest, sha256_file
@@ -40,20 +40,49 @@ def main(cfg: DictConfig) -> None:
             f"frame/action alignment; got {sample_stride}"
         )
     payload = torch.load(cte_path, map_location="cpu", weights_only=False)
-    if int(payload.get("action_dim", -1)) != 14 or tuple(payload.get("camera_keys", ())) != ("cam_high", "cam_left_wrist", "cam_right_wrist"):
-        raise ValueError(
-            "CTE checkpoint metadata is incompatible with RoboTwin V1 "
-            "(action_dim=14, cameras=cam_high/cam_left_wrist/cam_right_wrist)"
-        )
-    cte_config = dict(payload.get("config", {}))
+    cte_config = dict(payload.get("config", payload.get("model_config", {})))
     # Older checkpoints stored the CTE config nested under ``cte``.
     cte_config = dict(cte_config.get("cte", cte_config))
+    cte_input_type = str(payload.get("cte_input_type", cte_config.get("input_type", "rgb_frame")))
+    checkpoint_action_dim = int(payload.get("action_dim", cte_config.get("action_dim", -1)))
+    if (
+        checkpoint_action_dim != 14
+        or cte_input_type not in {"rgb_frame", "wan_vae_latent"}
+        or tuple(payload.get("camera_keys", ())) != ("cam_high", "cam_left_wrist", "cam_right_wrist")
+    ):
+        raise ValueError(
+            "CTE checkpoint metadata is incompatible with RoboTwin V1 "
+            "(input_type=rgb_frame|wan_vae_latent, action_dim=14, cameras=cam_high/cam_left_wrist/cam_right_wrist)"
+        )
+    checkpoint_vae_metadata = dict(payload.get("vae_metadata", {}))
+    if cte_input_type == "wan_vae_latent" and not checkpoint_vae_metadata:
+        raise ValueError("wan_vae_latent CTE checkpoints must include vae_metadata")
+    if cte_input_type == "wan_vae_latent":
+        required_vae_metadata = {
+            "model_id",
+            "vae_path",
+            "z_dim",
+            "temporal_downsample_factor",
+            "upsampling_factor",
+        }
+        if not required_vae_metadata.issubset(checkpoint_vae_metadata):
+            raise ValueError(
+                "wan_vae_latent CTE checkpoints must record complete VAE "
+                f"identity metadata: {sorted(required_vae_metadata)}"
+            )
     allowed = set(CausalTransitionEncoderConfig.__dataclass_fields__)
     model = CausalTransitionEncoder(CausalTransitionEncoderConfig(**{k: v for k, v in cte_config.items() if k in allowed}))
-    if model.cfg.action_dim != 14 or model.cfg.transition_steps != 4:
+    if (
+        model.cfg.action_dim != 14
+        or model.cfg.transition_steps != 4
+        or model.cfg.effect_window_transitions != 4
+    ):
         raise ValueError(
-            "RoboTwin Zeva V1 cache requires CTE action_dim=14 and transition_steps=4; "
-            f"got action_dim={model.cfg.action_dim}, transition_steps={model.cfg.transition_steps}"
+            "RoboTwin Zeva V1 cache requires CTE action_dim=14, "
+            "transition_steps=4, and effect_window_transitions=4; "
+            f"got action_dim={model.cfg.action_dim}, "
+            f"transition_steps={model.cfg.transition_steps}, "
+            f"effect_window_transitions={model.cfg.effect_window_transitions}"
         )
     if int(cfg.data.train.action_video_freq_ratio) != 4:
         raise ValueError(
@@ -61,16 +90,37 @@ def main(cfg: DictConfig) -> None:
             f"got {cfg.data.train.action_video_freq_ratio}"
         )
     load_cte_checkpoint(cte_path, model, map_location="cpu")
+    configured_device = cfg.get("device")
+    if configured_device is None or str(configured_device).strip().lower() in {"", "none", "null"}:
+        configured_device = "cuda" if torch.cuda.is_available() else "cpu"
+    cte_device = torch.device(str(configured_device))
+    if cte_device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("latent CTE cache requested CUDA but CUDA is unavailable")
+    frame_encoder = None
+    vae_metadata: dict[str, object] = {}
+    if cte_input_type == "wan_vae_latent":
+        model_values = dict(cfg.model)
+        vae, vae_metadata = load_frozen_wan_vae(
+            model_id=str(model_values.get("model_id", "Wan-AI/Wan2.2-TI2V-5B")),
+            tokenizer_model_id=str(model_values.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B")),
+            device=str(cte_device),
+            torch_dtype=torch.float32 if cte_device.type == "cpu" else torch.bfloat16,
+            redirect_common_files=bool(model_values.get("redirect_common_files", True)),
+        )
+        validate_vae_metadata(checkpoint_vae_metadata, vae_metadata)
+        frame_encoder = FastWAMCTELatentEncoder(
+            vae,
+            expected_channels=model.cfg.image_channels,
+            input_range="minus_one_one",
+        ).encode_history
+    model.to(cte_device)
     model.eval()
     records = []
-    # RobotVideoDataset exposes overlapping windows (normally stride=1).  The
-    # CTE is recurrent, so cache construction must consume the same ordered,
-    # non-overlapping 32-action chunks as Stage 1 and carry the final state to
-    # the next chunk in an episode.  Encoding every sliding window from the
-    # default BOS state would duplicate transitions in PIM and break the
-    # offline/online state machine.
+    # RobotVideoDataset exposes overlapping windows (normally stride=1).  Cache
+    # only ordered, non-overlapping 32-action source windows.  Each source
+    # window is passed through the canonical full-history Zeva CTE once; no
+    # recurrent hidden state is carried between windows.
     next_episode_step: dict[str, int] = {}
-    carried_state: dict[str, torch.Tensor] = {}
     seen_source_indices: set[int] = set()
     with torch.no_grad():
         for index in range(len(dataset)):
@@ -89,7 +139,6 @@ def main(cfg: DictConfig) -> None:
                     # A gap means the recurrent state cannot be joined safely.
                     # Start a new causal segment rather than silently carrying
                     # state across an unknown interval.
-                    carried_state.pop(episode_id, None)
                     next_episode_step.pop(episode_id, None)
 
             source_index = int(sample.get("dataset_index", index))
@@ -98,51 +147,56 @@ def main(cfg: DictConfig) -> None:
                     f"dataset returned duplicate source index {source_index}; "
                     "cache construction cannot preserve deterministic joins"
                 )
-            frames = torch.cat((sample["before_frames"], sample["after_frames"][-1:]), dim=0).unsqueeze(0)
-            actions = sample["transition_actions"].unsqueeze(0)
-            initial_state = torch.zeros((1, model.cfg.hidden_dim), dtype=frames.dtype)
-            initial_state_mask = torch.zeros((1,), dtype=torch.bool)
-            if episode_id in carried_state:
-                initial_state[0] = carried_state[episode_id]
-                initial_state_mask[0] = True
+            frames = sample.get("cte_frames")
+            preencoded = frames is not None
+            if frames is None:
+                frames = torch.cat((sample["before_frames"], sample["after_frames"][-1:]), dim=0)
+            elif frames.ndim != 4 or frames.shape[0] != 9:
+                raise ValueError("sample['cte_frames'] must be [9,C,H,W]")
+            if frame_encoder is not None and not preencoded:
+                frames = frame_encoder(frames.unsqueeze(0))[0].cpu()
+            frames = frames.unsqueeze(0).to(cte_device)
+            actions = sample["transition_actions"].unsqueeze(0).to(cte_device)
             output = model(
                 frames,
                 actions,
-                valid_mask=sample["frame_valid"].unsqueeze(0),
-                transition_valid=sample["transition_valid"].unsqueeze(0),
-                initial_state=initial_state,
-                initial_state_mask=initial_state_mask,
+                valid_mask=sample["frame_valid"].unsqueeze(0).to(cte_device),
+                transition_valid=sample["transition_valid"].unsqueeze(0).to(cte_device),
             )
             # Stage 2 queries phase_pre for the window's first action. If t=0
             # is invalid, later valid records cannot be safely joined to this
             # 32-action target, so discard the whole window.
             if not bool(output["transition_complete"][0, 0]):
-                carried_state.pop(episode_id, None)
                 next_episode_step.pop(episode_id, None)
                 continue
             seen_source_indices.add(source_index)
-            for t in range(8):
-                if not bool(output["transition_complete"][0, t]):
+            # Zeva observes one effect after each four-transition (16-action)
+            # window.  Store exactly the two effect rows produced by the
+            # 32-action source window, with the phase captured at window start.
+            effect_count = output["effect_post"].shape[1]
+            for effect_index in range(effect_count):
+                if not bool(output["effect_complete"][0, effect_index]):
                     continue
+                transition_index = effect_index * model.cfg.effect_window_transitions
+                transition_end = transition_index + model.cfg.effect_window_transitions
                 records.append({
                     "episode_id": episode.episode_id,
                     "task_id": episode.task_id,
                     "attempt_id": 0,
                     "window_index": source_index,
-                    "episode_step": episode_step + t * model.cfg.transition_steps * sample_stride,
-                    "transition_index": t,
-                    "phase_pre": output["phase"][0, t],
-                    "phase_post": output["phase"][0, t + 1],
-                    "effect": output["transition_effect"][0, t],
+                    "episode_step": episode_step + transition_index * model.cfg.transition_steps * sample_stride,
+                    "transition_index": transition_index,
+                    "effect_index": effect_index,
+                    "phase_pre": output["phase"][0, transition_index],
+                    "phase_post": output["phase"][0, transition_end],
+                    "effect": output["effect_post"][0, effect_index],
                     "valid": True,
                 })
             if bool(sample["frame_valid"].all()) and bool(sample["transition_valid"].all()):
-                carried_state[episode_id] = output["causal_interaction_state"][0, -1].detach().clone()
                 next_episode_step[episode_id] = episode_step + 32 * sample_stride
             else:
-                # A partial/padded window cannot establish the next causal
-                # state. Do not let it contaminate a later segment.
-                carried_state.pop(episode_id, None)
+                # A partial/padded window cannot establish the next ordered
+                # source position.
                 next_episode_step.pop(episode_id, None)
     cache_cfg = zeva.get("cache", {})
     stats_hash = sha256_file(stats_path)
@@ -156,8 +210,12 @@ def main(cfg: DictConfig) -> None:
         video_frames=9,
         phase_dim=model.cfg.phase_dim,
         effect_dim=model.cfg.effect_dim,
+        image_channels=model.cfg.image_channels,
         feature_dtype=str(cache_cfg.get("feature_dtype", "float32")),
         action_video_freq_ratio=int(cfg.data.train.action_video_freq_ratio),
+        cte_input_type=cte_input_type,
+        latent_channels=model.cfg.image_channels if cte_input_type == "wan_vae_latent" else 0,
+        vae_metadata=dict(vae_metadata),
     )
     if not records:
         raise RuntimeError("CTE cache construction produced no valid non-overlapping windows")

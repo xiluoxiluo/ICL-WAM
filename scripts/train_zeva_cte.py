@@ -16,6 +16,7 @@ from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset
 from fastwam.zeva import CausalTransitionEncoder, CausalTransitionEncoderConfig, CTELossConfig, causal_transition_encoder_loss
 from fastwam.zeva.checkpoint import load_cte_checkpoint, save_cte_checkpoint
 from fastwam.zeva.schemas import sha256_file
+from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_vae
 
 
 def _cfg_dict(value) -> dict:
@@ -49,10 +50,37 @@ def main(cfg: DictConfig) -> None:
     cte_values = _cfg_dict(zeva.get("cte"))
     allowed = set(CausalTransitionEncoderConfig.__dataclass_fields__)
     model = CausalTransitionEncoder(CausalTransitionEncoderConfig(**{k: v for k, v in cte_values.items() if k in allowed}))
-    if model.cfg.action_dim != 14 or model.cfg.transition_steps != 4:
+    cte_input_type = str(cte_values.get("input_type", "rgb_frame"))
+    if cte_input_type not in {"rgb_frame", "wan_vae_latent"}:
+        raise ValueError("zeva.cte.input_type must be rgb_frame or wan_vae_latent")
+    if cte_input_type == "rgb_frame" and model.cfg.image_channels != 3:
+        raise ValueError("rgb_frame CTE training requires image_channels=3")
+    frame_encoder = None
+    vae_metadata: dict[str, object] = {}
+    if cte_input_type == "wan_vae_latent":
+        model_values = _cfg_dict(cfg.model)
+        vae, vae_metadata = load_frozen_wan_vae(
+            model_id=str(model_values.get("model_id", "Wan-AI/Wan2.2-TI2V-5B")),
+            tokenizer_model_id=str(model_values.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B")),
+            device=device_name,
+            torch_dtype=torch.float32 if device.type == "cpu" else torch.bfloat16,
+            redirect_common_files=bool(model_values.get("redirect_common_files", True)),
+        )
+        frame_encoder = FastWAMCTELatentEncoder(
+            vae, expected_channels=model.cfg.image_channels,
+            input_range="minus_one_one",
+        ).encode_history
+    if (
+        model.cfg.action_dim != 14
+        or model.cfg.transition_steps != 4
+        or model.cfg.effect_window_transitions != 4
+    ):
         raise ValueError(
-            "RoboTwin Zeva V1 Stage 1 requires CTE action_dim=14 and transition_steps=4; "
-            f"got action_dim={model.cfg.action_dim}, transition_steps={model.cfg.transition_steps}"
+            "RoboTwin Zeva V1 Stage 1 requires CTE action_dim=14, "
+            "transition_steps=4, and effect_window_transitions=4; "
+            f"got action_dim={model.cfg.action_dim}, "
+            f"transition_steps={model.cfg.transition_steps}, "
+            f"effect_window_transitions={model.cfg.effect_window_transitions}"
         )
     model.to(device)
     optimizer = AdamW(
@@ -83,6 +111,10 @@ def main(cfg: DictConfig) -> None:
         "transition_steps": model.cfg.transition_steps,
         "action_horizon": model.cfg.transition_steps * 8,
         "video_frames": 9,
+        "image_channels": model.cfg.image_channels,
+        "cte_input_type": cte_input_type,
+        "latent_channels": model.cfg.image_channels if cte_input_type == "wan_vae_latent" else 0,
+        "vae_metadata": vae_metadata,
         "camera_keys": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
     }
     (output_dir / "dataset_manifest.json").write_text(
@@ -103,27 +135,26 @@ def main(cfg: DictConfig) -> None:
     else:
         metrics_file = (output_dir / "metrics.jsonl").open("w", encoding="utf-8")
     next_episode_step: dict[str, int] = {}
-    carried_state: dict[str, torch.Tensor] = {}
     semantic_lookup: dict[str, int] = {}
     pending: list[dict] = []
 
     def train_batch(batch: list[dict]) -> None:
         frames_list, actions_list, valid_list, transition_valid_list = [], [], [], []
-        initial_states = torch.zeros((len(batch), model.cfg.hidden_dim), dtype=torch.float32)
-        initial_mask = torch.zeros(len(batch), dtype=torch.bool)
         semantic_ids = []
-        for position, sample in enumerate(batch):
-            frames = torch.cat((sample["before_frames"], sample["after_frames"][-1:]), dim=0)
+        for sample in batch:
+            frames = sample.get("cte_frames")
+            preencoded = frames is not None
+            if frames is None:
+                frames = torch.cat((sample["before_frames"], sample["after_frames"][-1:]), dim=0)
+            elif frames.ndim != 4 or frames.shape[0] != 9:
+                raise ValueError("sample['cte_frames'] must be [9,C,H,W]")
+            if frame_encoder is not None and not preencoded:
+                frames = frame_encoder(frames.unsqueeze(0))[0].cpu()
             frames_list.append(frames)
             actions_list.append(sample["transition_actions"])
             valid_list.append(sample["frame_valid"])
             transition_valid_list.append(sample["transition_valid"])
             episode = sample["episode"]
-            episode_id = str(episode.episode_id)
-            expected_step = next_episode_step.get(episode_id)
-            if expected_step is not None and int(episode.episode_step) == expected_step and episode_id in carried_state:
-                initial_states[position] = carried_state[episode_id]
-                initial_mask[position] = True
             task_key = (
                 f"id:{episode.task_id}"
                 if episode.task_id not in (None, 0, "0")
@@ -136,15 +167,11 @@ def main(cfg: DictConfig) -> None:
         actions = torch.stack(actions_list, dim=0).to(device)
         valid = torch.stack(valid_list, dim=0).to(device)
         transition_valid = torch.stack(transition_valid_list, dim=0).to(device)
-        initial_states = initial_states.to(device)
-        initial_mask = initial_mask.to(device)
         output = model(
             frames,
             actions,
             valid_mask=valid,
             transition_valid=transition_valid,
-            initial_state=initial_states,
-            initial_state_mask=initial_mask,
         )
         losses = causal_transition_encoder_loss(
             output,
@@ -176,23 +203,21 @@ def main(cfg: DictConfig) -> None:
             "grad_norm": float(grad_norm.detach().cpu()),
         }) + "\n")
         metrics_file.flush()
-        for position, sample in enumerate(batch):
+        for sample in batch:
             episode = sample["episode"]
             episode_id = str(episode.episode_id)
             if bool(sample["frame_valid"].all()) and bool(sample["transition_valid"].all()):
-                carried_state[episode_id] = output["causal_interaction_state"].detach()[position, -1].cpu()
                 next_episode_step[episode_id] = int(episode.episode_step) + 32 * sample_stride
             else:
-                # Never carry a masked/padded state through an unknown causal
-                # gap. The next valid sample starts a fresh segment.
-                carried_state.pop(episode_id, None)
+                # A masked/padded window cannot establish the next ordered
+                # source position; the next valid window starts a new sample.
                 next_episode_step.pop(episode_id, None)
 
     while step < steps:
-        # Hidden state is only meaningful within one ordered pass through the
-        # dataset; restart it at an epoch boundary before replaying windows.
+        # The CTE receives each complete window as full history.  Restart only
+        # the source-window cursor at an epoch boundary; there is no recurrent
+        # state handoff between optimizer batches.
         next_episode_step.clear()
-        carried_state.clear()
         for sample in dataset:
             episode = sample["episode"]
             episode_id = str(episode.episode_id)
@@ -206,9 +231,8 @@ def main(cfg: DictConfig) -> None:
             # each episode in ordered 32-action chunks and skip overlap rows.
             if expected_step is not None and episode_step < expected_step:
                 continue
-            # Keep at most one chunk from an episode in a minibatch. This
-            # preserves the hidden-state handoff between optimizer steps while
-            # still giving the task-contrastive objective multiple episodes.
+            # Keep at most one chunk from an episode in a minibatch so each
+            # optimizer batch contains distinct causal windows.
             if pending and any(str(item["episode"].episode_id) == episode_id for item in pending):
                 train_batch(pending)
                 pending.clear()
@@ -228,7 +252,16 @@ def main(cfg: DictConfig) -> None:
             pending.clear()
             step += 1
     metrics_file.close()
-    save_cte_checkpoint(output_dir / "cte.pt", model, optimizer=optimizer, scheduler=scheduler, step=step, config=_cfg_dict(zeva))
+    save_cte_checkpoint(
+        output_dir / "cte.pt",
+        model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        step=step,
+        config=_cfg_dict(zeva),
+        cte_input_type=cte_input_type,
+        vae_metadata=vae_metadata,
+    )
     print(f"saved Stage 1 checkpoint: {output_dir / 'cte.pt'}")
 
 

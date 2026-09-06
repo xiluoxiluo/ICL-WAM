@@ -10,9 +10,20 @@ zeva:
   cte:
     checkpoint: null
     action_dim: 14
-    action_group_size: 4
+    transition_steps: 4
+    effect_window_transitions: 4
+    effect_target_grid: [4, 6]
+    hidden_dim: 256
+    retrieval_dim: 128
     phase_dim: 128
     effect_dim: 128
+    num_layers: 4
+    num_heads: 8
+    # Match Zeva's serving path: RGB is encoded once by the frozen Wan VAE
+    # outside CTE.  Set input_type=rgb_frame/image_channels=3 only for an
+    # explicitly separate CPU/debug checkpoint.
+    image_channels: 48
+    input_type: wan_vae_latent
   memory:
     bit_size: 4
     pim_top_k: 4

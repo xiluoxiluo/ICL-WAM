@@ -40,15 +40,44 @@ def main(cfg: DictConfig) -> None:
             "RoboTwin Zeva V1 requires data.train.global_sample_stride=1 for exact "
             f"frame/action alignment; got {cfg.data.train.global_sample_stride}"
         )
+    cte_payload = torch.load(cte_path, map_location="cpu", weights_only=False)
+    cte_config = dict(cte_payload.get("config", cte_payload.get("model_config", {})))
+    cte_config = dict(cte_config.get("cte", cte_config))
+    cte_input_type = str(cte_payload.get("cte_input_type", cte_config.get("input_type", "rgb_frame")))
+    cte_image_channels = int(cte_payload.get("image_channels", cte_config.get("image_channels", 3)))
+    if cte_input_type not in {"rgb_frame", "wan_vae_latent"}:
+        raise ValueError(f"Unsupported CTE input type in checkpoint: {cte_input_type}")
+    cte_vae_metadata = dict(cte_payload.get("vae_metadata", {}))
+    if cte_input_type == "wan_vae_latent":
+        required_vae_metadata = {
+            "model_id",
+            "vae_path",
+            "z_dim",
+            "temporal_downsample_factor",
+            "upsampling_factor",
+        }
+        if not required_vae_metadata.issubset(cte_vae_metadata):
+            raise ValueError(
+                "wan_vae_latent CTE checkpoints must record complete VAE identity "
+                f"metadata: {sorted(required_vae_metadata)}"
+            )
     expected = {
+        "schema_version": "zeva_fastwam_robotwin_cache_v3",
         "action_dim": 14,
         "action_group_size": 4,
         "action_horizon": 32,
         "video_frames": 9,
+        "effect_window_transitions": 4,
+        "transition_count": 8,
+        "image_channels": cte_image_channels,
         "camera_keys": ("cam_high", "cam_left_wrist", "cam_right_wrist"),
+        "cte_input_type": cte_input_type,
+        "latent_channels": cte_image_channels if cte_input_type == "wan_vae_latent" else 0,
         "action_video_freq_ratio": int(cfg.data.train.action_video_freq_ratio),
         "action_normalization": "fastwam_processor_output",
     }
+    if cte_input_type == "wan_vae_latent":
+        expected["vae_metadata"] = cte_vae_metadata
     prompt_cfg = cfg.model.get("zeva", {}).get("prompt", {})
     expected["phase_dim"] = int(prompt_cfg.get("phase_dim", 128))
     expected["effect_dim"] = int(prompt_cfg.get("effect_dim", 128))

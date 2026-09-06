@@ -37,13 +37,14 @@ def test_stage2_uses_sparse_cache_window_indices(tmp_path):
     manifest = CacheManifest()
     records = []
     for window_index, phase_value in ((0, 1.0), (2, 2.0)):
-        for transition_index in range(8):
+        for effect_index, transition_index in enumerate((0, 4)):
             records.append({
                 "episode_id": "episode-0",
                 "task_id": 0,
                 "window_index": window_index,
                 "episode_step": window_index * 32,
                 "transition_index": transition_index,
+                "effect_index": effect_index,
                 "phase_pre": torch.full((128,), phase_value),
                 "phase_post": torch.full((128,), phase_value),
                 "effect": torch.full((128,), phase_value),

@@ -66,3 +66,23 @@ def test_cross_attempt_pim_merge_is_hidden_until_next_attempt():
     assert sources[0]["attempt_id"] == 1
     assert sources[0]["first_attempt_id"] == 0
     assert sources[0]["last_attempt_id"] == 1
+
+
+def test_effect_lifecycle_keeps_window_offset_and_commits_pending_pairs():
+    pim = PersistentInteractionMemory(
+        PersistentInteractionMemoryConfig(phase_dim=2, effect_dim=2, capacity=8, top_k=2)
+    )
+    lifecycle = CausalMemoryLifecycle(pim)
+    lifecycle.reset_episode("task", episode_id="ep")
+    lifecycle.observe_completed_effect(
+        torch.tensor([1.0, 0.0]), torch.tensor([1.0, 0.0])
+    )
+    lifecycle.observe_completed_effect(
+        torch.tensor([0.0, 1.0]), torch.tensor([0.0, 1.0])
+    )
+    # Effects are indexed 0/1, but their source transition windows begin at
+    # transition 0/4 in the 8-transition source window.
+    assert len(pim) == 0
+    lifecycle.end_attempt()
+    assert [entry.transition_index for entry in pim.entries] == [0, 4]
+    assert [entry.metadata["effect_index"] for entry in pim.entries] == [0, 1]

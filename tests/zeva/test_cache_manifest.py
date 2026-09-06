@@ -18,3 +18,19 @@ def test_cache_manifest_rejects_inconsistent_shape():
         pass
     else:
         raise AssertionError("inconsistent action/video schema was accepted")
+
+
+def test_cache_manifest_tracks_latent_contract_separately():
+    manifest = CacheManifest(
+        image_channels=48,
+        latent_channels=48,
+        cte_input_type="wan_vae_latent",
+        vae_metadata={
+            "model_id": "wan",
+            "vae_path": "/models/wan.vae",
+            "z_dim": 48,
+            "temporal_downsample_factor": 4,
+            "upsampling_factor": 8,
+        },
+    )
+    assert manifest.image_channels == manifest.latent_channels == 48

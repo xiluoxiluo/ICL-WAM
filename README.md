@@ -111,6 +111,7 @@ torchrun --standalone --nproc_per_node=8 \
 | `action_group_size` / CTE `transition_steps` | 4 | 每个 transition 执行 4 个 action |
 | transition 数 | 8 | 一个窗口内的 `32 = 8 x 4` |
 | camera 顺序 | `cam_high`, `cam_left_wrist`, `cam_right_wrist` | 顺序不能改变 |
+| CTE 输入 | `[B,9,C,H,W]` | 生产默认由冻结 Wan2.2 VAE38 将 RGB mosaic 编码为 `C=48`；`C=3` 仅用于独立 debug 合同 |
 | 最终图像 | `[3, 384, 320]` mosaic | 与 FastWAM RoboTwin processor 一致，RGB 归一化到 `[-1, 1]` |
 | action normalization | `fastwam_processor_output` | 使用同一份 `dataset_stats.json` 的 z-score |
 | CTE `phase_dim/effect_dim` | 128 / 128 | 必须与 prompt encoder 相同 |
@@ -125,7 +126,7 @@ torchrun --standalone --nproc_per_node=8 \
 | action scheduler shift | 1.0 / 1.0 | `train_shift` / `infer_shift`，与 FastWAM action path 对齐 |
 | Stage 2 batch/lr/steps | 16 / `2e-4` / 10000 | 任务配置默认值，可按显存覆盖 |
 
-因果顺序必须保持：CTE `initialize()` 只看当前 frame；执行完 4-action group 后，用 observed after-frame 调用 `update()`，再把得到的 `phase_post + observed effect` 写入 memory。BIT 在每次 attempt 开始时清空，PIM 在同一 episode 的 retry 间保留并做 running mean/count 合并；当前 attempt 的条目不会被当前 attempt 自己检索。
+因果顺序必须保持：正式 CTE 使用 Zeva 的 full-history `[B,T,C,H,W]` 接口，RGB 到 Wan latent 的转换只在冻结的外部 adapter 中执行，action stream 采用 right-shift；每 4 个 action 形成一个 transition，每 4 个 transition（16 个 action）才产生一个 completed effect。BIT 在每次 attempt 开始时清空，PIM 以 effect-window 起点的 pending phase 配对 observed `effect_post`，在同一 episode 的 retry 间保留并做 running mean/count 合并；当前 attempt 的条目不会被当前 attempt 自己检索。
 
 评测时 `EVALUATION.skip_get_obs_within_replan=false` 是强制要求，否则无法为每个已执行 action 配对 after-frame。Zeva 模式下 `replan_steps` 必须是 4 的倍数，默认 8；`action_horizon` 必须是 32。
 
@@ -200,7 +201,7 @@ python scripts/train_zeva_cte.py \
 
 ### 5.3 构建 CTE phase/effect cache
 
-该脚本加载冻结的 Stage 1 CTE，按 episode 顺序传递 recurrent state，只保留不重叠且完整的窗口，并写出 safetensors shards 和严格 manifest。
+该脚本加载冻结的 Stage 1 CTE，按 episode 顺序取不重叠且完整的 32-action full-history 窗口；每窗口写入两个 effect rows，并写出 safetensors shards 和严格 manifest。
 
 ```bash
 python scripts/build_zeva_robotwin_cache.py \
@@ -245,7 +246,7 @@ python scripts/train_zeva_fastwam.py \
 
 ### 5.5 文本 embedding、Wan 下载和多卡训练的关系
 
-Zeva Stage 1/2 都沿用 FastWAM 的 dataset/processor，不会改变原有 image resize、action normalization 或 prompt 格式。需要多卡时，CTE 脚本可由外部 launcher 启动；Stage 2 推荐沿用 FastWAM 的 Accelerate/DeepSpeed 配置。不要通过随机打乱 Stage 1 的 episode 顺序来“增加数据量”，因为 CTE 的 hidden state handoff 和 cache manifest 都依赖确定的 episode 顺序。
+Zeva Stage 1/2 都沿用 FastWAM 的 dataset/processor，不会改变原有 image resize、action normalization 或 prompt 格式。需要多卡时，CTE 脚本可由外部 launcher 启动；Stage 2 推荐沿用 FastWAM 的 Accelerate/DeepSpeed 配置。不要通过随机打乱 Stage 1 的 episode 顺序来“增加数据量”，因为 cache manifest 依赖确定的 episode/window 对齐。
 
 ## 6. RoboTwin 固定 seed 评测
 
