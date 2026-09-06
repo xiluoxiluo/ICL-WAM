@@ -28,6 +28,7 @@ def save_cte_checkpoint(
     camera_keys: tuple[str, ...] = ("cam_high", "cam_left_wrist", "cam_right_wrist"),
     cte_input_type: str | None = None,
     vae_metadata: dict | None = None,
+    cte_vae_input_size: tuple[int, int] | list[int] | None = None,
 ) -> None:
     model_config = dict(model.cfg.to_dict())
     if config:
@@ -58,6 +59,13 @@ def save_cte_checkpoint(
         "camera_keys": list(camera_keys),
     }
     if configured_input_type == "wan_vae_latent":
+        if cte_vae_input_size is None or len(cte_vae_input_size) != 2:
+            raise ValueError(
+                "wan_vae_latent checkpoints must record cte_vae_input_size as [H, W]"
+            )
+        cte_vae_input_size = tuple(int(value) for value in cte_vae_input_size)
+        if min(cte_vae_input_size) < 1:
+            raise ValueError("cte_vae_input_size must contain positive dimensions")
         required_vae_metadata = {
             "model_id",
             "vae_path",
@@ -72,6 +80,7 @@ def save_cte_checkpoint(
             )
         payload["latent_channels"] = int(model.cfg.image_channels)
         payload["vae_metadata"] = dict(vae_metadata or {})
+        payload["cte_vae_input_size"] = list(cte_vae_input_size)
     torch.save(payload, path)
 
 

@@ -41,6 +41,7 @@ class CacheManifest:
     latent_channels: int = 0
     cte_input_type: str = "rgb_frame"
     vae_metadata: dict[str, object] = field(default_factory=dict)
+    cte_vae_input_size: tuple[int, int] | None = None
     effect_window_transitions: int = 4
     transition_count: int = 8
     feature_dtype: str = "float32"
@@ -50,6 +51,11 @@ class CacheManifest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "camera_keys", tuple(self.camera_keys))
         object.__setattr__(self, "vae_metadata", dict(self.vae_metadata))
+        if self.cte_vae_input_size is not None:
+            size = tuple(int(value) for value in self.cte_vae_input_size)
+            if len(size) != 2 or min(size) < 1:
+                raise ValueError("cte_vae_input_size must be [H, W] with positive dimensions")
+            object.__setattr__(self, "cte_vae_input_size", size)
         if self.schema_version not in {"zeva_fastwam_robotwin_cache_v2", "zeva_fastwam_robotwin_cache_v3"}:
             raise ValueError(f"unsupported cache schema_version: {self.schema_version}")
         if self.action_dim < 1 or self.action_group_size < 1 or self.action_horizon < 1:

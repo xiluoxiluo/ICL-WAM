@@ -16,6 +16,16 @@ from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.schemas import CacheManifest, sha256_file
 
 
+def _video_size_hw(cfg: DictConfig) -> tuple[int, int]:
+    value = cfg.data.train.get("video_size")
+    if value is None or len(value) != 2:
+        raise ValueError("data.train.video_size must be [H, W] for Zeva cache construction")
+    size = tuple(int(v) for v in value)
+    if min(size) < 1:
+        raise ValueError(f"data.train.video_size must be positive, got {size}")
+    return size
+
+
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     # The Zeva block belongs to the FastWAM model config.  Keep all training
@@ -55,6 +65,17 @@ def main(cfg: DictConfig) -> None:
             "(input_type=rgb_frame|wan_vae_latent, action_dim=14, cameras=cam_high/cam_left_wrist/cam_right_wrist)"
         )
     checkpoint_vae_metadata = dict(payload.get("vae_metadata", {}))
+    cte_vae_input_size = _video_size_hw(cfg)
+    checkpoint_input_size = payload.get("cte_vae_input_size")
+    if cte_input_type == "wan_vae_latent":
+        if checkpoint_input_size is None or len(checkpoint_input_size) != 2:
+            raise ValueError("wan_vae_latent CTE checkpoints must include cte_vae_input_size")
+        checkpoint_input_size = tuple(int(v) for v in checkpoint_input_size)
+        if checkpoint_input_size != cte_vae_input_size:
+            raise ValueError(
+                "CTE/cache VAE input size mismatch: checkpoint declares "
+                f"{checkpoint_input_size}, data config uses {cte_vae_input_size}"
+            )
     if cte_input_type == "wan_vae_latent" and not checkpoint_vae_metadata:
         raise ValueError("wan_vae_latent CTE checkpoints must include vae_metadata")
     if cte_input_type == "wan_vae_latent":
@@ -109,7 +130,7 @@ def main(cfg: DictConfig) -> None:
         )
         validate_vae_metadata(checkpoint_vae_metadata, vae_metadata)
         frame_encoder = FastWAMCTELatentEncoder(
-            vae,
+            vae, resize=cte_vae_input_size,
             expected_channels=model.cfg.image_channels,
             input_range="minus_one_one",
         ).encode_history
@@ -216,6 +237,7 @@ def main(cfg: DictConfig) -> None:
         cte_input_type=cte_input_type,
         latent_channels=model.cfg.image_channels if cte_input_type == "wan_vae_latent" else 0,
         vae_metadata=dict(vae_metadata),
+        cte_vae_input_size=cte_vae_input_size if cte_input_type == "wan_vae_latent" else None,
     )
     if not records:
         raise RuntimeError("CTE cache construction produced no valid non-overlapping windows")

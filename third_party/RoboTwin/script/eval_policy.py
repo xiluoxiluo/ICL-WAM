@@ -436,8 +436,11 @@ def eval_policy(task_name,
                 if TASK_ENV.eval_success:
                     succ = True
                     break
-            if succ and hasattr(model, "finalize_attempt"):
-                model.finalize_attempt(TASK_ENV)
+            # A failed/timeout attempt can still contain a complete terminal
+            # transition.  Finalize every normally completed attempt so its
+            # after-frame is not silently dropped from CTE/PIM history.
+            if hasattr(model, "finalize_attempt"):
+                model.finalize_attempt(TASK_ENV, success=succ)
             if succ:
                 break
         # task_total_reward += TASK_ENV.episode_score

@@ -128,6 +128,49 @@ def test_nonzero_addon_gate_changes_action_path():
     assert not torch.equal(base, conditioned)
 
 
+def test_memory_content_changes_action_prediction():
+    """Different PIM content must affect actions, not merely a constant bias."""
+    torch.manual_seed(7)
+    model = _model().eval()
+    with torch.no_grad():
+        model.zeva_behavior_prefix_adapter.output.weight.normal_(mean=0.0, std=0.01)
+        model.zeva_behavior_prefix_adapter.pim_gate.fill_(math.atanh(0.5))
+
+    action = torch.randn(1, 32, 14)
+    timestep = torch.ones(1)
+    context = torch.randn(1, 3, 4)
+    context_mask = torch.ones(1, 3, dtype=torch.bool)
+    attention = torch.zeros(1, 33)
+    cache = [torch.zeros(1, 1, 1, 1)]
+    task = torch.randn(1, 256)
+    phase = torch.randn(1, 128)
+    bit = torch.randn(1, 4, 128)
+    bit_mask = torch.ones(1, 4, dtype=torch.bool)
+    pim_phase_a = torch.randn(1, 4, 128)
+    pim_effect_a = torch.randn(1, 4, 128)
+    pim_phase_b = pim_phase_a.clone()
+    pim_effect_b = -pim_effect_a
+    pim_mask = torch.ones(1, 4, dtype=torch.bool)
+
+    memory_a, mask_a = model.zeva_prompt_encoder(
+        task, phase, bit, bit_mask, pim_phase_a, pim_effect_a, pim_mask
+    )
+    memory_b, mask_b = model.zeva_prompt_encoder(
+        task, phase, bit, bit_mask, pim_phase_b, pim_effect_b, pim_mask
+    )
+    assert torch.linalg.vector_norm(memory_a - memory_b) > 1e-6
+
+    action_a = model._denoise_action_with_video_cache_zeva(
+        action, timestep, context, context_mask, cache, cache, attention, memory_a, mask_a
+    )
+    action_b = model._denoise_action_with_video_cache_zeva(
+        action, timestep, context, context_mask, cache, cache, attention, memory_b, mask_b
+    )
+    delta = torch.linalg.vector_norm(action_a - action_b)
+    assert torch.isfinite(delta)
+    assert delta > 1e-5
+
+
 def test_parameter_report_rejects_trainable_base():
     model = _model()
     model.base_probe = nn.Linear(2, 2)

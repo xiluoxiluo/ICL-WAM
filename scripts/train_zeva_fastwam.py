@@ -48,7 +48,16 @@ def main(cfg: DictConfig) -> None:
     if cte_input_type not in {"rgb_frame", "wan_vae_latent"}:
         raise ValueError(f"Unsupported CTE input type in checkpoint: {cte_input_type}")
     cte_vae_metadata = dict(cte_payload.get("vae_metadata", {}))
+    video_size = tuple(int(v) for v in cfg.data.train.get("video_size", ()))
+    if len(video_size) != 2 or min(video_size) < 1:
+        raise ValueError("data.train.video_size must be [H, W] for Stage 2")
+    cte_vae_input_size = cte_payload.get("cte_vae_input_size")
     if cte_input_type == "wan_vae_latent":
+        if cte_vae_input_size is None or tuple(int(v) for v in cte_vae_input_size) != video_size:
+            raise ValueError(
+                "CTE VAE input size mismatch between checkpoint and Stage 2 data config: "
+                f"checkpoint={cte_vae_input_size}, config={video_size}"
+            )
         required_vae_metadata = {
             "model_id",
             "vae_path",
@@ -78,6 +87,7 @@ def main(cfg: DictConfig) -> None:
     }
     if cte_input_type == "wan_vae_latent":
         expected["vae_metadata"] = cte_vae_metadata
+        expected["cte_vae_input_size"] = video_size
     prompt_cfg = cfg.model.get("zeva", {}).get("prompt", {})
     expected["phase_dim"] = int(prompt_cfg.get("phase_dim", 128))
     expected["effect_dim"] = int(prompt_cfg.get("effect_dim", 128))

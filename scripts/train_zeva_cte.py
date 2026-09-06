@@ -23,6 +23,16 @@ def _cfg_dict(value) -> dict:
     return {} if value is None else dict(OmegaConf.to_container(value, resolve=True))
 
 
+def _video_size_hw(cfg: DictConfig) -> tuple[int, int]:
+    value = cfg.data.train.get("video_size")
+    if value is None or len(value) != 2:
+        raise ValueError("data.train.video_size must be [H, W] for Zeva CTE training")
+    size = tuple(int(v) for v in value)
+    if min(size) < 1:
+        raise ValueError(f"data.train.video_size must be positive, got {size}")
+    return size
+
+
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     configured_device = cfg.get("device")
@@ -57,6 +67,7 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("rgb_frame CTE training requires image_channels=3")
     frame_encoder = None
     vae_metadata: dict[str, object] = {}
+    cte_vae_input_size = _video_size_hw(cfg)
     if cte_input_type == "wan_vae_latent":
         model_values = _cfg_dict(cfg.model)
         vae, vae_metadata = load_frozen_wan_vae(
@@ -67,7 +78,7 @@ def main(cfg: DictConfig) -> None:
             redirect_common_files=bool(model_values.get("redirect_common_files", True)),
         )
         frame_encoder = FastWAMCTELatentEncoder(
-            vae, expected_channels=model.cfg.image_channels,
+            vae, resize=cte_vae_input_size, expected_channels=model.cfg.image_channels,
             input_range="minus_one_one",
         ).encode_history
     if (
@@ -115,6 +126,7 @@ def main(cfg: DictConfig) -> None:
         "cte_input_type": cte_input_type,
         "latent_channels": model.cfg.image_channels if cte_input_type == "wan_vae_latent" else 0,
         "vae_metadata": vae_metadata,
+        "cte_vae_input_size": list(cte_vae_input_size),
         "camera_keys": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
     }
     (output_dir / "dataset_manifest.json").write_text(
@@ -261,6 +273,7 @@ def main(cfg: DictConfig) -> None:
         config=_cfg_dict(zeva),
         cte_input_type=cte_input_type,
         vae_metadata=vae_metadata,
+        cte_vae_input_size=cte_vae_input_size,
     )
     print(f"saved Stage 1 checkpoint: {output_dir / 'cte.pt'}")
 

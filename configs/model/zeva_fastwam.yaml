@@ -24,6 +24,7 @@ zeva:
     # explicitly separate CPU/debug checkpoint.
     image_channels: 48
     input_type: wan_vae_latent
+    vae_input_size: ${data.train.video_size}
   memory:
     bit_size: 4
     pim_top_k: 4

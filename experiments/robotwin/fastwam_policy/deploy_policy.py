@@ -184,6 +184,7 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        video_size: tuple[int, int] | list[int] = (384, 320),
         zeva_mode: str = "base",
         cte_checkpoint: Optional[str] = None,
         addon_checkpoint: Optional[str] = None,
@@ -207,6 +208,10 @@ class WorldActionRobotWinPolicy:
         self._cte_frame_encoder = None
         self._observed_effect_count = 0
         self._transition_actions: list[torch.Tensor] = []
+        self._attempt_finalized = False
+        if len(video_size) != 2 or min(int(v) for v in video_size) < 1:
+            raise ValueError(f"video_size must be [H, W] with positive dimensions, got {video_size}")
+        self.video_size = tuple(int(v) for v in video_size)
         self.max_attempts = int(max_attempts)
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -292,8 +297,20 @@ class WorldActionRobotWinPolicy:
                 }
                 if runtime_vae_metadata["model_id"]:
                     validate_vae_metadata(vae_metadata, runtime_vae_metadata)
+                checkpoint_size = cte_payload.get("cte_vae_input_size")
+                if checkpoint_size is None or len(checkpoint_size) != 2:
+                    raise ValueError(
+                        "wan_vae_latent CTE checkpoints must record cte_vae_input_size as [H, W]"
+                    )
+                checkpoint_size = tuple(int(v) for v in checkpoint_size)
+                if checkpoint_size != self.video_size:
+                    raise ValueError(
+                        "CTE VAE input size mismatch: checkpoint declares "
+                        f"{checkpoint_size}, evaluation data uses {self.video_size}"
+                    )
                 self._cte_frame_encoder = FastWAMCTELatentEncoder(
                     self.model,
+                    resize=self.video_size,
                     expected_channels=cte_cfg.image_channels,
                     input_range="minus_one_one",
                 ).encode_history
@@ -614,6 +631,7 @@ class WorldActionRobotWinPolicy:
         self._cte_history = None
         self._observed_effect_count = 0
         self._transition_actions.clear()
+        self._attempt_finalized = False
         if self.zeva_mode != "base":
             # The evaluator calls reset for both new episodes and retries.  A
             # retry explicitly follows with begin_attempt(), which preserves
@@ -632,6 +650,7 @@ class WorldActionRobotWinPolicy:
             self._cte_history = None
             self._observed_effect_count = 0
             self._transition_actions.clear()
+            self._attempt_finalized = False
             self._needs_episode_reset = True
             return
         if self.lifecycle.pim.task_cluster is not None:
@@ -639,47 +658,68 @@ class WorldActionRobotWinPolicy:
         self._cte_history = None
         self._observed_effect_count = 0
         self._transition_actions.clear()
+        self._attempt_finalized = False
         self._needs_episode_reset = self.lifecycle.pim.task_cluster is None
 
-    def finalize_attempt(self, task_env) -> None:
-        """Commit a complete terminal four-action transition after success.
+    def finalize_attempt(self, task_env, success: bool = False) -> None:
+        """Finalize one normally completed attempt, including failures.
 
         RoboTwin performs the terminal ``get_obs()`` inside ``take_action``
         before setting ``eval_success``; the evaluator exits its control loop
         immediately afterwards, so the normal next-step update would otherwise
         never see this final after-frame.
         """
-        if (
-            self.zeva_mode == "base"
-            or self.cte is None
-            or len(self._transition_actions) != self.cte.cfg.transition_steps
-        ):
+        if self._attempt_finalized:
             return
-        terminal_obs = getattr(task_env, "now_obs", None)
-        if not isinstance(terminal_obs, dict) or "observation" not in terminal_obs:
+
+        # Base mode has no lifecycle state, but still clear transient actions
+        # so a policy object can be safely reused by the evaluator.
+        if self.zeva_mode == "base" or self.cte is None or self.lifecycle is None:
+            self._transition_actions.clear()
+            self._attempt_finalized = True
             return
-        if self._cte_history is None:
-            return
-        next_image = self._build_robotwin_image_tensor(terminal_obs)[0].float()
-        action_group = torch.stack(self._transition_actions).to(self.model.device)
-        self._cte_history.append_transition(action_group, next_image)
-        encoded = self._cte_history.forward()
-        complete = encoded["effect_complete"][0]
-        while self._observed_effect_count < complete.shape[0]:
-            effect_index = self._observed_effect_count
-            if bool(complete[effect_index]):
-                start = effect_index * self.cte.cfg.effect_window_transitions
-                self.lifecycle.observe_completed_effect(
-                    encoded["phase"][0, start],
-                    encoded["effect_post"][0, effect_index],
-                    metadata={"source_step": start * self.cte.cfg.transition_steps},
-                )
-            self._observed_effect_count += 1
-        self._transition_actions.clear()
-        # The evaluator does not start another attempt after success.  Flush
-        # the pending phase/effect pairs now so the lifecycle has the same
-        # commit semantics as a retry boundary.
-        self.lifecycle.end_attempt()
+
+        try:
+            terminal_obs = getattr(task_env, "now_obs", None)
+            has_terminal_obs = isinstance(terminal_obs, dict) and "observation" in terminal_obs
+            has_complete_tail = len(self._transition_actions) == self.cte.cfg.transition_steps
+
+            # Only a complete four-action group paired with a trustworthy
+            # after-frame may be appended.  Incomplete tails are discarded,
+            # never padded or otherwise fabricated.
+            if has_terminal_obs and has_complete_tail and self._cte_history is not None:
+                next_image = self._build_robotwin_image_tensor(terminal_obs)[0].float()
+                action_group = torch.stack(self._transition_actions).to(self.model.device)
+                self._cte_history.append_transition(action_group, next_image)
+                encoded = self._cte_history.forward()
+                complete = encoded["effect_complete"][0]
+                while self._observed_effect_count < complete.shape[0]:
+                    effect_index = self._observed_effect_count
+                    if bool(complete[effect_index]):
+                        start = effect_index * self.cte.cfg.effect_window_transitions
+                        self.lifecycle.observe_completed_effect(
+                            encoded["phase"][0, start],
+                            encoded["effect_post"][0, effect_index],
+                            metadata={
+                                "source_step": start * self.cte.cfg.transition_steps,
+                                "terminal_attempt": True,
+                                "attempt_success": bool(success),
+                                "terminal_observation_used": True,
+                            },
+                        )
+                    self._observed_effect_count += 1
+
+            self._transition_actions.clear()
+            # Commit effects observed earlier in this attempt even when the
+            # terminal tail was incomplete or no reliable terminal frame was
+            # available.
+            if self.lifecycle.pim.task_cluster is not None:
+                self.lifecycle.end_attempt()
+            self._attempt_finalized = True
+        except Exception:
+            # Keep the guard unset so callers may retry after an operational
+            # failure; do not claim the attempt was finalized prematurely.
+            raise
 
 
 def encode_obs(observation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -774,6 +814,7 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        video_size=tuple(int(v) for v in cfg.data.train.video_size),
         zeva_mode=zeva_mode,
         cte_checkpoint=None if _is_none_like(cte_checkpoint) else str(cte_checkpoint),
         addon_checkpoint=None if _is_none_like(addon_checkpoint) else str(addon_checkpoint),

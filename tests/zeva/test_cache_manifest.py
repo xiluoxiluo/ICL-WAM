@@ -32,5 +32,7 @@ def test_cache_manifest_tracks_latent_contract_separately():
             "temporal_downsample_factor": 4,
             "upsampling_factor": 8,
         },
+        cte_vae_input_size=(384, 320),
     )
     assert manifest.image_channels == manifest.latent_channels == 48
+    assert manifest.cte_vae_input_size == (384, 320)
