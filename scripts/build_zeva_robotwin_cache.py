@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections import defaultdict
 
 import hydra
 import torch
@@ -10,7 +11,14 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset
-from fastwam.zeva import CausalTransitionEncoder, CausalTransitionEncoderConfig, FastWAMCTELatentEncoder, load_frozen_wan_vae, validate_vae_metadata
+from fastwam.zeva import (
+    CausalTransitionEncoder,
+    CausalTransitionEncoderConfig,
+    FastWAMCTELatentEncoder,
+    build_cte_query_index,
+    load_frozen_wan_vae,
+    validate_vae_metadata,
+)
 from fastwam.zeva.cache import save_phase_effect_cache
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.schemas import CacheManifest, sha256_file
@@ -137,91 +145,153 @@ def main(cfg: DictConfig) -> None:
     model.to(cte_device)
     model.eval()
     records = []
-    # RobotVideoDataset exposes overlapping windows (normally stride=1).  Cache
-    # only ordered, non-overlapping 32-action source windows.  Each source
-    # window is passed through the canonical full-history Zeva CTE once; no
-    # recurrent hidden state is carried between windows.
-    next_episode_step: dict[str, int] = {}
+    # Keep every complete source window for phase queries (including deploy
+    # positions such as 24/48). Shared boundaries/actions are deduplicated and
+    # each contiguous episode segment is encoded once as a full prefix.
+    index_rows = build_cte_query_index(
+        dataset,
+        sample_stride=sample_stride,
+        transition_steps=model.cfg.transition_steps,
+    )
+    grouped: dict[str, list[tuple[object, dict]]] = defaultdict(list)
+    for index_row in index_rows:
+        grouped[index_row.episode_id].append((index_row, dataset[index_row.dataset_index]))
     seen_source_indices: set[int] = set()
-    with torch.no_grad():
-        for index in range(len(dataset)):
-            sample = dataset[index]
-            episode = sample["episode"]
-            episode_id = str(episode.episode_id)
-            episode_step = int(episode.episode_step)
-            expected_step = next_episode_step.get(episode_id)
-            if expected_step is not None:
-                if episode_step < expected_step:
-                    # Overlapping source windows are deliberately not cached;
-                    # their start state is already represented by the previous
-                    # non-overlapping chunk.
-                    continue
-                if episode_step != expected_step:
-                    # A gap means the recurrent state cannot be joined safely.
-                    # Start a new causal segment rather than silently carrying
-                    # state across an unknown interval.
-                    next_episode_step.pop(episode_id, None)
 
-            source_index = int(sample.get("dataset_index", index))
-            if source_index in seen_source_indices:
-                raise ValueError(
-                    f"dataset returned duplicate source index {source_index}; "
-                    "cache construction cannot preserve deterministic joins"
-                )
-            frames = sample.get("cte_frames")
-            preencoded = frames is not None
-            if frames is None:
-                frames = torch.cat((sample["before_frames"], sample["after_frames"][-1:]), dim=0)
-            elif frames.ndim != 4 or frames.shape[0] != 9:
-                raise ValueError("sample['cte_frames'] must be [9,C,H,W]")
-            if frame_encoder is not None and not preencoded:
-                frames = frame_encoder(frames.unsqueeze(0))[0].cpu()
-            frames = frames.unsqueeze(0).to(cte_device)
-            actions = sample["transition_actions"].unsqueeze(0).to(cte_device)
-            output = model(
-                frames,
-                actions,
-                valid_mask=sample["frame_valid"].unsqueeze(0).to(cte_device),
-                transition_valid=sample["transition_valid"].unsqueeze(0).to(cte_device),
-            )
-            # Stage 2 queries phase_pre for the window's first action. If t=0
-            # is invalid, later valid records cannot be safely joined to this
-            # 32-action target, so discard the whole window.
-            if not bool(output["transition_complete"][0, 0]):
-                next_episode_step.pop(episode_id, None)
-                continue
-            seen_source_indices.add(source_index)
-            # Zeva observes one effect after each four-transition (16-action)
-            # window.  Store exactly the two effect rows produced by the
-            # 32-action source window, with the phase captured at window start.
-            effect_count = output["effect_post"].shape[1]
-            for effect_index in range(effect_count):
-                if not bool(output["effect_complete"][0, effect_index]):
+    def source_frames(sample: dict) -> tuple[torch.Tensor, bool]:
+        frames = sample.get("cte_frames")
+        preencoded = frames is not None
+        if frames is None:
+            frames = torch.cat((sample["before_frames"], sample["after_frames"][-1:]), dim=0)
+        if frames.ndim != 4 or frames.shape[0] != 9:
+            raise ValueError("sample['cte_frames'] must be [9,C,H,W]")
+        return frames, preencoded
+
+    with torch.no_grad():
+        for episode_id, entries in grouped.items():
+            boundary_frames: dict[int, torch.Tensor] = {}
+            action_groups: dict[int, torch.Tensor] = {}
+            source_rows: dict[int, object] = {}
+            source_samples: dict[int, dict] = {}
+            for index_row, sample in entries:
+                index = int(index_row.dataset_index)
+                source_index = int(sample.get("dataset_index", index))
+                if source_index in seen_source_indices:
+                    raise ValueError(
+                        f"dataset returned duplicate source index {source_index}; "
+                        "cache construction cannot preserve deterministic joins"
+                    )
+                seen_source_indices.add(source_index)
+                source_rows[source_index] = index_row
+                source_samples[source_index] = sample
+                frames, _preencoded = source_frames(sample)
+                start = int(index_row.episode_step)
+                for local_index, frame in enumerate(frames):
+                    raw_step = start + local_index * model.cfg.transition_steps * sample_stride
+                    previous = boundary_frames.get(raw_step)
+                    if previous is not None and not torch.allclose(previous, frame, atol=1.0e-6, rtol=0.0):
+                        raise ValueError(f"inconsistent RGB/latent boundary at episode={episode_id} raw_step={raw_step}")
+                    boundary_frames.setdefault(raw_step, frame)
+                for local_index, action_group in enumerate(sample["transition_actions"]):
+                    raw_step = start + local_index * model.cfg.transition_steps * sample_stride
+                    previous = action_groups.get(raw_step)
+                    if previous is not None and not torch.allclose(previous, action_group, atol=1.0e-6, rtol=0.0):
+                        raise ValueError(f"inconsistent action group at episode={episode_id} raw_step={raw_step}")
+                    action_groups.setdefault(raw_step, action_group)
+
+            raw_steps = sorted(boundary_frames)
+            segments: list[list[int]] = []
+            segment: list[int] = []
+            for raw_step in raw_steps:
+                if segment and (
+                    raw_step != segment[-1] + model.cfg.transition_steps * sample_stride
+                    or segment[-1] not in action_groups
+                ):
+                    segments.append(segment)
+                    segment = []
+                segment.append(raw_step)
+            if segment:
+                segments.append(segment)
+
+            for segment in segments:
+                if len(segment) < 2:
                     continue
-                transition_index = effect_index * model.cfg.effect_window_transitions
-                transition_end = transition_index + model.cfg.effect_window_transitions
-                records.append({
-                    "episode_id": episode.episode_id,
-                    "task_id": episode.task_id,
-                    "attempt_id": 0,
-                    "window_index": source_index,
-                    "episode_step": episode_step + transition_index * model.cfg.transition_steps * sample_stride,
-                    "transition_index": transition_index,
-                    "effect_index": effect_index,
-                    "phase_pre": output["phase"][0, transition_index],
-                    "phase_post": output["phase"][0, transition_end],
-                    "effect": output["effect_post"][0, effect_index],
-                    "valid": True,
-                })
-            if bool(sample["frame_valid"].all()) and bool(sample["transition_valid"].all()):
-                next_episode_step[episode_id] = episode_step + 32 * sample_stride
-            else:
-                # A partial/padded window cannot establish the next ordered
-                # source position.
-                next_episode_step.pop(episode_id, None)
+                first_frames = [boundary_frames[raw_step] for raw_step in segment]
+                frames = torch.stack(first_frames)
+                actions = torch.stack([action_groups[raw_step] for raw_step in segment[:-1]])
+                encoded_flags = [source_frames(source_samples[index])[1] for index in source_samples]
+                if any(encoded_flags) and not all(encoded_flags):
+                    raise ValueError("a full-history segment cannot mix RGB and preencoded CTE frames")
+                if cte_input_type == "rgb_frame" and any(encoded_flags):
+                    raise ValueError("rgb_frame CTE cache cannot consume preencoded latent frames")
+                if cte_input_type == "wan_vae_latent" and frame_encoder is not None and not any(encoded_flags):
+                    frames = frame_encoder(frames.unsqueeze(0))[0].cpu()
+                output = model(
+                    frames.unsqueeze(0).to(cte_device),
+                    actions.unsqueeze(0).to(cte_device),
+                    valid_mask=torch.ones((1, len(segment)), dtype=torch.bool, device=cte_device),
+                    transition_valid=torch.ones(
+                        (1, len(segment) - 1, actions.shape[1]), dtype=torch.bool, device=cte_device
+                    ),
+                )
+                raw_to_index = {raw_step: i for i, raw_step in enumerate(segment)}
+                for source_index, index_row in source_rows.items():
+                    query_raw_step = int(index_row.episode_step)
+                    if query_raw_step not in raw_to_index:
+                        continue
+                    query_index = raw_to_index[query_raw_step]
+                    query_phase = output["phase"][0, query_index]
+                    records.append({
+                        "record_type": "phase_query",
+                        "episode_id": episode_id,
+                        "task_id": index_row.task_id,
+                        "attempt_id": 0,
+                        "window_index": source_index,
+                        "episode_step": query_raw_step,
+                        "raw_step": query_raw_step,
+                        "start_raw_step": query_raw_step,
+                        "end_raw_step": query_raw_step,
+                        "transition_index": query_index,
+                        "effect_index": 0,
+                        "phase_pre": query_phase,
+                        "phase_post": query_phase,
+                        "effect": torch.zeros(model.cfg.effect_dim, device=query_phase.device),
+                        "valid": True,
+                    })
+                effect_count = output["effect_post"].shape[1]
+                for effect_index in range(effect_count):
+                    if not bool(output["effect_complete"][0, effect_index]):
+                        continue
+                    start_index = effect_index * model.cfg.effect_window_transitions
+                    end_index = start_index + model.cfg.effect_window_transitions
+                    start_raw_step = segment[start_index]
+                    end_raw_step = segment[end_index]
+                    records.append({
+                        "record_type": "effect",
+                        "episode_id": episode_id,
+                        "task_id": next(iter(source_rows.values())).task_id,
+                        "attempt_id": 0,
+                        "window_index": None,
+                        "episode_step": start_raw_step,
+                        "raw_step": end_raw_step,
+                        "start_raw_step": start_raw_step,
+                        "end_raw_step": end_raw_step,
+                        "transition_index": start_index,
+                        "effect_index": effect_index,
+                        "phase_pre": output["phase"][0, start_index],
+                        "phase_post": output["phase"][0, end_index],
+                        "effect": output["effect_post"][0, effect_index],
+                        "valid": True,
+                    })
+
+    record_order = {"effect": 0, "phase_query": 1}
+    records.sort(key=lambda row: (str(row["episode_id"]), int(row["raw_step"]), record_order[row["record_type"]]))
     cache_cfg = zeva.get("cache", {})
     stats_hash = sha256_file(stats_path)
     manifest = CacheManifest(
+        schema_version="zeva_fastwam_robotwin_cache_v4",
+        history_semantics="full_episode_prefix",
+        query_step_unit="raw_action_step",
         cte_checkpoint_sha256=checkpoint_sha256(cte_path),
         dataset_stats_sha256=stats_hash,
         dataset_path=str(cfg.data.train.dataset_dirs[0]),
@@ -240,7 +310,7 @@ def main(cfg: DictConfig) -> None:
         cte_vae_input_size=cte_vae_input_size if cte_input_type == "wan_vae_latent" else None,
     )
     if not records:
-        raise RuntimeError("CTE cache construction produced no valid non-overlapping windows")
+        raise RuntimeError("CTE cache construction produced no valid full-history query/effect records")
     save_phase_effect_cache(cache_path, records, manifest)
     print(f"saved {len(records)} phase/effect records to {cache_path}")
 

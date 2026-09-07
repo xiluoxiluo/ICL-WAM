@@ -49,7 +49,6 @@ zeva:
     num_heads: 8
     mlp_ratio: 2.0
     gate_init: 0.0
-    train_gate_epsilon: 1.0e-3
   cache:
     path: null
     strict_manifest: true

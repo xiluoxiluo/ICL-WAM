@@ -172,7 +172,7 @@ def create_fastwam(
         prompt_cfg = dict(zeva.get("prompt", {}))
         adapter_cfg = dict(zeva.get("adapter", {}))
         prompt_keys = {"global_dim", "phase_dim", "effect_dim", "brief_length", "persistent_length", "hidden_dim", "num_heads"}
-        adapter_keys = {"memory_dim", "action_horizon", "action_hidden_dim", "num_heads", "mlp_ratio", "gate_init", "train_gate_epsilon"}
+        adapter_keys = {"memory_dim", "action_horizon", "action_hidden_dim", "num_heads", "mlp_ratio", "gate_init"}
         model.attach_zeva_addon(
             CausalPromptEncoder(CausalPromptConfig(**{k: v for k, v in prompt_cfg.items() if k in prompt_keys})),
             BehaviorPrefixAdapter(BehaviorPrefixAdapterConfig(**{k: v for k, v in adapter_cfg.items() if k in adapter_keys})),

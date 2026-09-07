@@ -71,7 +71,9 @@ def main(cfg: DictConfig) -> None:
                 f"metadata: {sorted(required_vae_metadata)}"
             )
     expected = {
-        "schema_version": "zeva_fastwam_robotwin_cache_v3",
+        "schema_version": "zeva_fastwam_robotwin_cache_v4",
+        "history_semantics": "full_episode_prefix",
+        "query_step_unit": "raw_action_step",
         "action_dim": 14,
         "action_group_size": 4,
         "action_horizon": 32,

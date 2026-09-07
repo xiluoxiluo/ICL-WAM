@@ -20,11 +20,11 @@ only when `zeva.enabled=true`.
   completed transitions (16 raw actions); a 32-action window therefore yields
   eight transitions and two effect windows. There is no formal
   `initialize/update` or transition-level effect head.
-- BIT is cleared at an attempt boundary. PIM entries persist within an episode
-  and merge phase/effect prototypes across attempts using a running
-  mean/count. The merged entry is tagged with the latest attempt, so retrieval
-  excludes the active attempt and exposes the accumulated prototype from the
-  next attempt onward.
+- BIT is cleared at an attempt boundary. PIM entries are appended as soon as
+  an effect is completed, so a later query in the same attempt can retrieve
+  that completed interaction. PIM entries persist within an episode and merge
+  phase/effect prototypes across attempts using a running mean/count;
+  incomplete/future effects are never written.
 - PIM candidates pair the phase at the effect-window start with its observed
   `effect_post`; action queries use the current phase. This matches the online
   lifecycle and offline cache proxy.
@@ -40,20 +40,23 @@ only when `zeva.enabled=true`.
 
 ## Intentional initialization detail
 
-The design calls for both a zero output projection and `tanh(alpha)` with
-`alpha=0`. Their product is an exact no-op at initialization. During training
-only, a small `train_gate_epsilon` (default `1e-3`) lets the zero-initialized
-output projection receive gradients; evaluation and `pim_shadow` use the exact
-gate-controlled path, so gate zero is numerically identical to base FastWAM.
+The output projection uses Xavier initialization and `tanh(alpha)` starts at
+`alpha=0`. Their product is an exact no-op at initialization while preserving
+an expressive residual direction. Training and evaluation use the same
+gate-controlled formula; after the gate moves, gradients flow through the
+adapter and prompt encoder normally.
 
 ## Cache and checkpoints
 
 Phase/effect features are written as safetensors shards with a JSON manifest and
-episode index (schema `v3`). Cache rows retain the source dataset index and episode start
-step, plus an effect index, so a dataset retry cannot silently join a feature from another window.
+episode index (schema `v4` for repaired full-episode-prefix caches; `v3` remains
+readable for diagnostics). Cache rows retain the source dataset index, raw query
+step, episode start step, and effect index, so a dataset retry cannot silently
+join a feature from another window.
 Zeva dataset/cache builders reject a retry that changes the requested source
-index, reject non-unit global sampling stride, and consume only ordered,
-non-overlapping full-history windows without recurrent state handoff.
+index and reject non-unit global sampling stride. Stage 1 consumes ordered,
+non-overlapping windows for optimization; cache construction retains all
+complete query positions and joins them into contiguous full-history segments.
 The manifest records CTE hash, dataset stats hash, camera order,
 action normalization, dimensions, and schema version. CTE and addon checkpoints
 are separate; addon loading can require matching base and CTE SHA256 values.

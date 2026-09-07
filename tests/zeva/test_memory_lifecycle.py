@@ -3,11 +3,13 @@ import torch
 from fastwam.zeva import CausalMemoryLifecycle, PersistentInteractionMemory, PersistentInteractionMemoryConfig
 
 
-def test_bit_clears_and_pim_excludes_current_attempt():
+def test_bit_clears_and_pim_exposes_completed_current_attempt():
     pim = PersistentInteractionMemory(PersistentInteractionMemoryConfig(phase_dim=2, effect_dim=2, capacity=8, top_k=2))
     lifecycle = CausalMemoryLifecycle(pim); lifecycle.set_effect_dim(2); lifecycle.reset_episode("task", episode_id="ep")
     lifecycle.observe_completed_transition(torch.tensor([1.0, 0.0]), torch.tensor([1.0, 0.0]))
-    assert lifecycle.memory_inputs(torch.tensor([1.0, 0.0]), torch.zeros(256))["pim_mask"].sum() == 0
+    # A completed effect is persistent immediately and is causally visible to
+    # the next query in the same attempt.
+    assert lifecycle.memory_inputs(torch.tensor([1.0, 0.0]), torch.zeros(256))["pim_mask"].sum() == 1
     lifecycle.reset_attempt(1)
     assert lifecycle.bit.tensors().valid.sum() == 0
     assert lifecycle.memory_inputs(torch.tensor([1.0, 0.0]), torch.zeros(256))["pim_mask"].sum() == 1
@@ -35,6 +37,28 @@ def test_reset_attempt_requires_episode_before_mutating_lifecycle():
         raise AssertionError("reset_attempt accepted an uninitialized PIM")
     assert lifecycle._attempt_id == 0
     assert lifecycle._transition_index == 0
+
+
+def test_observe_effect_requires_episode_before_mutating_bit():
+    pim = PersistentInteractionMemory(PersistentInteractionMemoryConfig(phase_dim=2, effect_dim=2))
+    lifecycle = CausalMemoryLifecycle(pim)
+    try:
+        lifecycle.observe_completed_effect(torch.ones(2), torch.ones(2))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("observe_completed_effect accepted an uninitialized PIM")
+    assert lifecycle.bit.tensors().valid.sum() == 0
+
+
+def test_effect_index_metadata_is_canonical():
+    pim = PersistentInteractionMemory(PersistentInteractionMemoryConfig(phase_dim=2, effect_dim=2))
+    lifecycle = CausalMemoryLifecycle(pim)
+    lifecycle.reset_episode("task")
+    lifecycle.observe_completed_effect(
+        torch.tensor([1.0, 0.0]), torch.tensor([1.0, 0.0]), metadata={"effect_index": 99}
+    )
+    assert pim.entries[0].metadata["effect_index"] == 0
 
 
 def test_cross_attempt_pim_merge_is_hidden_until_next_attempt():
@@ -68,7 +92,7 @@ def test_cross_attempt_pim_merge_is_hidden_until_next_attempt():
     assert sources[0]["last_attempt_id"] == 1
 
 
-def test_effect_lifecycle_keeps_window_offset_and_commits_pending_pairs():
+def test_effect_lifecycle_keeps_window_offset_and_writes_immediately():
     pim = PersistentInteractionMemory(
         PersistentInteractionMemoryConfig(phase_dim=2, effect_dim=2, capacity=8, top_k=2)
     )
@@ -81,8 +105,9 @@ def test_effect_lifecycle_keeps_window_offset_and_commits_pending_pairs():
         torch.tensor([0.0, 1.0]), torch.tensor([0.0, 1.0])
     )
     # Effects are indexed 0/1, but their source transition windows begin at
-    # transition 0/4 in the 8-transition source window.
-    assert len(pim) == 0
+    # transition 0/4 in the 8-transition source window. Both are persistent
+    # before the attempt boundary, while BIT is still attempt-scoped.
+    assert len(pim) == 2
     lifecycle.end_attempt()
     assert [entry.transition_index for entry in pim.entries] == [0, 4]
     assert [entry.metadata["effect_index"] for entry in pim.entries] == [0, 1]

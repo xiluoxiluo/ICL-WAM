@@ -25,6 +25,11 @@ class TransitionRecord:
 @dataclass(frozen=True)
 class CacheManifest:
     schema_version: str = "zeva_fastwam_robotwin_cache_v3"
+    # v4 caches are computed from a contiguous episode prefix. v3 remains
+    # readable for diagnostics/tests but must not be used for the repaired
+    # Stage 2 training path.
+    history_semantics: str = "window_local"
+    query_step_unit: str = "episode_step"
     cte_checkpoint_sha256: str = ""
     dataset_stats_sha256: str = ""
     dataset_path: str = ""
@@ -56,8 +61,21 @@ class CacheManifest:
             if len(size) != 2 or min(size) < 1:
                 raise ValueError("cte_vae_input_size must be [H, W] with positive dimensions")
             object.__setattr__(self, "cte_vae_input_size", size)
-        if self.schema_version not in {"zeva_fastwam_robotwin_cache_v2", "zeva_fastwam_robotwin_cache_v3"}:
+        if self.schema_version not in {
+            "zeva_fastwam_robotwin_cache_v2",
+            "zeva_fastwam_robotwin_cache_v3",
+            "zeva_fastwam_robotwin_cache_v4",
+        }:
             raise ValueError(f"unsupported cache schema_version: {self.schema_version}")
+        if self.history_semantics not in {"window_local", "full_episode_prefix"}:
+            raise ValueError("unsupported cache history_semantics")
+        if self.query_step_unit not in {"episode_step", "raw_action_step"}:
+            raise ValueError("unsupported cache query_step_unit")
+        if self.schema_version == "zeva_fastwam_robotwin_cache_v4" and (
+            self.history_semantics != "full_episode_prefix"
+            or self.query_step_unit != "raw_action_step"
+        ):
+            raise ValueError("cache v4 requires full_episode_prefix/raw_action_step semantics")
         if self.action_dim < 1 or self.action_group_size < 1 or self.action_horizon < 1:
             raise ValueError("cache action dimensions must be positive")
         if self.action_horizon % self.action_group_size != 0:

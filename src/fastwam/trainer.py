@@ -22,7 +22,6 @@ from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 from .zeva.checkpoint import checkpoint_sha256
-from .zeva.causal_prompt import task_tokens_from_context
 
 logger = get_logger(__name__)
 
@@ -843,42 +842,12 @@ class Wan22Trainer:
 
                 with self.accelerator.autocast():
                     if self.zeva_training:
-                        video = sample["video"]
-                        if video.ndim != 5 or video.shape[2] < 1:
-                            raise ValueError("Zeva training sample video must be [B,3,T,H,W]")
-                        if "behavior_memory" in sample:
-                            behavior_memory = sample["behavior_memory"]
-                            behavior_memory_mask = sample["behavior_memory_mask"]
-                        else:
-                            context_for_task = sample["context"].to(train_model.device)
-                            context_mask_for_task = sample.get("context_mask")
-                            if context_mask_for_task is not None:
-                                context_mask_for_task = context_mask_for_task.to(train_model.device)
-                            task_dim = int(train_model.zeva_prompt_encoder.config.global_dim)
-                            task_tokens = task_tokens_from_context(
-                                context_for_task,
-                                context_mask_for_task,
-                                task_dim,
-                            )
-                            behavior_memory, behavior_memory_mask = train_model.zeva_prompt_encoder(
-                                task_tokens=task_tokens,
-                                current_phase=sample["phase"].to(train_model.device),
-                                bit_effects=sample["bit_effects"].to(train_model.device),
-                                bit_mask=sample["bit_mask"].to(train_model.device),
-                                pim_phases=sample["pim_phases"].to(train_model.device),
-                                pim_effects=sample["pim_effects"].to(train_model.device),
-                                pim_mask=sample["pim_mask"].to(train_model.device),
-                            )
-                        loss, loss_dict = train_model.forward_zeva_action_train(
-                            input_image=video[:, :, 0],
-                            clean_action=sample["action"],
-                            context=sample["context"],
-                            context_mask=sample["context_mask"],
-                            behavior_memory=behavior_memory,
-                            behavior_memory_mask=behavior_memory_mask,
-                            proprio=sample.get("proprio"),
-                            action_valid=sample.get("action_valid"),
-                        )
+                        # Route through the prepared wrapper so DDP/
+                        # DeepSpeed forward hooks observe the complete Zeva
+                        # prompt -> adapter -> action-loss graph.
+                        sample = dict(sample)
+                        sample["_training_mode"] = "zeva_stage2"
+                        loss, loss_dict = self.model(sample)
                         if not torch.isfinite(loss):
                             raise FloatingPointError(
                                 f"Non-finite Zeva Stage 2 action loss at global step {self.global_step + 1}: {loss.item()}"

@@ -122,13 +122,13 @@ torchrun --standalone --nproc_per_node=8 \
 | `beta_phase/beta_effect` | 0.5 / 0.5 | PIM 相似度两部分权重 |
 | prompt hidden / adapter hidden | 256 / 1024 | CausalPromptEncoder 和 prefix adapter 宽度 |
 | `adapter.gate_init` | 0 | addon 初始为精确 no-op |
-| `train_gate_epsilon` | `1e-3` | 仅训练时让零初始化输出层获得梯度，评测不加 epsilon |
+| `adapter.output` / gate formula | Xavier / `tanh(gate)` | 输出投影非零；训练与评测使用同一 gate 公式 |
 | action scheduler shift | 1.0 / 1.0 | `train_shift` / `infer_shift`，与 FastWAM action path 对齐 |
 | Stage 2 batch/lr/steps | 16 / `2e-4` / 10000 | 任务配置默认值，可按显存覆盖 |
 
-因果顺序必须保持：正式 CTE 使用 Zeva 的 full-history `[B,T,C,H,W]` 接口，RGB 到 Wan latent 的转换只在冻结的外部 adapter 中执行，action stream 采用 right-shift；每 4 个 action 形成一个 transition，每 4 个 transition（16 个 action）才产生一个 completed effect。BIT 在每次 attempt 开始时清空，PIM 以 effect-window 起点的 pending phase 配对 observed `effect_post`，在同一 episode 的 retry 间保留并做 running mean/count 合并；当前 attempt 的条目不会被当前 attempt 自己检索。
+因果顺序必须保持：正式 CTE 使用 Zeva 的 full-history `[B,T,C,H,W]` 接口，RGB 到 Wan latent 的转换只在冻结的外部 adapter 中执行，action stream 采用 right-shift；每 4 个 action 形成一个 transition，每 4 个 transition（16 个 action）才产生一个 completed effect。BIT 在每次 attempt 开始和结束时清空，PIM 在 completed effect 形成时立即写入，以 effect-window 起点的 phase 配对 observed `effect_post`，在同一 episode 的 retry 间保留并做 running mean/count 合并；只有已完成的 effect 才能被后续 query 检索。
 
-评测时 `EVALUATION.skip_get_obs_within_replan=false` 是强制要求，否则无法为每个已执行 action 配对 after-frame。Zeva 模式下 `replan_steps` 必须是 4 的倍数，默认 8；`action_horizon` 必须是 32。
+评测时 `EVALUATION.skip_get_obs_within_replan=false` 是强制要求，否则无法为每个已执行 action 配对 after-frame。Zeva 模式下 `replan_steps` 必须是 4 的倍数，默认 24；`action_horizon` 必须是 32。
 
 ## 4. Checkpoint、cache 和路径约定
 
@@ -136,7 +136,7 @@ torchrun --standalone --nproc_per_node=8 \
 | --- | --- | --- | --- |
 | FastWAM base checkpoint | `runs/robotwin_uncond_3cam_384_1e-4/<run>/checkpoints/weights/step_XXXXXX.pt` 或 release `.pt` | 原 FastWAM 训练 | Stage 2 的 `ckpt=`、所有评测的 `--ckpt` |
 | CTE checkpoint | `runs/zeva_cte/cte.pt` | Stage 1 | cache 构建、Stage 2、`pim_shadow/pim_on` 评测 |
-| phase/effect cache | `data/robotwin2.0/zeva_cache/v1/` | `build_zeva_robotwin_cache.py` | Stage 2 离线 memory prefix |
+| phase/effect cache | `data/robotwin2.0/zeva_cache/v4/` | `build_zeva_robotwin_cache.py` | Stage 2 离线 memory prefix |
 | Stage 2 addon | `runs/zeva_stage2/checkpoints/weights/step_XXXXXX_addon.pt` | Stage 2 | 仅 `pim_on` 评测 |
 | dataset stats | `data/robotwin2.0/dataset_stats.json` | 数据预处理/已有发布文件 | Stage 1、cache、Stage 2、评测 |
 | ActionDiT backbone | `checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt` | 预处理脚本 | 构造 FastWAM 模型 |
@@ -146,7 +146,7 @@ base checkpoint 必须是兼容 14 维 RoboTwin FastWAM 的 checkpoint，通常�
 cache 目录至少包含：
 
 ```text
-zeva_cache/v1/
+zeva_cache/v4/
 ├── manifest.json
 ├── episode_index.json
 └── phase_effect-*.safetensors
@@ -181,6 +181,7 @@ python scripts/build_zeva_robotwin_transitions.py \
 ### 5.2 Stage 1：训练 CTE
 
 Stage 1 不需要传 FastWAM base checkpoint，但需要数据、`dataset_stats.json` 和 T5 cache。CTE 训练输出 `cte.pt`、解析后的 `config.yaml`、`dataset_manifest.json` 和 `metrics.jsonl`。
+训练脚本先建立 episode 内不重叠的 32-action 索引，再按 task 组织 minibatch（默认每 task 4 个样本）；`metrics.jsonl` 会记录实际 batch、同 task positive 数、窗口起点和各项 CTE loss。数据不足以形成平衡 batch 时会保留剩余样本并在日志中体现实际退化情况。
 
 ```bash
 python scripts/train_zeva_cte.py \
@@ -201,14 +202,14 @@ python scripts/train_zeva_cte.py \
 
 ### 5.3 构建 CTE phase/effect cache
 
-该脚本加载冻结的 Stage 1 CTE，按 episode 顺序取不重叠且完整的 32-action full-history 窗口；每窗口写入两个 effect rows，并写出 safetensors shards 和严格 manifest。
+该脚本加载冻结的 Stage 1 CTE，按 episode 顺序构建连续 full-history 前缀；phase query 与 completed effect 使用独立记录，并写出 v4 safetensors shards 和严格 manifest。query 保留部署可能使用的 raw-step 位置，不把 32-action 监督窗口结束后的未来 phase 当作当前输入。
 
 ```bash
 python scripts/build_zeva_robotwin_cache.py \
   --config-name train \
   task=robotwin_zeva_fastwam_3cam_384 \
   model.zeva.cte.checkpoint=./runs/zeva_cte/cte.pt \
-  model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v1
+  model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v4
 ```
 
 如果更换 `dataset_stats.json`、相机顺序、CTE 维度或数据集路径，请使用新的 cache 目录或先删除旧 cache 后重建。
@@ -227,7 +228,7 @@ python scripts/train_zeva_fastwam.py \
   task=robotwin_zeva_fastwam_3cam_384 \
   ckpt=./runs/robotwin_uncond_3cam_384_1e-4/fastwam_base/checkpoints/weights/step_010000.pt \
   model.zeva.cte.checkpoint=./runs/zeva_cte/cte.pt \
-  model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v1 \
+  model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v4 \
   output_dir=./runs/zeva_stage2 \
   mixed_precision=bf16
 ```
@@ -239,7 +240,7 @@ python scripts/train_zeva_fastwam.py \
   --config-name train task=robotwin_zeva_fastwam_3cam_384 \
   ckpt=./runs/robotwin_uncond_3cam_384_1e-4/fastwam_base/checkpoints/weights/step_010000.pt \
   model.zeva.cte.checkpoint=./runs/zeva_cte/cte.pt \
-  model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v1 \
+  model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v4 \
   output_dir=./runs/zeva_stage2 \
   resume=./runs/zeva_stage2/checkpoints/state/step_005000
 ```

@@ -1,4 +1,5 @@
 import math
+from types import MethodType
 
 import torch
 from torch import nn
@@ -84,11 +85,11 @@ def test_gate_zero_action_path_matches_base_and_addon_gets_gradients():
     )
     pred.square().mean().backward()
     assert model.zeva_behavior_prefix_adapter.pim_gate.grad is not None
-    # The epsilon training gate makes the zero-initialized output projection
-    # identifiable on the first optimizer step; without this gradient the
-    # addon would remain a permanent no-op.
+    # The exact zero gate intentionally makes the first residual update a
+    # gate-only step; once the gate opens, the projector and prompt receive
+    # ordinary upstream gradients.
     assert model.zeva_behavior_prefix_adapter.output.weight.grad is not None
-    assert model.zeva_behavior_prefix_adapter.output.weight.grad.norm() > 0
+    assert model.zeva_behavior_prefix_adapter.output.weight.grad.norm() == 0
     assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.zeva_prompt_encoder.parameters())
     assert all(p.grad is None for p in model.action_expert.parameters())
 
@@ -229,3 +230,32 @@ def test_attach_zeva_addon_freezes_base_modules():
     )
     assert any(parameter.requires_grad for parameter in model.zeva_prompt_encoder.parameters())
     assert any(parameter.requires_grad for parameter in model.zeva_behavior_prefix_adapter.parameters())
+
+
+def test_forward_routes_stage2_through_model_entrypoint():
+    model = _model()
+    called = {}
+
+    def fake_forward(self, **kwargs):
+        called.update(kwargs)
+        return torch.tensor(2.0), {"loss_action": 2.0}
+
+    model.forward_zeva_action_train = MethodType(fake_forward, model)
+    sample = {
+        "_training_mode": "zeva_stage2",
+        "video": torch.zeros(1, 3, 1, 8, 8),
+        "action": torch.zeros(1, 32, 14),
+        "context": torch.zeros(1, 3, 256),
+        "context_mask": torch.ones(1, 3, dtype=torch.bool),
+        "phase": torch.zeros(1, 128),
+        "bit_effects": torch.zeros(1, 4, 128),
+        "bit_mask": torch.zeros(1, 4, dtype=torch.bool),
+        "pim_phases": torch.zeros(1, 4, 128),
+        "pim_effects": torch.zeros(1, 4, 128),
+        "pim_mask": torch.zeros(1, 4, dtype=torch.bool),
+    }
+    loss, metrics = model(sample)
+    assert loss.item() == 2.0
+    assert metrics["memory/bit_count"] == 0.0
+    assert metrics["memory/pim_count"] == 0.0
+    assert called["behavior_memory"].shape == (1, 4, 256)

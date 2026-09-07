@@ -87,39 +87,58 @@ class ZevaStage2Dataset(Dataset):
     """Attach causal prompt inputs to each frozen FastWAM training window."""
 
     def __init__(self, base_dataset: Dataset, cache: PhaseEffectCache, top_k: int = 4, bit_size: int = 4):
-        if cache.manifest.schema_version != "zeva_fastwam_robotwin_cache_v3":
+        if cache.manifest.schema_version not in {"zeva_fastwam_robotwin_cache_v3", "zeva_fastwam_robotwin_cache_v4"}:
             raise ValueError(
-                "Stage 2 requires zeva_fastwam_robotwin_cache_v3; older "
+                "Stage 2 requires zeva_fastwam_robotwin_cache_v3/v4; older "
                 "transition-level caches are incompatible with effect-window cadence"
             )
         self.base = ZevaRobotWinDataset(base_dataset)
         self.cache = cache
         self.top_k, self.bit_size = int(top_k), int(bit_size)
-        self._cached_window_indices = tuple(sorted({
-            int(row["window_index"])
-            for row in cache.rows
-            if row.get("window_index") is not None
-            and int(row.get("effect_index", 0 if int(row.get("transition_index", -1)) == 0 else -1)) == 0
-        }))
+        if cache.manifest.schema_version == "zeva_fastwam_robotwin_cache_v4":
+            self._cached_window_indices = tuple(sorted({
+                int(row["window_index"])
+                for row_index, row in enumerate(cache.rows)
+                if row.get("record_type") == "phase_query"
+                and row.get("window_index") is not None
+                and cache.get(row_index)["valid"]
+            }))
+        else:
+            self._cached_window_indices = tuple(sorted({
+                int(row["window_index"])
+                for row_index, row in enumerate(cache.rows)
+                if row.get("window_index") is not None
+                and int(row.get("effect_index", 0 if int(row.get("transition_index", -1)) == 0 else -1)) == 0
+                and cache.get(row_index)["valid"]
+            }))
         if not self._cached_window_indices:
             raise ValueError("Stage 2 cache contains no complete window starts (transition_index=0)")
         self._window_rows: dict[int, int] = {}
         self._bit_history: dict[int, tuple[torch.Tensor, ...]] = {}
         episode_effects: dict[str, deque[torch.Tensor]] = defaultdict(lambda: deque(maxlen=self.bit_size))
-        # Build the causal BIT prefix once. The cache writer emits rows in
-        # episode/window/effect order, so each effect is observed only after
-        # the current window's effect-0 query has captured its prefix.
+        # Build the causal BIT prefix once. v4 cache rows are ordered with a
+        # completed effect before a phase query at the same raw boundary, so
+        # an effect ending at raw step s is visible to the query at s. Legacy
+        # v3 rows retain their original window-local ordering.
         for row_index in range(len(cache.rows)):
             item = cache.get(row_index)
             window_index = item.get("window_index")
             episode_id = str(item["episode_id"])
-            if window_index is not None and int(item.get("effect_index", 0 if int(item["transition_index"]) == 0 else -1)) == 0:
+            is_query = (
+                item.get("record_type") == "phase_query"
+                if cache.manifest.schema_version == "zeva_fastwam_robotwin_cache_v4"
+                else int(item.get("effect_index", 0 if int(item["transition_index"]) == 0 else -1)) == 0
+            )
+            if window_index is not None and is_query and item["valid"]:
                 window_index = int(window_index)
                 if window_index in self._window_rows:
                     raise ValueError(f"duplicate cache window_index {window_index}")
                 self._window_rows[window_index] = row_index
                 self._bit_history[window_index] = tuple(episode_effects[episode_id])
-            if item["valid"]:
+            if item["valid"] and (
+                cache.manifest.schema_version != "zeva_fastwam_robotwin_cache_v4"
+                or item.get("record_type") == "effect"
+            ):
                 episode_effects[episode_id].append(item["effect"])
         self.bank = MemoryBank(
             phase_dim=int(cache.manifest.phase_dim),
@@ -128,6 +147,8 @@ class ZevaStage2Dataset(Dataset):
         )
         for row_index, row in enumerate(cache.rows):
             item = cache.get(row_index)
+            if cache.manifest.schema_version == "zeva_fastwam_robotwin_cache_v4" and item.get("record_type") != "effect":
+                continue
             self.bank.add(
                 # PIM stores the phase at the beginning of the effect window;
                 # use the same phase_pre representation for offline retrieval.
@@ -167,6 +188,17 @@ class ZevaStage2Dataset(Dataset):
         expected_window = current.get("window_index")
         if expected_window != source_index:
             raise ValueError(f"cache window_index mismatch: expected {source_index}, got {expected_window}")
+        if self.cache.manifest.schema_version == "zeva_fastwam_robotwin_cache_v4":
+            if current.get("record_type") != "phase_query":
+                raise ValueError("Stage 2 window mapping must point to a v4 phase_query record")
+            raw_step = current.get("raw_step")
+            if raw_step is None or int(raw_step) != int(current.get("episode_step")):
+                raise ValueError("v4 phase_query raw_step and episode_step must identify the same query boundary")
+            if int(sample["episode"].episode_step) != int(raw_step):
+                raise ValueError(
+                    "Stage 2 sample/cache raw-step mismatch: "
+                    f"sample={sample['episode'].episode_step}, cache={raw_step}"
+                )
         episode_id = current["episode_id"]
         phase = current["phase_pre"]
         effect_dim = int(self.cache.manifest.effect_dim)
@@ -177,7 +209,11 @@ class ZevaStage2Dataset(Dataset):
             bit_effects[-len(previous):] = torch.stack(previous)
             bit_mask[-len(previous):] = True
         retrieved = self.bank.retrieve(phase, episode_id=episode_id, task_id=current["task_id"], top_k=self.top_k)
+        current_raw_step = current.get("raw_step")
+        if current_raw_step is None:
+            current_raw_step = current.get("episode_step", 0)
         sample.update({"phase": phase, "bit_effects": bit_effects, "bit_mask": bit_mask,
+                       "raw_step": int(current_raw_step),
                        "pim_phases": retrieved.phases, "pim_effects": retrieved.effects, "pim_mask": retrieved.mask,
                        "behavior_memory": None, "behavior_memory_mask": None})
         # The trainer builds memory tokens through CausalPromptEncoder.

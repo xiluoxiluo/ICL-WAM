@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from fastwam.utils.logging_config import get_logger
+from fastwam.zeva.causal_prompt import task_tokens_from_context
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
@@ -792,6 +793,8 @@ class FastWAM(torch.nn.Module):
     ) -> torch.Tensor:
         if self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Zeva addon is not attached to this FastWAM instance")
+        if behavior_memory_mask.ndim != 2 or behavior_memory_mask.shape[1] != 4:
+            raise ValueError("behavior_memory_mask must be the four-token CausalPrompt mask")
         (
             action_tokens,
             _t,
@@ -806,10 +809,6 @@ class FastWAM(torch.nn.Module):
             context_mask=context_mask,
         )
         if gate_override is None and self.zeva_behavior_prefix_adapter.training:
-            # The production gate starts at zero.  During Stage 2 the adapter
-            # uses its tiny training-only epsilon so the first backward pass
-            # can identify both the residual projection and the prompt path.
-            # Eval/shadow paths remain exactly tanh(gate)-controlled.
             gated_residual = self.zeva_behavior_prefix_adapter.gated(
                 behavior_memory, behavior_memory_mask, action_horizon=latents_action.shape[1]
             )
@@ -821,6 +820,13 @@ class FastWAM(torch.nn.Module):
             if gate_override is not None:
                 gate = gate.new_tensor(float(gate_override))
             gated_residual = gate * residual
+        # CausalPromptEncoder places the persistent-memory summary last in its
+        # four-token output. Task/phase/BIT conditioning remains available when
+        # PIM is empty, but the PIM residual itself is an exact no-op.
+        has_pim = behavior_memory_mask[:, -1].to(
+            device=gated_residual.device, dtype=gated_residual.dtype
+        ).view(-1, 1, 1)
+        gated_residual = gated_residual * has_pim
         if debug is not None:
             base_norm = action_tokens.detach().float().norm(dim=-1).mean()
             delta_norm = gated_residual.detach().float().norm(dim=-1).mean()
@@ -851,8 +857,8 @@ class FastWAM(torch.nn.Module):
     def _validate_zeva_memory(self, behavior_memory, behavior_memory_mask, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.zeva_enabled or self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Zeva addon is not attached to this FastWAM instance")
-        if behavior_memory.ndim != 3 or behavior_memory.shape[0] != batch_size:
-            raise ValueError("behavior_memory must be [B,N,d_mem]")
+        if behavior_memory.ndim != 3 or behavior_memory.shape[0] != batch_size or behavior_memory.shape[1] != 4:
+            raise ValueError("behavior_memory must be [B,4,d_mem]")
         if behavior_memory_mask.shape != behavior_memory.shape[:2]:
             raise ValueError("behavior_memory_mask must be [B,N]")
         return behavior_memory.to(self.device), behavior_memory_mask.to(self.device, dtype=torch.bool)
@@ -959,6 +965,15 @@ class FastWAM(torch.nn.Module):
         }
         for key, value in debug_metrics.items():
             metrics[key] = float(value.detach().cpu())
+        # Keep stable metric names for rollout/trainer dashboards while
+        # retaining the short keys used by existing callers.
+        metrics.update({
+            "memory/gate": metrics["gate"],
+            "memory/base_action_hidden_norm": metrics.get("base_action_hidden_norm", 0.0),
+            "memory/memory_delta_hidden_norm": metrics.get("memory_delta_hidden_norm", 0.0),
+            "memory/conditioned_action_hidden_norm": metrics.get("conditioned_action_hidden_norm", 0.0),
+            "memory/memory_residual_ratio": metrics.get("memory_residual_ratio", 0.0),
+        })
         return loss, metrics
 
     @torch.no_grad()
@@ -1524,4 +1539,59 @@ class FastWAM(torch.nn.Module):
         return payload
 
     def forward(self, *args, **kwargs):
+        if args and isinstance(args[0], dict):
+            sample = args[0]
+            if sample.get("_training_mode", "base") == "zeva_stage2":
+                return self._forward_zeva_stage2(sample)
         return self.training_loss(*args, **kwargs)
+
+    def _forward_zeva_stage2(self, sample: dict[str, Any]):
+        """Prepared-model forward route for Zeva Stage 2.
+
+        Keeping prompt construction and the conditioned action loss behind the
+        module's forward entry preserves DDP/DeepSpeed forward hooks. Frozen
+        video/VAE work remains bounded by ``forward_zeva_action_train``'s
+        no-grad region.
+        """
+        if not self.zeva_enabled or self.zeva_prompt_encoder is None:
+            raise RuntimeError("Zeva Stage 2 forward requires an attached addon")
+        required = ("video", "action", "context", "context_mask", "phase", "bit_effects", "bit_mask", "pim_phases", "pim_effects", "pim_mask")
+        missing = [key for key in required if key not in sample]
+        if missing:
+            raise KeyError(f"Zeva Stage 2 sample is missing fields: {missing}")
+        video = sample["video"]
+        if video.ndim != 5 or video.shape[2] < 1:
+            raise ValueError("Zeva Stage 2 sample video must be [B,3,T,H,W]")
+        context = sample["context"].to(self.device)
+        context_mask = sample["context_mask"].to(self.device, dtype=torch.bool)
+        task_tokens = task_tokens_from_context(
+            context,
+            context_mask,
+            int(self.zeva_prompt_encoder.config.global_dim),
+        )
+        behavior_memory, behavior_memory_mask = self.zeva_prompt_encoder(
+            task_tokens=task_tokens,
+            current_phase=sample["phase"].to(self.device),
+            bit_effects=sample["bit_effects"].to(self.device),
+            bit_mask=sample["bit_mask"].to(self.device),
+            pim_phases=sample["pim_phases"].to(self.device),
+            pim_effects=sample["pim_effects"].to(self.device),
+            pim_mask=sample["pim_mask"].to(self.device),
+        )
+        loss, metrics = self.forward_zeva_action_train(
+            input_image=video[:, :, 0],
+            clean_action=sample["action"],
+            context=sample["context"],
+            context_mask=sample["context_mask"],
+            behavior_memory=behavior_memory,
+            behavior_memory_mask=behavior_memory_mask,
+            proprio=sample.get("proprio"),
+            action_valid=sample.get("action_valid"),
+        )
+        metrics.update(
+            {
+                "memory/bit_count": float(sample["bit_mask"].to(dtype=torch.float32).sum(dim=-1).mean().detach().cpu()),
+                "memory/pim_count": float(sample["pim_mask"].to(dtype=torch.float32).sum(dim=-1).mean().detach().cpu()),
+            }
+        )
+        return loss, metrics

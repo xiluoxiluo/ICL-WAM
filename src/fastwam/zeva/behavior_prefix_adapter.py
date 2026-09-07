@@ -16,10 +16,6 @@ class BehaviorPrefixAdapterConfig:
     num_heads: int = 8
     mlp_ratio: float = 2.0
     gate_init: float = 0.0
-    # A tiny training-only offset lets the zero-initialized residual projection
-    # receive gradients while alpha is still zero. Evaluation remains exactly
-    # gate-controlled.
-    train_gate_epsilon: float = 1.0e-3
 
     def __post_init__(self) -> None:
         if min(self.memory_dim, self.action_horizon, self.action_hidden_dim, self.num_heads) < 1:
@@ -28,8 +24,6 @@ class BehaviorPrefixAdapterConfig:
             raise ValueError("action_hidden_dim must be divisible by num_heads")
         if self.mlp_ratio <= 0:
             raise ValueError("mlp_ratio must be positive")
-        if self.train_gate_epsilon < 0:
-            raise ValueError("train_gate_epsilon cannot be negative")
 
 
 class BehaviorPrefixAdapter(nn.Module):
@@ -41,9 +35,11 @@ class BehaviorPrefixAdapter(nn.Module):
         self.cross_attention = nn.MultiheadAttention(cfg.action_hidden_dim, cfg.num_heads, batch_first=True)
         self.mlp = nn.Sequential(nn.LayerNorm(cfg.action_hidden_dim), nn.Linear(cfg.action_hidden_dim, int(cfg.mlp_ratio * cfg.action_hidden_dim)), nn.GELU(), nn.Linear(int(cfg.mlp_ratio * cfg.action_hidden_dim), cfg.action_hidden_dim))
         self.output = nn.Linear(cfg.action_hidden_dim, cfg.action_hidden_dim)
-        # Required by the V1 contract: the addon is an exact no-op at its
-        # initialization (tanh(alpha)=0 and residual=0).
-        nn.init.zeros_(self.output.weight); nn.init.zeros_(self.output.bias)
+        # Match Zeva's stable initialization: the residual projector is
+        # expressive from the first step, while tanh(gate_init)=0 keeps the
+        # complete addon an exact no-op until the scalar gate moves.
+        nn.init.xavier_uniform_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
         self.pim_gate = nn.Parameter(torch.tensor(float(cfg.gate_init)))
 
     def forward(self, memory_tokens: Tensor, memory_mask: Tensor, action_horizon: int | None = None) -> Tensor:
@@ -64,7 +60,4 @@ class BehaviorPrefixAdapter(nn.Module):
         return self.output(attended + self.mlp(attended))
 
     def gated(self, memory_tokens: Tensor, memory_mask: Tensor, action_horizon: int | None = None) -> Tensor:
-        gate = torch.tanh(self.pim_gate)
-        if self.training and self.config.train_gate_epsilon:
-            gate = gate + float(self.config.train_gate_epsilon)
-        return gate * self.forward(memory_tokens, memory_mask, action_horizon)
+        return torch.tanh(self.pim_gate) * self.forward(memory_tokens, memory_mask, action_horizon)

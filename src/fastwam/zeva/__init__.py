@@ -5,6 +5,7 @@ from .causal_prompt import CausalPromptConfig, CausalPromptEncoder, task_tokens_
 from .causal_transition_encoder import CausalTransitionEncoder, CausalTransitionEncoderConfig
 from .cte_losses import CTELossConfig, causal_transition_encoder_loss
 from .lifecycle import CausalCTEHistory, CausalMemoryLifecycle, LifecycleConfig
+from .stage1_sampling import CTETrainIndex, TaskBalancedCTEBatchSampler, build_cte_query_index, build_cte_training_index
 from .memory import BriefInteractionTrace, PersistentInteractionMemory, PersistentInteractionMemoryConfig
 from .retrieval import MemoryBank, RetrievalResult
 from .schemas import CacheManifest, TransitionRecord, build_transition_view, transition_valid_mask
@@ -23,6 +24,10 @@ __all__ = [
     "CausalMemoryLifecycle",
     "CausalCTEHistory",
     "LifecycleConfig",
+    "CTETrainIndex",
+    "TaskBalancedCTEBatchSampler",
+    "build_cte_training_index",
+    "build_cte_query_index",
     "BriefInteractionTrace",
     "PersistentInteractionMemory",
     "PersistentInteractionMemoryConfig",

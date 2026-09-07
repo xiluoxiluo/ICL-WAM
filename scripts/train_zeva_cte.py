@@ -13,7 +13,14 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset
-from fastwam.zeva import CausalTransitionEncoder, CausalTransitionEncoderConfig, CTELossConfig, causal_transition_encoder_loss
+from fastwam.zeva import (
+    CausalTransitionEncoder,
+    CausalTransitionEncoderConfig,
+    CTELossConfig,
+    TaskBalancedCTEBatchSampler,
+    build_cte_training_index,
+    causal_transition_encoder_loss,
+)
 from fastwam.zeva.checkpoint import load_cte_checkpoint, save_cte_checkpoint
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_vae
@@ -107,6 +114,30 @@ def main(cfg: DictConfig) -> None:
             f"frame/action alignment; got {sample_stride}"
         )
     steps = int(cfg.get("max_steps") or 1000)
+    training_index = build_cte_training_index(
+        dataset,
+        source_window_actions=32,
+        sample_stride=sample_stride,
+    )
+    if not training_index:
+        raise ValueError("Stage 1 contains no complete, non-overlapping CTE windows")
+    samples_per_task = int(cfg.get("cte_samples_per_task") or 4)
+    configured_tasks = cfg.get("cte_tasks_per_batch")
+    tasks_per_batch = None if configured_tasks in (None, "", "None", "null") else int(configured_tasks)
+    if tasks_per_batch is None:
+        tasks_per_batch = max(1, min(4, batch_size // max(samples_per_task, 1)))
+    batch_sampler = TaskBalancedCTEBatchSampler(
+        training_index,
+        batch_size=batch_size,
+        tasks_per_batch=tasks_per_batch,
+        samples_per_task=samples_per_task,
+        seed=int(cfg.get("seed", 42)),
+    )
+    if tasks_per_batch < 2:
+        print(
+            "Stage 1 warning: configured batch_size cannot provide two tasks "
+            f"with {samples_per_task} samples per task; task contrastive loss may be sparse."
+        )
     scheduler = CosineAnnealingLR(optimizer, T_max=max(steps, 1))
     model.train(); step = 0
     output_dir = Path(str(cfg.output_dir))
@@ -146,13 +177,14 @@ def main(cfg: DictConfig) -> None:
             metrics_file = (output_dir / "metrics.jsonl").open("a", encoding="utf-8")
     else:
         metrics_file = (output_dir / "metrics.jsonl").open("w", encoding="utf-8")
-    next_episode_step: dict[str, int] = {}
     semantic_lookup: dict[str, int] = {}
-    pending: list[dict] = []
 
     def train_batch(batch: list[dict]) -> None:
         frames_list, actions_list, valid_list, transition_valid_list = [], [], [], []
         semantic_ids = []
+        batch_task_keys: list[str] = []
+        batch_episode_ids: list[str] = []
+        batch_window_starts: list[int] = []
         for sample in batch:
             frames = sample.get("cte_frames")
             preencoded = frames is not None
@@ -174,6 +206,9 @@ def main(cfg: DictConfig) -> None:
             )
             semantic_lookup.setdefault(task_key, len(semantic_lookup))
             semantic_ids.append(semantic_lookup[task_key])
+            batch_task_keys.append(task_key)
+            batch_episode_ids.append(str(episode.episode_id))
+            batch_window_starts.append(int(episode.episode_step))
 
         frames = torch.stack(frames_list, dim=0).to(device)
         actions = torch.stack(actions_list, dim=0).to(device)
@@ -204,7 +239,7 @@ def main(cfg: DictConfig) -> None:
         optimizer.step()
         scheduler.step()
         model.update_ema_target()
-        metrics_file.write(json.dumps({
+        metric_payload = {
             "step": int(step + 1),
             "loss": float(losses["total"].detach().cpu()),
             "action": float(losses["action"].detach().cpu()),
@@ -213,56 +248,55 @@ def main(cfg: DictConfig) -> None:
             "phase": float(losses["loss_phase"].detach().cpu()),
             "effect": float(losses["loss_effect"].detach().cpu()),
             "grad_norm": float(grad_norm.detach().cpu()),
-        }) + "\n")
+            "actual_batch_size": len(batch),
+            "distinct_task_count": len(set(batch_task_keys)),
+            "task_positive_anchor_count": sum(
+                count for count in {key: batch_task_keys.count(key) for key in set(batch_task_keys)}.values()
+                if count > 1
+            ),
+            "task_positive_pair_count": sum(
+                count * (count - 1) // 2
+                for count in {key: batch_task_keys.count(key) for key in set(batch_task_keys)}.values()
+            ),
+            "distinct_episode_count": len(set(batch_episode_ids)),
+            "dataset_index": [int(sample.get("dataset_index", -1)) for sample in batch],
+            "episode_id": batch_episode_ids,
+            "task_id": batch_task_keys,
+            "episode_step": batch_window_starts,
+        }
+        metric_payload.update({
+            "cte/loss": metric_payload["loss"],
+            "cte/loss_action": metric_payload["action"],
+            "cte/loss_vision": metric_payload["vision"],
+            "cte/loss_task": metric_payload["task"],
+            "cte/loss_phase": metric_payload["phase"],
+            "cte/loss_effect": metric_payload["effect"],
+            "cte/actual_batch_size": metric_payload["actual_batch_size"],
+            "cte/distinct_task_count": metric_payload["distinct_task_count"],
+            "cte/task_positive_anchor_count": metric_payload["task_positive_anchor_count"],
+            "cte/task_positive_pair_count": metric_payload["task_positive_pair_count"],
+            "cte/distinct_episode_count": metric_payload["distinct_episode_count"],
+        })
+        metrics_file.write(json.dumps(metric_payload) + "\n")
         metrics_file.flush()
-        for sample in batch:
-            episode = sample["episode"]
-            episode_id = str(episode.episode_id)
-            if bool(sample["frame_valid"].all()) and bool(sample["transition_valid"].all()):
-                next_episode_step[episode_id] = int(episode.episode_step) + 32 * sample_stride
-            else:
-                # A masked/padded window cannot establish the next ordered
-                # source position; the next valid window starts a new sample.
-                next_episode_step.pop(episode_id, None)
 
+    epoch = 0
     while step < steps:
-        # The CTE receives each complete window as full history.  Restart only
-        # the source-window cursor at an epoch boundary; there is no recurrent
-        # state handoff between optimizer batches.
-        next_episode_step.clear()
-        for sample in dataset:
-            episode = sample["episode"]
-            episode_id = str(episode.episode_id)
-            episode_step = int(episode.episode_step)
-            if not bool(sample["transition_valid"].any()):
-                # A fully padded window contributes no CTE objective and must
-                # not trigger a backward pass on a constant zero loss.
-                continue
-            expected_step = next_episode_step.get(episode_id)
-            # RobotVideoDataset windows normally overlap at stride=1. Consume
-            # each episode in ordered 32-action chunks and skip overlap rows.
-            if expected_step is not None and episode_step < expected_step:
-                continue
-            # Keep at most one chunk from an episode in a minibatch so each
-            # optimizer batch contains distinct causal windows.
-            if pending and any(str(item["episode"].episode_id) == episode_id for item in pending):
-                train_batch(pending)
-                pending.clear()
-                step += 1
-                if step >= steps:
-                    break
-            pending.append(sample)
-            if len(pending) < batch_size:
-                continue
-            train_batch(pending)
-            pending.clear()
-            step += 1
+        # Temporal selection is complete before batching. This prevents a
+        # same-episode overlap row (e.g. step 1) from being flushed into the
+        # next optimizer batch after step 0 was selected.
+        batch_sampler.set_epoch(epoch)
+        epoch += 1
+        progressed = False
+        for index_batch in batch_sampler:
             if step >= steps:
                 break
-        if pending and step < steps:
-            train_batch(pending)
-            pending.clear()
+            batch = [dataset[row.dataset_index] for row in index_batch]
+            train_batch(batch)
             step += 1
+            progressed = True
+        if not progressed:
+            raise RuntimeError("Stage 1 sampler produced no training batch")
     metrics_file.close()
     save_cte_checkpoint(
         output_dir / "cte.pt",

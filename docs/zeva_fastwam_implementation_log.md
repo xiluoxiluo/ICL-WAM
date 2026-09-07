@@ -45,9 +45,12 @@ string device `"None"`.
 The CTE module follows Zeva's generic frame-tensor interface (`[B,T,C,H,W]`).
 Direct RGB runs use `C=3`; Zeva/FastWAM serving can select an explicit frozen
 Wan-VAE adapter, with input type, channel count, and VAE identity recorded in
-checkpoint/cache metadata. VAE encoding never occurs inside CTE. Cache rows are
-effect-window level (two rows per complete 32-action window), and PIM pairing
-uses pending phase plus observed `effect_post`.
+checkpoint/cache metadata. VAE encoding never occurs inside CTE. Repaired
+cache construction uses a full-episode-prefix v4 schema with separate
+phase-query and effect records; online history encodes each newly observed
+boundary frame once. PIM pairing uses the phase at effect-window start plus
+observed `effect_post`, and writes a completed effect immediately so later
+queries in the same attempt can see it.
 
 ## Remaining empirical gates
 
