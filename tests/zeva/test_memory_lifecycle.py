@@ -86,3 +86,4 @@ def test_effect_lifecycle_keeps_window_offset_and_commits_pending_pairs():
     lifecycle.end_attempt()
     assert [entry.transition_index for entry in pim.entries] == [0, 4]
     assert [entry.metadata["effect_index"] for entry in pim.entries] == [0, 1]
+    assert lifecycle.bit.tensors().valid.sum() == 0

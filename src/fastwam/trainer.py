@@ -97,6 +97,11 @@ class Wan22Trainer:
                 int(report["trainable_count"]),
                 int(report["frozen_count"]),
             )
+            trainable_modules = sorted({
+                str(name).split(".", 1)[0]
+                for name in report["trainable_names"]
+            })
+            logger.info("Zeva trainable modules: %s", ", ".join(trainable_modules))
         else:
             trainable_params = list(self.model.dit.parameters())
             proprio_encoder = getattr(self.model, "proprio_encoder", None)

@@ -128,6 +128,30 @@ def test_nonzero_addon_gate_changes_action_path():
     assert not torch.equal(base, conditioned)
 
 
+def test_conditioned_action_path_reports_residual_debug_metrics():
+    model = _model()
+    memory = torch.randn(1, 4, 256)
+    memory_mask = torch.ones(1, 4, dtype=torch.bool)
+    action = torch.randn(1, 32, 14)
+    timestep = torch.ones(1)
+    context = torch.randn(1, 3, 4)
+    context_mask = torch.ones(1, 3, dtype=torch.bool)
+    attention = torch.zeros(1, 33)
+    cache = [torch.zeros(1, 1, 1, 1)]
+    with torch.no_grad():
+        model.zeva_behavior_prefix_adapter.output.weight.normal_(std=0.01)
+        model.zeva_behavior_prefix_adapter.pim_gate.fill_(math.atanh(0.5))
+    debug = {}
+    model._denoise_action_with_video_cache_zeva(
+        action, timestep, context, context_mask, cache, cache, attention,
+        memory, memory_mask, debug=debug,
+    )
+    assert debug["base_action_hidden_norm"] > 0
+    assert debug["memory_delta_hidden_norm"] > 0
+    assert debug["conditioned_action_hidden_norm"] > 0
+    assert torch.isfinite(debug["memory_residual_ratio"])
+
+
 def test_memory_content_changes_action_prediction():
     """Different PIM content must affect actions, not merely a constant bias."""
     torch.manual_seed(7)
@@ -186,3 +210,22 @@ def test_parameter_report_rejects_trainable_base():
         pass
     else:
         raise AssertionError("base parameter was not rejected by Zeva whitelist")
+
+
+def test_attach_zeva_addon_freezes_base_modules():
+    model = _model()
+    # _model() emulates an already-constructed FastWAM with an attached addon;
+    # exercise the same invariant directly on its public attach method.
+    model.zeva_enabled = False
+    model.zeva_prompt_encoder = None
+    model.zeva_behavior_prefix_adapter = None
+    model.attach_zeva_addon(CausalPromptEncoder(), BehaviorPrefixAdapter(
+        BehaviorPrefixAdapterConfig(action_hidden_dim=8, num_heads=2)
+    ))
+    assert all(
+        not parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if not name.startswith(("zeva_prompt_encoder.", "zeva_behavior_prefix_adapter."))
+    )
+    assert any(parameter.requires_grad for parameter in model.zeva_prompt_encoder.parameters())
+    assert any(parameter.requires_grad for parameter in model.zeva_behavior_prefix_adapter.parameters())

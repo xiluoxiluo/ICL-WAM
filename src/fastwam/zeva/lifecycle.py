@@ -173,6 +173,10 @@ class CausalMemoryLifecycle:
                 metadata={"effect_index": pending.effect_index, **pending.metadata},
             )
         self._pending.clear()
+        # BIT is scoped to the just-finished attempt.  Clear it immediately,
+        # including when there will be no retry, so stale short-term evidence
+        # cannot be observed after the lifecycle boundary.
+        self.bit.reset()
 
     def reset_attempt(self, attempt_id: int) -> None:
         attempt_id = int(attempt_id)

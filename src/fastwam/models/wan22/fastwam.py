@@ -759,8 +759,14 @@ class FastWAM(torch.nn.Module):
             raise ValueError("Zeva V1 BehaviorPrefixAdapter action_horizon must be 32")
         if int(self.action_expert.action_dim) != 14:
             raise ValueError("Zeva V1 requires a 14-dimensional FastWAM action expert")
+        # Make the Zeva contract safe even when the caller does not go through
+        # Wan22Trainer: the pretrained FastWAM path is frozen before the addon
+        # modules are attached, while the addon remains explicitly trainable.
+        self.requires_grad_(False)
         self.zeva_prompt_encoder = causal_prompt_encoder.to(device=self.device, dtype=self.torch_dtype)
         self.zeva_behavior_prefix_adapter = behavior_prefix_adapter.to(device=self.device, dtype=self.torch_dtype)
+        self.zeva_prompt_encoder.requires_grad_(True)
+        self.zeva_behavior_prefix_adapter.requires_grad_(True)
         self.zeva_enabled = True
         self.zeva_mode = "pim_on"
         return self
@@ -782,6 +788,7 @@ class FastWAM(torch.nn.Module):
         behavior_memory: torch.Tensor,
         behavior_memory_mask: torch.Tensor,
         gate_override: Optional[float] = None,
+        debug: Optional[dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Zeva addon is not attached to this FastWAM instance")
@@ -814,7 +821,21 @@ class FastWAM(torch.nn.Module):
             if gate_override is not None:
                 gate = gate.new_tensor(float(gate_override))
             gated_residual = gate * residual
-        action_tokens = action_tokens + gated_residual.to(dtype=action_tokens.dtype)
+        if debug is not None:
+            base_norm = action_tokens.detach().float().norm(dim=-1).mean()
+            delta_norm = gated_residual.detach().float().norm(dim=-1).mean()
+            conditioned = action_tokens + gated_residual.to(dtype=action_tokens.dtype)
+            debug.update(
+                {
+                    "base_action_hidden_norm": base_norm,
+                    "memory_delta_hidden_norm": delta_norm,
+                    "conditioned_action_hidden_norm": conditioned.detach().float().norm(dim=-1).mean(),
+                    "memory_residual_ratio": delta_norm / base_norm.clamp_min(1.0e-8),
+                }
+            )
+            action_tokens = conditioned
+        else:
+            action_tokens = action_tokens + gated_residual.to(dtype=action_tokens.dtype)
         action_tokens = self.mot.forward_action_with_video_cache_tensor(
             action_tokens=action_tokens,
             action_freqs=action_freqs,
@@ -907,11 +928,13 @@ class FastWAM(torch.nn.Module):
                 video_context=video_context, video_context_mask=video_context_mask,
                 video_attention_mask=attention_mask[: video_tokens.shape[1], : video_tokens.shape[1]],
             )
+        debug_metrics: dict[str, torch.Tensor] = {}
         pred_action = self._denoise_action_with_video_cache_zeva(
             latents_action=noisy_action, timestep_action=timestep, context=context,
             context_mask=context_mask, video_cache_k=video_cache_k, video_cache_v=video_cache_v,
             action_attention_mask=attention_mask[video_tokens.shape[1]:, :],
             behavior_memory=behavior_memory, behavior_memory_mask=behavior_memory_mask,
+            debug=debug_metrics,
         )
         error = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=-1)
         if action_valid is not None:
@@ -929,7 +952,14 @@ class FastWAM(torch.nn.Module):
         gate = float(torch.tanh(self.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
         residual = self.zeva_behavior_prefix_adapter(behavior_memory, behavior_memory_mask, action_horizon=clean_action.shape[1])
         residual_norm = float(residual.detach().float().norm(dim=-1).mean().cpu())
-        return loss, {"loss_action": float(loss.detach()), "gate": gate, "behavior_residual_norm": residual_norm}
+        metrics = {
+            "loss_action": float(loss.detach()),
+            "gate": gate,
+            "behavior_residual_norm": residual_norm,
+        }
+        for key, value in debug_metrics.items():
+            metrics[key] = float(value.detach().cpu())
+        return loss, metrics
 
     @torch.no_grad()
     def _predict_action_noise_with_cache(
