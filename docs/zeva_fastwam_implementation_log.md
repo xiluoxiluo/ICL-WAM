@@ -1,5 +1,15 @@
 # Zeva -> FastWAM/RoboTwin implementation log
 
+### Cross-task effect transfer
+
+The default offline PIM proxy remains phase-conditioned and same-task.  The
+separate Zeva cross-task effect path is enabled with
+`model.zeva.memory.pim_retrieval_mode=cross_task_effect`.  It uses the latest
+completed effect in the causal BIT prefix as the query, excludes the current
+episode and query task, and ranks bank entries by effect-token cosine
+similarity.  The current cache-row effect is never used as the query, so the
+training target cannot leak into retrieval.
+
 This log records the read-only baseline checks and the final local validation
 for the V1 addon. It intentionally does not claim a real RoboTwin rollout,
 because this checkout has no dataset, base checkpoint, CUDA runtime, or SAPIEN
@@ -51,6 +61,15 @@ phase-query and effect records; online history encodes each newly observed
 boundary frame once. PIM pairing uses the phase at effect-window start plus
 observed `effect_post`, and writes a completed effect immediately so later
 queries in the same attempt can see it.
+
+The FastWAM policy path now has the same two Zeva injection branches: the
+Causal Prompt is gated into one independent behavior prefix slot placed before
+the untouched raw FastWAM text-context sequence, while a separate Gaussian
+action prior predicts the 32-step, 14-dimensional action sequence and its mean
+is projected into ActionDiT hidden space. Stage 2 optimizes the action flow
+loss together with the prior NLL; the addon is absent from `pim_shadow`, and
+the behavior slot remains valid, while its Causal Prompt residual is gated to
+zero when persistent evidence is unavailable.
 
 ## Remaining empirical gates
 

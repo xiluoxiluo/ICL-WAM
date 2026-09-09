@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 from fastwam.zeva.schemas import build_transition_view
 from fastwam.zeva.cache import PhaseEffectCache
 from fastwam.zeva.retrieval import MemoryBank
+from fastwam.zeva.task_context import TaskContextBank, retrieve_task_context
 
 
 @dataclass(frozen=True)
@@ -86,7 +87,17 @@ class ZevaRobotWinDataset(Dataset):
 class ZevaStage2Dataset(Dataset):
     """Attach causal prompt inputs to each frozen FastWAM training window."""
 
-    def __init__(self, base_dataset: Dataset, cache: PhaseEffectCache, top_k: int = 4, bit_size: int = 4):
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        cache: PhaseEffectCache,
+        top_k: int = 4,
+        bit_size: int = 4,
+        pim_retrieval_mode: str = "phase",
+        task_context_bank: TaskContextBank | None = None,
+        task_context_top_k: int = 1,
+        task_context_by_episode: dict[str, torch.Tensor] | None = None,
+    ):
         if cache.manifest.schema_version not in {"zeva_fastwam_robotwin_cache_v3", "zeva_fastwam_robotwin_cache_v4"}:
             raise ValueError(
                 "Stage 2 requires zeva_fastwam_robotwin_cache_v3/v4; older "
@@ -95,6 +106,20 @@ class ZevaStage2Dataset(Dataset):
         self.base = ZevaRobotWinDataset(base_dataset)
         self.cache = cache
         self.top_k, self.bit_size = int(top_k), int(bit_size)
+        self.pim_retrieval_mode = str(pim_retrieval_mode)
+        if self.pim_retrieval_mode not in {"phase", "cross_task_effect"}:
+            raise ValueError(
+                "pim_retrieval_mode must be 'phase' or 'cross_task_effect'"
+            )
+        self.task_context_bank = task_context_bank
+        self.task_context_top_k = int(task_context_top_k)
+        self.task_context_by_episode = task_context_by_episode
+        if task_context_bank is not None and task_context_by_episode is not None:
+            raise ValueError("Select either text-bank or static episode task contexts")
+        if self.task_context_top_k < 1:
+            raise ValueError("task_context_top_k must be positive")
+        if task_context_bank is not None and self.task_context_top_k > len(task_context_bank):
+            raise ValueError("task_context_top_k must not exceed the task-context bank size")
         if cache.manifest.schema_version == "zeva_fastwam_robotwin_cache_v4":
             self._cached_window_indices = tuple(sorted({
                 int(row["window_index"])
@@ -113,6 +138,12 @@ class ZevaStage2Dataset(Dataset):
             }))
         if not self._cached_window_indices:
             raise ValueError("Stage 2 cache contains no complete window starts (transition_index=0)")
+        if task_context_by_episode is not None:
+            query_windows = set(self._cached_window_indices)
+            required_episodes = {str(row["episode_id"]) for row in cache.rows if row.get("window_index") in query_windows}
+            missing = required_episodes - task_context_by_episode.keys()
+            if missing:
+                raise ValueError(f"missing initial task contexts for cached episodes: {sorted(missing)[:5]}")
         self._window_rows: dict[int, int] = {}
         self._bit_history: dict[int, tuple[torch.Tensor, ...]] = {}
         episode_effects: dict[str, deque[torch.Tensor]] = defaultdict(lambda: deque(maxlen=self.bit_size))
@@ -208,7 +239,40 @@ class ZevaStage2Dataset(Dataset):
         if previous:
             bit_effects[-len(previous):] = torch.stack(previous)
             bit_mask[-len(previous):] = True
-        retrieved = self.bank.retrieve(phase, episode_id=episode_id, task_id=current["task_id"], top_k=self.top_k)
+        if self.pim_retrieval_mode == "phase":
+            retrieved = self.bank.retrieve(
+                phase,
+                episode_id=episode_id,
+                task_id=current["task_id"],
+                top_k=self.top_k,
+            )
+        elif bool(bit_mask.any()):
+            # Effect transfer is queried only from an already completed
+            # effect in the causal prefix.  Querying the current cache row's
+            # effect would leak the outcome of the action being predicted.
+            retrieved = self.bank.retrieve_by_effect(
+                bit_effects[bit_mask][-1],
+                episode_id=episode_id,
+                task_id=current["task_id"],
+                top_k=self.top_k,
+                cross_task=True,
+            )
+        else:
+            # Keep the model contract [K,D] even before the first completed
+            # effect is available; no cross-task evidence exists yet.
+            retrieved = self.bank.retrieve(
+                phase,
+                episode_id=episode_id,
+                task_id=current["task_id"],
+                top_k=self.top_k,
+            )
+            retrieved = type(retrieved)(
+                torch.zeros_like(retrieved.phases),
+                torch.zeros_like(retrieved.effects),
+                torch.zeros_like(retrieved.mask),
+                torch.full_like(retrieved.scores, -torch.inf),
+                (),
+            )
         current_raw_step = current.get("raw_step")
         if current_raw_step is None:
             current_raw_step = current.get("episode_step", 0)
@@ -216,6 +280,22 @@ class ZevaStage2Dataset(Dataset):
                        "raw_step": int(current_raw_step),
                        "pim_phases": retrieved.phases, "pim_effects": retrieved.effects, "pim_mask": retrieved.mask,
                        "behavior_memory": None, "behavior_memory_mask": None})
+        if self.task_context_by_episode is not None:
+            episode_id = str(sample["episode"].episode_id)
+            if episode_id != str(current["episode_id"]):
+                raise ValueError("sample/cache episode identity mismatch for static task context")
+            sample["task_context"] = self.task_context_by_episode[episode_id].clone()
+        elif self.task_context_bank is not None:
+            task_context, task_context_result = retrieve_task_context(
+                sample["context"], sample.get("context_mask"), self.task_context_bank,
+                output_dim=self.task_context_bank.value_dim,
+                top_k=self.task_context_top_k,
+            )
+            # Keep one vector per dataset item; the default DataLoader collate
+            # then produces the model contract [B,global_dim].
+            sample["task_context"] = task_context[0]
+            sample["task_context_retrieval_indices"] = task_context_result.indices[0]
+            sample["task_context_retrieval_scores"] = task_context_result.scores[0]
         # The trainer builds memory tokens through CausalPromptEncoder.
         sample.pop("behavior_memory"); sample.pop("behavior_memory_mask")
         sample.pop("episode", None)

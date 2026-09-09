@@ -167,16 +167,41 @@ def create_fastwam(
             BehaviorPrefixAdapterConfig,
             CausalPromptEncoder,
             CausalPromptConfig,
+            ExactZevaPolicyInjectionAdapter,
+            ExactZevaPolicyInjectionConfig,
         )
 
         prompt_cfg = dict(zeva.get("prompt", {}))
         adapter_cfg = dict(zeva.get("adapter", {}))
         prompt_keys = {"global_dim", "phase_dim", "effect_dim", "brief_length", "persistent_length", "hidden_dim", "num_heads"}
         adapter_keys = {"memory_dim", "action_horizon", "action_hidden_dim", "num_heads", "mlp_ratio", "gate_init"}
+        adapter_mode = str(adapter_cfg.get("mode", "memory_residual"))
+        if adapter_mode == "exact_zeva":
+            exact_keys = set(ExactZevaPolicyInjectionConfig.__dataclass_fields__)
+            exact_cfg = {
+                key: value for key, value in adapter_cfg.items() if key in exact_keys
+            }
+            # Reuse the legacy config name when switching an existing config
+            # from memory_residual to the exact two-branch adapter.
+            if "prompt_gate_init" not in exact_cfg and "gate_init" in adapter_cfg:
+                exact_cfg["prompt_gate_init"] = adapter_cfg["gate_init"]
+            exact_cfg.setdefault("context_dim", int(video_dit_config["text_dim"]))
+            exact_cfg.setdefault("action_dim", int(action_dit_config["action_dim"]))
+            exact_cfg.setdefault("action_hidden_dim", int(action_dit_config["hidden_dim"]))
+            policy_adapter = ExactZevaPolicyInjectionAdapter(
+                ExactZevaPolicyInjectionConfig(**exact_cfg)
+            )
+        elif adapter_mode == "memory_residual":
+            policy_adapter = BehaviorPrefixAdapter(
+                BehaviorPrefixAdapterConfig(**{k: v for k, v in adapter_cfg.items() if k in adapter_keys})
+            )
+        else:
+            raise ValueError("zeva.adapter.mode must be memory_residual or exact_zeva")
         model.attach_zeva_addon(
             CausalPromptEncoder(CausalPromptConfig(**{k: v for k, v in prompt_cfg.items() if k in prompt_keys})),
-            BehaviorPrefixAdapter(BehaviorPrefixAdapterConfig(**{k: v for k, v in adapter_cfg.items() if k in adapter_keys})),
+            policy_adapter,
         )
+        model.zeva_task_context_mode = str(zeva.get("task_context", {}).get("mode", "pooling"))
     return model
 
 

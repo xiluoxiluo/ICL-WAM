@@ -1,8 +1,10 @@
 # ICLWAM：FastWAM + Zeva 因果记忆
 
-本目录是在 FastWAM RoboTwin action path 上增加 Zeva causal memory 的实验实现。原有 FastWAM、Joint、IDM 和 Optional-IDM 模块仍按原逻辑工作；只有选择 `model=zeva_fastwam`（或评测配置 `sim_robotwin_zeva.yaml`）并设置 `zeva.enabled=true` 时，才会挂载 CTE、BIT/PIM、CausalPromptEncoder 和 BehaviorPrefixAdapter。
+本目录是在 FastWAM RoboTwin action path 上增加 Zeva causal memory 的实验实现。原有 FastWAM、Joint、IDM 和 Optional-IDM 模块仍按原逻辑工作；只有选择 `model=zeva_fastwam`（或评测配置 `sim_robotwin_zeva.yaml`）并设置 `zeva.enabled=true` 时，才会挂载 CTE、BIT/PIM、CausalPromptEncoder 和 Zeva policy-injection addon。默认 addon 模式为 `exact_zeva`：Causal Prompt prefix 使用独立 behavior prefix slot，Gaussian action prior 走另一条独立注入支路。
 
 FastWAM 原始的 LIBERO/RoboTwin 安装、数据下载和基线说明见 [`docs/README_newzh.md`](docs/README_newzh.md)；本文只补充 ICLWAM/Zeva 新增部分以及可复现实验的完整串联方式。
+
+基于示范行为的静态 task-context 链路见 [建库、检索头训练与部署说明](docs/static_task_context.md)。选择 `task=robotwin_zeva_fastwam_static_3cam_384` 可启用 FastWAM 初始图像与指令 readout、CTE 行为原型和训练后的检索头；原配置继续使用文本 pooling。该路径需要重新建库并训练检索头和 addon，不能直接复用 pooling addon。
 
 下面的命令都假设在 `ICLWAM/` 根目录执行：
 
@@ -22,7 +24,7 @@ Zeva 实验不是用一个新 checkpoint 替换 FastWAM，而是四个阶段串�
 4. 用冻结的 CTE 生成 phase/effect cache，再进行 Stage 2；Stage 2 只训练 Zeva addon，FastWAM 和 CTE 都冻结。
 5. 评测时将 FastWAM 基座、CTE 和 Stage 2 addon 组合起来，并用固定 seed 比较 `base`、`pim_shadow` 和 `pim_on`。
 
-`pim_shadow` 会运行完整的因果生命周期但不加载 addon，用于检查 memory/retrieval 是否改变；`pim_on` 才会把训练得到的 memory prefix 注入 FastWAM action path。
+`pim_shadow` 会运行完整的因果生命周期但不加载 addon，用于检查 memory/retrieval 是否改变；`pim_on` 才会把训练得到的 behavior prefix slot 和 action prior 注入 FastWAM action path。
 
 ## 2. 环境和数据
 

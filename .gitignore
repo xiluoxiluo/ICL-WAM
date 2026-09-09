@@ -12,6 +12,12 @@ evaluate_results/
 
 volc/
 tests/
+!/tests/
+/tests/*
+!/tests/zeva/
+/tests/zeva/*
+!/tests/zeva/test_task_context_bank.py
+!/tests/zeva/test_static_task_context.py
 
 # ai coding
 .codex/

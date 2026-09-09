@@ -7,6 +7,10 @@ from PIL import Image
 
 from fastwam.utils.logging_config import get_logger
 from fastwam.zeva.causal_prompt import task_tokens_from_context
+from fastwam.zeva.behavior_prefix_adapter import (
+    ExactZevaPolicyInjectionAdapter,
+    gaussian_prior_nll,
+)
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
@@ -94,6 +98,7 @@ class FastWAM(torch.nn.Module):
         self.zeva_enabled = False
         self.zeva_prompt_encoder = None
         self.zeva_behavior_prefix_adapter = None
+        self.zeva_injection_mode = "memory_residual"
         self.zeva_mode = "base"
 
         self.to(self.device)
@@ -229,6 +234,45 @@ class FastWAM(torch.nn.Module):
         mask = torch.ones_like(mask)
         return prompt_emb.to(device=self.device), mask
 
+    @torch.no_grad()
+    def extract_task_context_readout(
+        self, input_image: torch.Tensor, context: torch.Tensor, context_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Clean initial-image/text readout, with no action, proprio, or addon.
+
+        Mirrors Zeva's mean of final vision hidden states at diffusion time
+        zero. FastWAM's video MoT stream supplies the corresponding states.
+        """
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
+            raise ValueError("initial image must be [B,3,H,W]")
+        if context.ndim != 3 or context.shape[0] != input_image.shape[0] or context_mask.shape != context.shape[:2]:
+            raise ValueError("initial readout requires aligned image/context batches")
+        if self.video_expert.training:
+            raise ValueError("initial task-context readout requires the frozen policy in eval mode")
+        context = context.to(device=self.device, dtype=self.torch_dtype)
+        context_mask = context_mask.to(device=self.device, dtype=torch.bool)
+        image = input_image.to(device=self.device, dtype=self.torch_dtype).unsqueeze(2)
+        latent = self.vae.model.encode(image, self.vae.scale).clone()
+        timestep = torch.zeros(input_image.shape[0], device=self.device, dtype=latent.dtype)
+        (
+            tokens, _time, t_mod, video_context, video_mask, freqs,
+            _frames, _height, _width, tokens_per_frame,
+        ) = self.video_expert.prepare(
+            x=latent, timestep=timestep, context=context, context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False)),
+        )
+        mask = self._build_mot_attention_mask(
+            video_seq_len=tokens.shape[1], action_seq_len=0,
+            video_tokens_per_frame=tokens_per_frame, device=self.device,
+        )
+        _keys, _values, hidden = self.mot.prefill_video_cache_tensor(
+            video_tokens=tokens, video_freqs=freqs, video_t_mod=t_mod,
+            video_context=video_context, video_context_mask=video_mask,
+            video_attention_mask=mask, return_hidden=True,
+        )
+        return hidden.float().mean(dim=1).detach()
+
     def _append_proprio_to_context(
         self,
         context: torch.Tensor,
@@ -250,6 +294,28 @@ class FastWAM(torch.nn.Module):
         return (
             torch.cat([context, proprio_token], dim=1),
             torch.cat([context_mask, proprio_mask], dim=1),
+        )
+
+    def _prepend_exact_zeva_behavior_slot(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        behavior_memory: torch.Tensor,
+        behavior_memory_mask: torch.Tensor,
+        task_tokens: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Insert the dedicated behavior slot for the exact Zeva adapter."""
+        if getattr(self, "zeva_injection_mode", "memory_residual") != "exact_zeva":
+            return context, context_mask
+        adapter = self.zeva_behavior_prefix_adapter
+        if adapter is None:
+            raise RuntimeError("exact Zeva injection requires an attached adapter")
+        return adapter.prepend_behavior_prefix_slot(
+            context=context,
+            context_mask=context_mask,
+            memory_tokens=behavior_memory,
+            memory_mask=behavior_memory_mask,
+            task_tokens=task_tokens,
         )
 
     @torch.no_grad()
@@ -760,6 +826,33 @@ class FastWAM(torch.nn.Module):
             raise ValueError("Zeva V1 BehaviorPrefixAdapter action_horizon must be 32")
         if int(self.action_expert.action_dim) != 14:
             raise ValueError("Zeva V1 requires a 14-dimensional FastWAM action expert")
+        injection_mode = (
+            "exact_zeva"
+            if isinstance(behavior_prefix_adapter, ExactZevaPolicyInjectionAdapter)
+            else "memory_residual"
+        )
+        if injection_mode == "exact_zeva":
+            prompt_cfg = causal_prompt_encoder.config
+            adapter_cfg = behavior_prefix_adapter.config
+            dimension_pairs = (
+                ("global_dim", adapter_cfg.global_dim, prompt_cfg.global_dim),
+                ("phase_dim", adapter_cfg.phase_dim, prompt_cfg.phase_dim),
+                ("effect_dim", adapter_cfg.effect_dim, prompt_cfg.effect_dim),
+                ("effect_history_length", adapter_cfg.effect_history_length, prompt_cfg.brief_length),
+            )
+            for name, adapter_value, prompt_value in dimension_pairs:
+                if int(adapter_value) != int(prompt_value):
+                    raise ValueError(
+                        f"exact Zeva {name} must match between policy adapter and "
+                        f"CausalPromptEncoder: {adapter_value} vs {prompt_value}"
+                    )
+            if int(adapter_cfg.context_dim) != int(self.text_dim):
+                raise ValueError(
+                    "exact Zeva prefix context_dim must match FastWAM text_dim: "
+                    f"{adapter_cfg.context_dim} vs {self.text_dim}"
+                )
+            if int(adapter_cfg.action_dim) != int(self.action_expert.action_dim):
+                raise ValueError("exact Zeva prior action_dim must match FastWAM action_dim")
         # Make the Zeva contract safe even when the caller does not go through
         # Wan22Trainer: the pretrained FastWAM path is frozen before the addon
         # modules are attached, while the addon remains explicitly trainable.
@@ -768,6 +861,7 @@ class FastWAM(torch.nn.Module):
         self.zeva_behavior_prefix_adapter = behavior_prefix_adapter.to(device=self.device, dtype=self.torch_dtype)
         self.zeva_prompt_encoder.requires_grad_(True)
         self.zeva_behavior_prefix_adapter.requires_grad_(True)
+        self.zeva_injection_mode = injection_mode
         self.zeva_enabled = True
         self.zeva_mode = "pim_on"
         return self
@@ -788,6 +882,7 @@ class FastWAM(torch.nn.Module):
         action_attention_mask: torch.Tensor,
         behavior_memory: torch.Tensor,
         behavior_memory_mask: torch.Tensor,
+        zeva_action_residual: Optional[torch.Tensor] = None,
         gate_override: Optional[float] = None,
         debug: Optional[dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
@@ -808,7 +903,21 @@ class FastWAM(torch.nn.Module):
             context=context,
             context_mask=context_mask,
         )
-        if gate_override is None and self.zeva_behavior_prefix_adapter.training:
+        injection_mode = getattr(self, "zeva_injection_mode", "memory_residual")
+        if gate_override is not None and float(gate_override) == 0.0:
+            # ``pim_shadow`` is a lifecycle-only control.  Short-circuit the
+            # addon entirely so it remains a true vanilla FastWAM comparison
+            # and does not require an otherwise-unused policy prior.
+            gated_residual = torch.zeros_like(action_tokens)
+        elif injection_mode == "exact_zeva":
+            if zeva_action_residual is None:
+                raise ValueError("exact Zeva injection requires an action-prior residual")
+            gated_residual = zeva_action_residual.to(
+                device=action_tokens.device, dtype=action_tokens.dtype
+            )
+            if gate_override is not None:
+                gated_residual = gated_residual * float(gate_override)
+        elif gate_override is None and self.zeva_behavior_prefix_adapter.training:
             gated_residual = self.zeva_behavior_prefix_adapter.gated(
                 behavior_memory, behavior_memory_mask, action_horizon=latents_action.shape[1]
             )
@@ -823,10 +932,16 @@ class FastWAM(torch.nn.Module):
         # CausalPromptEncoder places the persistent-memory summary last in its
         # four-token output. Task/phase/BIT conditioning remains available when
         # PIM is empty, but the PIM residual itself is an exact no-op.
-        has_pim = behavior_memory_mask[:, -1].to(
-            device=gated_residual.device, dtype=gated_residual.dtype
-        ).view(-1, 1, 1)
-        gated_residual = gated_residual * has_pim
+        if injection_mode != "exact_zeva":
+            has_pim = behavior_memory_mask[:, -1].to(
+                device=gated_residual.device, dtype=gated_residual.dtype
+            ).view(-1, 1, 1)
+            gated_residual = gated_residual * has_pim
+        if gated_residual.shape != action_tokens.shape:
+            raise ValueError(
+                "Zeva action-prior residual must match prepared action hidden shape: "
+                f"residual={tuple(gated_residual.shape)}, action={tuple(action_tokens.shape)}"
+            )
         if debug is not None:
             base_norm = action_tokens.detach().float().norm(dim=-1).mean()
             delta_norm = gated_residual.detach().float().norm(dim=-1).mean()
@@ -875,6 +990,10 @@ class FastWAM(torch.nn.Module):
         noise: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         action_valid: Optional[torch.Tensor] = None,
+        zeva_action_residual: Optional[torch.Tensor] = None,
+        zeva_prior_mean: Optional[torch.Tensor] = None,
+        zeva_prior_std: Optional[torch.Tensor] = None,
+        zeva_task_tokens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Train only the Zeva residual against FastWAM action flow matching."""
         if input_image.ndim != 4 or input_image.shape[1] != 3:
@@ -888,6 +1007,17 @@ class FastWAM(torch.nn.Module):
         )
         context = context.to(self.device, dtype=self.torch_dtype)
         context_mask = context_mask.to(self.device, dtype=torch.bool)
+        if (
+            getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
+            and zeva_task_tokens is None
+        ):
+            # Preserve a useful direct-call fallback while making the normal
+            # bank/static path pass its retrieved task vector explicitly.
+            zeva_task_tokens = task_tokens_from_context(
+                context,
+                context_mask,
+                int(self.zeva_behavior_prefix_adapter.config.global_dim),
+            )
         if self.proprio_encoder is not None:
             if proprio is None:
                 raise ValueError("proprio is required when FastWAM proprio_dim is enabled")
@@ -899,6 +1029,14 @@ class FastWAM(torch.nn.Module):
                 )
             context, context_mask = self._append_proprio_to_context(
                 context, context_mask, proprio[:, 0, :].to(self.device, dtype=self.torch_dtype)
+            )
+        if getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva":
+            context, context_mask = self._prepend_exact_zeva_behavior_slot(
+                context=context,
+                context_mask=context_mask,
+                memory_tokens=behavior_memory,
+                memory_mask=behavior_memory_mask,
+                task_tokens=zeva_task_tokens,
             )
         clean_action = clean_action.to(self.device, dtype=self.torch_dtype)
         noise = torch.randn_like(clean_action) if noise is None else noise.to(clean_action)
@@ -940,6 +1078,7 @@ class FastWAM(torch.nn.Module):
             context_mask=context_mask, video_cache_k=video_cache_k, video_cache_v=video_cache_v,
             action_attention_mask=attention_mask[video_tokens.shape[1]:, :],
             behavior_memory=behavior_memory, behavior_memory_mask=behavior_memory_mask,
+            zeva_action_residual=zeva_action_residual,
             debug=debug_metrics,
         )
         error = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=-1)
@@ -955,14 +1094,27 @@ class FastWAM(torch.nn.Module):
             device=loss_per_sample.device, dtype=loss_per_sample.dtype
         )
         loss = (loss_per_sample * action_weight).mean()
-        gate = float(torch.tanh(self.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
-        residual = self.zeva_behavior_prefix_adapter(behavior_memory, behavior_memory_mask, action_horizon=clean_action.shape[1])
+        if getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva":
+            if zeva_prior_mean is None or zeva_prior_std is None:
+                raise ValueError("exact Zeva training requires action-prior outputs")
+            prior_loss = gaussian_prior_nll(
+                clean_action.float(), zeva_prior_mean.float(), zeva_prior_std.float(), action_valid
+            )
+            loss = loss + prior_loss * float(self.zeva_behavior_prefix_adapter.config.prior_loss_weight)
+            prior_metrics = {"behavior_prior_nll": float(prior_loss.detach().cpu())}
+            residual = zeva_action_residual
+            gate = float(torch.tanh(self.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
+        else:
+            gate = float(torch.tanh(self.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
+            residual = self.zeva_behavior_prefix_adapter(behavior_memory, behavior_memory_mask, action_horizon=clean_action.shape[1])
+            prior_metrics = {}
         residual_norm = float(residual.detach().float().norm(dim=-1).mean().cpu())
         metrics = {
             "loss_action": float(loss.detach()),
             "gate": gate,
             "behavior_residual_norm": residual_norm,
         }
+        metrics.update(prior_metrics)
         for key, value in debug_metrics.items():
             metrics[key] = float(value.detach().cpu())
         # Keep stable metric names for rollout/trainer dashboards while
@@ -1235,6 +1387,8 @@ class FastWAM(torch.nn.Module):
         compile_action_infer: bool = False,
         behavior_memory: Optional[torch.Tensor] = None,
         behavior_memory_mask: Optional[torch.Tensor] = None,
+        zeva_action_residual: Optional[torch.Tensor] = None,
+        zeva_task_tokens: Optional[torch.Tensor] = None,
         zeva_mode: str = "base",
     ) -> dict[str, Any]:
         self.eval()
@@ -1309,11 +1463,40 @@ class FastWAM(torch.nn.Module):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if (
+            zeva_mode == "pim_on"
+            and getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
+            and zeva_task_tokens is None
+        ):
+            # The explicit argument is used for bank/static task context.  A
+            # text-pooling fallback keeps the public inference API usable when
+            # callers provide only the original FastWAM prompt context.
+            zeva_task_tokens = task_tokens_from_context(
+                context,
+                context_mask,
+                int(self.zeva_behavior_prefix_adapter.config.global_dim),
+            )
         if proprio is not None:
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
                 proprio=proprio,
+            )
+        # Keep the model as the single owner of the policy-injection layout.
+        # FastWAM has no unified Zeva packed language stream, so its equivalent
+        # is one dedicated cross-attention context token before the untouched
+        # text/proprio tokens.  Shadow mode deliberately follows the vanilla
+        # context path so it remains a true baseline check.
+        if (
+            zeva_mode == "pim_on"
+            and getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
+        ):
+            context, context_mask = self._prepend_exact_zeva_behavior_slot(
+                context=context,
+                context_mask=context_mask,
+                memory_tokens=behavior_memory,
+                memory_mask=behavior_memory_mask,
+                task_tokens=zeva_task_tokens,
             )
 
         timestep_video = torch.zeros(
@@ -1414,6 +1597,7 @@ class FastWAM(torch.nn.Module):
                     action_attention_mask=action_attention_mask,
                     behavior_memory=behavior_memory,
                     behavior_memory_mask=behavior_memory_mask,
+                    zeva_action_residual=zeva_action_residual,
                     gate_override=0.0 if zeva_mode == "pim_shadow" else None,
                 )
             pred_action = pred_action_posi
@@ -1495,6 +1679,7 @@ class FastWAM(torch.nn.Module):
             "step": int(step), "config": config or {},
             "base_checkpoint_sha256": base_checkpoint_sha256,
             "cte_checkpoint_sha256": cte_checkpoint_sha256,
+            "task_context_identity": getattr(self, "zeva_task_context_identity", None),
         }, path)
 
     def load_zeva_addon_checkpoint(self, path, *, base_checkpoint_sha256: Optional[str] = None,
@@ -1506,6 +1691,7 @@ class FastWAM(torch.nn.Module):
             path, self.zeva_prompt_encoder, self.zeva_behavior_prefix_adapter,
             base_checkpoint_sha256=base_checkpoint_sha256,
             cte_checkpoint_sha256=cte_checkpoint_sha256,
+            task_context_identity=getattr(self, "zeva_task_context_identity", None),
         )
 
     def zeva_parameter_report(self) -> dict[str, object]:
@@ -1564,11 +1750,15 @@ class FastWAM(torch.nn.Module):
             raise ValueError("Zeva Stage 2 sample video must be [B,3,T,H,W]")
         context = sample["context"].to(self.device)
         context_mask = sample["context_mask"].to(self.device, dtype=torch.bool)
-        task_tokens = task_tokens_from_context(
-            context,
-            context_mask,
-            int(self.zeva_prompt_encoder.config.global_dim),
-        )
+        task_dim = int(self.zeva_prompt_encoder.config.global_dim)
+        if sample.get("task_context") is None:
+            if getattr(self, "zeva_task_context_mode", "pooling") == "static":
+                raise ValueError("static task context requires an initial episode task_context vector")
+            task_tokens = task_tokens_from_context(context, context_mask, task_dim)
+        else:
+            task_tokens = sample["task_context"].to(device=self.device)
+        if task_tokens.shape != (context.shape[0], task_dim):
+            raise ValueError("task_context must be [B, prompt.global_dim]")
         behavior_memory, behavior_memory_mask = self.zeva_prompt_encoder(
             task_tokens=task_tokens,
             current_phase=sample["phase"].to(self.device),
@@ -1578,15 +1768,33 @@ class FastWAM(torch.nn.Module):
             pim_effects=sample["pim_effects"].to(self.device),
             pim_mask=sample["pim_mask"].to(self.device),
         )
+        zeva_action_residual = None
+        zeva_prior_mean = None
+        zeva_prior_std = None
+        if getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva":
+            adapter = self.zeva_behavior_prefix_adapter
+            zeva_prior_mean, zeva_prior_std = adapter.prior(
+                task_tokens,
+                sample["phase"].to(self.device),
+                sample["bit_effects"].to(self.device),
+                sample["bit_mask"].to(self.device),
+            )
+            zeva_action_residual = adapter.action_prior_residual(
+                zeva_prior_mean, training=True
+            )
         loss, metrics = self.forward_zeva_action_train(
             input_image=video[:, :, 0],
             clean_action=sample["action"],
-            context=sample["context"],
-            context_mask=sample["context_mask"],
+            context=context,
+            context_mask=context_mask,
             behavior_memory=behavior_memory,
             behavior_memory_mask=behavior_memory_mask,
             proprio=sample.get("proprio"),
             action_valid=sample.get("action_valid"),
+            zeva_action_residual=zeva_action_residual,
+            zeva_prior_mean=zeva_prior_mean,
+            zeva_prior_std=zeva_prior_std,
+            zeva_task_tokens=task_tokens,
         )
         metrics.update(
             {

@@ -36,8 +36,13 @@ from fastwam.zeva import (
     PersistentInteractionMemory,
     PersistentInteractionMemoryConfig,
     task_tokens_from_context,
+    TaskContextBank,
+    retrieve_task_context,
 )
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
+from fastwam.zeva.static_task_context import (
+    StaticTaskContextRetriever, StaticTaskContextSession, task_context_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +203,62 @@ class WorldActionRobotWinPolicy:
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
         zeva_memory_cfg = model_cfg_copy.get("zeva", {}).get("memory", {})
+        task_context_cfg = model_cfg_copy.get("zeva", {}).get("task_context", {})
+        self.task_context_bank = None
+        self._static_task_context_session = None
+        self._last_task_context_retrieval = None
+        self.task_context_mode = str(task_context_cfg.get("mode", "pooling"))
+        self.task_context_top_k = int(task_context_cfg.get("top_k", 1))
+        if self.task_context_mode == "bank":
+            if self.model.zeva_prompt_encoder is None:
+                raise ValueError("task-context bank requires an enabled Zeva prompt encoder")
+            bank_path = task_context_cfg.get("bank_path")
+            if _is_none_like(bank_path):
+                raise ValueError("zeva.task_context.bank_path is required when mode=bank")
+            self.task_context_bank = TaskContextBank.load(
+                str(bank_path),
+                expected_key_dim=int(task_context_cfg.get("key_dim", 256)),
+                expected_value_dim=int(
+                    task_context_cfg.get(
+                        "value_dim",
+                        self.model.zeva_prompt_encoder.config.global_dim,
+                    )
+                ),
+            )
+            if self.task_context_bank.value_dim != int(self.model.zeva_prompt_encoder.config.global_dim):
+                raise ValueError("zeva.task_context.value_dim must match zeva.prompt.global_dim")
+            if self.task_context_top_k < 1 or self.task_context_top_k > len(self.task_context_bank):
+                raise ValueError(
+                    "zeva.task_context.top_k must be within the task-context bank size; "
+                    f"got {self.task_context_top_k}, bank_size={len(self.task_context_bank)}"
+                )
+        elif self.task_context_mode == "static":
+            for name in ("bank_path", "retrieval_checkpoint"):
+                if _is_none_like(task_context_cfg.get(name)):
+                    raise ValueError(f"static task context requires zeva.task_context.{name}")
+            if _is_none_like(cte_checkpoint):
+                raise ValueError("static task context requires the matching CTE checkpoint")
+            bank_path = str(task_context_cfg["bank_path"])
+            head_path = str(task_context_cfg["retrieval_checkpoint"])
+            retriever = StaticTaskContextRetriever.load(
+                bank_path, head_path, top_k=self.task_context_top_k, device=device,
+                expected={
+                    "base_checkpoint_sha256": checkpoint_sha256(checkpoint_path),
+                    "cte_checkpoint_sha256": checkpoint_sha256(str(cte_checkpoint)),
+                    "dataset_stats_sha256": checkpoint_sha256(dataset_stats_path),
+                    "video_size": [int(value) for value in video_size],
+                    "context_len": int(model_cfg_copy.get("tokenizer_max_len", 128)),
+                    "readout_dim": int(model_cfg_copy.video_dit_config.hidden_dim),
+                },
+            )
+            if self.model.zeva_prompt_encoder is None or retriever.bank.value_dim != self.model.zeva_prompt_encoder.config.global_dim:
+                raise ValueError("static behavior bank value_dim must match the Zeva prompt encoder")
+            self._static_task_context_session = StaticTaskContextSession(retriever)
+            self.model.zeva_task_context_identity = task_context_identity(
+                "static", bank_path, head_path, self.task_context_top_k,
+            )
+        elif self.task_context_mode != "pooling":
+            raise ValueError("zeva.task_context.mode must be pooling, bank, or static")
 
         self.zeva_mode = str(zeva_mode)
         if self.zeva_mode not in {"base", "pim_shadow", "pim_on"}:
@@ -504,17 +565,58 @@ class WorldActionRobotWinPolicy:
             with torch.no_grad():
                 context, _context_mask = self.model.encode_prompt(prompt)
                 task_dim = int(self.model.zeva_prompt_encoder.config.global_dim)
-                task_tokens = task_tokens_from_context(context, _context_mask, task_dim)
+                if self._static_task_context_session is not None:
+                    task_context_result = self._static_task_context_session.resolve(
+                        self.model, image_tensor, context, _context_mask, instruction,
+                    )
+                    task_tokens = task_context_result.values
+                    self._last_task_context_retrieval = {
+                        "indices": task_context_result.indices.cpu(),
+                        "scores": task_context_result.scores.cpu(),
+                        "sources": task_context_result.sources,
+                    }
+                elif self.task_context_bank is None:
+                    task_tokens = task_tokens_from_context(context, _context_mask, task_dim)
+                else:
+                    task_tokens, task_context_result = retrieve_task_context(
+                        context,
+                        _context_mask,
+                        self.task_context_bank,
+                        output_dim=task_dim,
+                        top_k=self.task_context_top_k,
+                    )
+                    self._last_task_context_retrieval = {
+                        "indices": task_context_result.indices.detach().cpu(),
+                        "scores": task_context_result.scores.detach().cpu(),
+                        "sources": task_context_result.sources,
+                    }
                 encoded = self._cte_history.forward()
                 phase = encoded["phase"][:, -1]
                 memory = self.lifecycle.memory_inputs(phase, task_tokens)
                 behavior_memory, behavior_memory_mask = self.model.zeva_prompt_encoder(**memory)
+                zeva_action_residual = None
+                if (
+                    self.zeva_mode == "pim_on"
+                    and getattr(self.model, "zeva_injection_mode", "memory_residual") == "exact_zeva"
+                ):
+                    adapter = self.model.zeva_behavior_prefix_adapter
+                    prior_mean, _prior_std = adapter.prior(
+                        task_tokens,
+                        phase,
+                        memory["bit_effects"],
+                        memory["bit_mask"],
+                    )
+                    zeva_action_residual = adapter.action_prior_residual(
+                        prior_mean, training=False
+                    )
             infer_kwargs = {
                 "prompt": None,
                 "context": context,
                 "context_mask": _context_mask,
                 "behavior_memory": behavior_memory,
                 "behavior_memory_mask": behavior_memory_mask,
+                "zeva_action_residual": zeva_action_residual,
+                "zeva_task_tokens": task_tokens,
                 "zeva_mode": self.zeva_mode,
                 "input_image": image_tensor,
                 "action_horizon": self.action_horizon,
@@ -624,6 +726,9 @@ class WorldActionRobotWinPolicy:
         }
 
     def reset(self) -> None:
+        if getattr(self, "_static_task_context_session", None) is not None:
+            self._static_task_context_session.reset()
+        self._last_task_context_retrieval = None
         self.pending_actions.clear()
         self.episode_count += 1
         self.step_count = 0
@@ -641,6 +746,9 @@ class WorldActionRobotWinPolicy:
 
     def begin_attempt(self, attempt_id: int) -> None:
         """Reset transient CTE/BIT state while retaining episode-scoped PIM."""
+        if getattr(self, "_static_task_context_session", None) is not None:
+            self._static_task_context_session.reset()
+        self._last_task_context_retrieval = None
         if self.lifecycle is None:
             return
         attempt_id = int(attempt_id)

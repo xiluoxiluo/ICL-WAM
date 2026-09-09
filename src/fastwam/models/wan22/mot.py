@@ -479,7 +479,8 @@ class MoT(nn.Module):
         video_context: torch.Tensor,
         video_context_mask: torch.Tensor,
         video_attention_mask: torch.Tensor,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        return_hidden: bool = False,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]] | tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
         expert = self.mixtures["video"]
         x = video_tokens
         cache_k_list: list[torch.Tensor] = []
@@ -523,6 +524,8 @@ class MoT(nn.Module):
             )
             cache_k_list.append(k)
             cache_v_list.append(v)
+        if return_hidden:
+            return cache_k_list, cache_v_list, x
         return cache_k_list, cache_v_list
 
     def forward_action_with_video_cache_tensor(

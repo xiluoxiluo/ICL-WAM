@@ -41,3 +41,32 @@ def test_memory_rejects_non_finite_configuration_and_features():
         pass
     else:
         raise AssertionError("non-finite memory feature was accepted")
+
+
+def test_cross_task_effect_retrieval_uses_effect_similarity_and_scope():
+    bank = MemoryBank(phase_dim=2, effect_dim=2, top_k=2)
+    # The phase ranking intentionally disagrees with the effect ranking.
+    bank.add(torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0]), episode_id="a", task_id="task-a")
+    bank.add(torch.tensor([0.0, 1.0]), torch.tensor([1.0, 0.0]), episode_id="b", task_id="task-b")
+    bank.add(torch.tensor([0.0, 1.0]), torch.tensor([0.0, 1.0]), episode_id="c", task_id="task-a")
+
+    result = bank.retrieve_by_effect(
+        torch.tensor([1.0, 0.0]),
+        episode_id="query",
+        task_id="task-a",
+        top_k=1,
+    )
+    assert result.mask.tolist() == [True]
+    assert result.sources[0]["episode_id"] == "b"
+    assert result.sources[0]["retrieval_key"] == "effect"
+    assert result.sources[0]["retrieval_scope"] == "cross_task"
+
+
+def test_cross_task_effect_retrieval_requires_task_id():
+    bank = MemoryBank(phase_dim=2, effect_dim=2, top_k=1)
+    try:
+        bank.retrieve_by_effect(torch.ones(2), episode_id="query")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("cross-task effect retrieval accepted a missing task_id")

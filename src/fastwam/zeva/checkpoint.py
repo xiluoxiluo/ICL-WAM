@@ -98,8 +98,10 @@ def save_addon_checkpoint(path: str | Path, causal_prompt_encoder, behavior_pref
     torch.save({"causal_prompt_encoder": causal_prompt_encoder.state_dict(), "behavior_prefix_adapter": behavior_prefix_adapter.state_dict(), "pim_gate": behavior_prefix_adapter.pim_gate.detach().cpu(), "step": int(step), "config": config, "base_checkpoint_sha256": base_checkpoint_sha256, "cte_checkpoint_sha256": cte_checkpoint_sha256}, path)
 
 
-def load_addon_checkpoint(path: str | Path, causal_prompt_encoder, behavior_prefix_adapter, *, base_checkpoint_sha256: str | None = None, cte_checkpoint_sha256: str | None = None, map_location: str = "cpu") -> dict:
+def load_addon_checkpoint(path: str | Path, causal_prompt_encoder, behavior_prefix_adapter, *, base_checkpoint_sha256: str | None = None, cte_checkpoint_sha256: str | None = None, task_context_identity: dict | None = None, map_location: str = "cpu") -> dict:
     payload = torch.load(path, map_location=map_location, weights_only=False)
+    if payload.get("task_context_identity") != task_context_identity:
+        raise ValueError("addon checkpoint task-context artifacts or retrieval settings mismatch")
     for name, expected in (("base_checkpoint_sha256", base_checkpoint_sha256), ("cte_checkpoint_sha256", cte_checkpoint_sha256)):
         if expected is not None and payload.get(name) != expected:
             raise ValueError(f"addon checkpoint {name} mismatch")

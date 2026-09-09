@@ -14,6 +14,10 @@ from fastwam.trainer import Wan22Trainer
 from fastwam.zeva.cache import PhaseEffectCache
 from fastwam.zeva.checkpoint import checkpoint_sha256
 from fastwam.zeva.schemas import sha256_file
+from fastwam.zeva.task_context import TaskContextBank
+from fastwam.zeva.static_task_context import (
+    StaticTaskContextRetriever, load_readout_cache, stage2_task_contexts, task_context_identity,
+)
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
@@ -106,6 +110,7 @@ def main(cfg: DictConfig) -> None:
     base = instantiate(cfg.data.train)
     top_k = int(zeva.get("memory", {}).get("pim_top_k", 4))
     bit_size = int(zeva.get("memory", {}).get("bit_size", 4))
+    pim_retrieval_mode = str(zeva.get("memory", {}).get("pim_retrieval_mode", "phase"))
     if top_k != int(prompt_cfg.get("persistent_length", 4)):
         raise ValueError(
             "zeva.memory.pim_top_k must match zeva.prompt.persistent_length; "
@@ -116,9 +121,57 @@ def main(cfg: DictConfig) -> None:
             "zeva.memory.bit_size must match zeva.prompt.brief_length; "
             f"got {bit_size} vs {prompt_cfg.get('brief_length', 4)}"
         )
-    dataset = ZevaStage2Dataset(base, cache, top_k=top_k, bit_size=bit_size)
+    task_context_cfg = zeva.get("task_context", {})
+    task_context_mode = str(task_context_cfg.get("mode", "pooling"))
+    task_context_bank = None
+    task_context_by_episode = None
+    static_identity = None
+    task_context_top_k = int(task_context_cfg.get("top_k", 1))
+    if task_context_mode == "bank":
+        bank_path = str(task_context_cfg.get("bank_path"))
+        if not bank_path or bank_path in {"None", "null"}:
+            raise ValueError("zeva.task_context.bank_path is required when mode=bank")
+        task_context_bank = TaskContextBank.load(
+            bank_path,
+            expected_key_dim=int(task_context_cfg.get("key_dim", 256)),
+            expected_value_dim=int(task_context_cfg.get("value_dim", prompt_cfg.get("global_dim", 256))),
+        )
+        if task_context_bank.value_dim != int(prompt_cfg.get("global_dim", 256)):
+            raise ValueError("zeva.task_context.value_dim must match zeva.prompt.global_dim")
+    elif task_context_mode == "static":
+        for name in ("bank_path", "retrieval_checkpoint", "readout_cache_path"):
+            if task_context_cfg.get(name) in (None, "", "None", "null"):
+                raise ValueError(f"static task context requires zeva.task_context.{name}")
+        bank_path = str(task_context_cfg["bank_path"])
+        head_path = str(task_context_cfg["retrieval_checkpoint"])
+        retriever = StaticTaskContextRetriever.load(
+            bank_path, head_path, top_k=task_context_top_k,
+            expected={
+                "base_checkpoint_sha256": checkpoint_sha256(str(checkpoint)),
+                "cte_checkpoint_sha256": expected["cte_checkpoint_sha256"],
+                "dataset_stats_sha256": expected["dataset_stats_sha256"],
+                "video_size": list(video_size),
+                "context_len": int(cfg.model.tokenizer_max_len),
+                "readout_dim": int(cfg.model.video_dit_config.hidden_dim),
+            },
+        )
+        if retriever.bank.value_dim != int(prompt_cfg.get("global_dim", 256)):
+            raise ValueError("behavior bank value_dim must match CausalPrompt global_dim")
+        readouts = load_readout_cache(str(task_context_cfg["readout_cache_path"]), bank_path, retriever.bank)
+        task_context_by_episode = stage2_task_contexts(retriever, readouts)
+        static_identity = task_context_identity("static", bank_path, head_path, task_context_top_k)
+    elif task_context_mode != "pooling":
+        raise ValueError("zeva.task_context.mode must be pooling, bank, or static")
+    dataset = ZevaStage2Dataset(
+        base, cache, top_k=top_k, bit_size=bit_size,
+        pim_retrieval_mode=pim_retrieval_mode,
+        task_context_bank=task_context_bank,
+        task_context_top_k=task_context_top_k,
+        task_context_by_episode=task_context_by_episode,
+    )
     model = instantiate(cfg.model, model_dtype=_mixed_precision_to_model_dtype(str(cfg.mixed_precision)), device="cuda")
     model.load_checkpoint(str(checkpoint))
+    model.zeva_task_context_identity = static_identity
     trainer = Wan22Trainer(cfg=cfg, model=model, train_dataset=dataset, val_dataset=None)
     trainer.train()
     print(f"Stage 2 complete; addon checkpoints are under {Path(str(cfg.output_dir)) / 'checkpoints'}")

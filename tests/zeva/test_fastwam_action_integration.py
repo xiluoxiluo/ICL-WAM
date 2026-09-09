@@ -1,6 +1,7 @@
 import math
 from types import MethodType
 
+import pytest
 import torch
 from torch import nn
 
@@ -9,6 +10,8 @@ from fastwam.zeva import (
     BehaviorPrefixAdapter,
     BehaviorPrefixAdapterConfig,
     CausalPromptEncoder,
+    ExactZevaPolicyInjectionAdapter,
+    ExactZevaPolicyInjectionConfig,
 )
 
 
@@ -129,6 +132,49 @@ def test_nonzero_addon_gate_changes_action_path():
     assert not torch.equal(base, conditioned)
 
 
+def test_exact_model_owns_the_independent_behavior_prefix_slot():
+    model = _model()
+    model.zeva_injection_mode = "exact_zeva"
+    model.zeva_behavior_prefix_adapter = ExactZevaPolicyInjectionAdapter(
+        ExactZevaPolicyInjectionConfig(
+            memory_dim=8,
+            context_dim=4,
+            global_dim=8,
+            phase_dim=4,
+            effect_dim=4,
+            effect_history_length=2,
+            action_dim=3,
+            action_horizon=5,
+            prior_hidden_dim=8,
+            prior_num_heads=2,
+            action_hidden_dim=8,
+        )
+    )
+    with torch.no_grad():
+        model.zeva_behavior_prefix_adapter.pim_gate.fill_(0.5)
+    context = torch.randn(1, 3, 4)
+    context_mask = torch.tensor([[True, True, False]])
+    memory = torch.randn(1, 4, 8)
+    memory_mask = torch.ones(1, 4, dtype=torch.bool)
+    task = torch.randn(1, 8)
+    augmented, augmented_mask = model._prepend_exact_zeva_behavior_slot(
+        context, context_mask, memory, memory_mask, task_tokens=task
+    )
+    assert augmented.shape == (1, 4, 4)
+    assert augmented_mask.tolist() == [[True, True, True, False]]
+    torch.testing.assert_close(augmented[:, 1:], context)
+    torch.testing.assert_close(augmented_mask[:, 1:], context_mask)
+
+    # Legacy adapters keep their old action-hidden path and do not acquire a
+    # context slot implicitly.
+    model.zeva_injection_mode = "memory_residual"
+    same_context, same_mask = model._prepend_exact_zeva_behavior_slot(
+        context, context_mask, memory, memory_mask
+    )
+    assert same_context is context
+    assert same_mask is context_mask
+
+
 def test_conditioned_action_path_reports_residual_debug_metrics():
     model = _model()
     memory = torch.randn(1, 4, 256)
@@ -232,7 +278,8 @@ def test_attach_zeva_addon_freezes_base_modules():
     assert any(parameter.requires_grad for parameter in model.zeva_behavior_prefix_adapter.parameters())
 
 
-def test_forward_routes_stage2_through_model_entrypoint():
+@pytest.mark.parametrize("use_bank", [False, True])
+def test_forward_routes_stage2_through_model_entrypoint(use_bank):
     model = _model()
     called = {}
 
@@ -254,8 +301,26 @@ def test_forward_routes_stage2_through_model_entrypoint():
         "pim_effects": torch.zeros(1, 4, 128),
         "pim_mask": torch.zeros(1, 4, dtype=torch.bool),
     }
+    expected_task = torch.arange(256).float().unsqueeze(0) if use_bank else torch.zeros(1, 256)
+    if use_bank:
+        sample["task_context"] = expected_task.clone()
+
+    def capture_task(module, args, kwargs):
+        called["task_tokens"] = kwargs["task_tokens"].detach().clone()
+
+    hook = model.zeva_prompt_encoder.register_forward_pre_hook(capture_task, with_kwargs=True)
     loss, metrics = model(sample)
+    hook.remove()
+    torch.testing.assert_close(called["task_tokens"], expected_task)
     assert loss.item() == 2.0
     assert metrics["memory/bit_count"] == 0.0
     assert metrics["memory/pim_count"] == 0.0
     assert called["behavior_memory"].shape == (1, 4, 256)
+    if use_bank:
+        sample["task_context"] = torch.zeros(1, 1, 256)
+        with pytest.raises(ValueError, match="task_context must be"):
+            model(sample)
+        model.zeva_task_context_mode = "static"
+        sample.pop("task_context")
+        with pytest.raises(ValueError, match="initial episode task_context"):
+            model(sample)
