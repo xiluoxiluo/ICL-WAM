@@ -4,6 +4,7 @@ defaults:
 
 zeva:
   enabled: true
+  training_stage: policy_injection
   action_only: true
   freeze_fastwam: true
   freeze_cte_stage2: true
@@ -28,7 +29,7 @@ zeva:
   memory:
     bit_size: 4
     pim_top_k: 4
-    pim_max_entries: 256
+    pim_max_entries: 64
     # phase is the Zeva default; cross_task_effect uses a causal BIT effect
     # to retrieve functionally similar effects from other tasks.
     pim_retrieval_mode: phase
@@ -40,12 +41,12 @@ zeva:
   task_context:
     # pooling: text baseline; bank: text-prototype baseline; static: learned
     # initial-image/text retrieval of frozen CTE demonstration prototypes.
-    mode: pooling
+    mode: static
     bank_path: null
     readout_cache_path: null
     retrieval_checkpoint: null
-    top_k: 1
-    key_dim: 256
+    top_k: 5
+    key_dim: ${model.zeva.cte.retrieval_dim}
     value_dim: ${model.zeva.prompt.global_dim}
     # Build-time value; training/deployment use the temperature saved in the bank.
     temperature: 0.07
@@ -82,7 +83,7 @@ zeva:
     prior_hidden_dim: 256
     prior_num_heads: 4
     prior_loss_weight: 0.01
-    prior_dropout_rate: 0.0
+    prior_dropout_rate: 0.4
     prior_inference_guidance_scale: 0.5
     leading_condition_steps: 0
   cache:

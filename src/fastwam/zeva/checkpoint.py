@@ -94,17 +94,74 @@ def load_cte_checkpoint(path: str | Path, model, optimizer=None, scheduler=None,
     return payload
 
 
-def save_addon_checkpoint(path: str | Path, causal_prompt_encoder, behavior_prefix_adapter, step: int, config: dict, base_checkpoint_sha256: str, cte_checkpoint_sha256: str) -> None:
-    torch.save({"causal_prompt_encoder": causal_prompt_encoder.state_dict(), "behavior_prefix_adapter": behavior_prefix_adapter.state_dict(), "pim_gate": behavior_prefix_adapter.pim_gate.detach().cpu(), "step": int(step), "config": config, "base_checkpoint_sha256": base_checkpoint_sha256, "cte_checkpoint_sha256": cte_checkpoint_sha256}, path)
+def save_addon_checkpoint(
+    path: str | Path,
+    causal_prompt_encoder,
+    behavior_prefix_adapter,
+    step: int,
+    config: dict,
+    base_checkpoint_sha256: str,
+    cte_checkpoint_sha256: str,
+    training_stage: str = "policy_injection",
+) -> None:
+    torch.save(
+        {
+            "causal_prompt_encoder": causal_prompt_encoder.state_dict(),
+            "behavior_prefix_adapter": behavior_prefix_adapter.state_dict(),
+            "pim_gate": behavior_prefix_adapter.pim_gate.detach().cpu(),
+            "training_stage": str(training_stage),
+            "step": int(step),
+            "config": config,
+            "base_checkpoint_sha256": base_checkpoint_sha256,
+            "cte_checkpoint_sha256": cte_checkpoint_sha256,
+        },
+        path,
+    )
 
 
-def load_addon_checkpoint(path: str | Path, causal_prompt_encoder, behavior_prefix_adapter, *, base_checkpoint_sha256: str | None = None, cte_checkpoint_sha256: str | None = None, task_context_identity: dict | None = None, map_location: str = "cpu") -> dict:
+def load_addon_checkpoint(
+    path: str | Path,
+    causal_prompt_encoder,
+    behavior_prefix_adapter,
+    *,
+    base_checkpoint_sha256: str | None = None,
+    cte_checkpoint_sha256: str | None = None,
+    task_context_identity: dict | None = None,
+    map_location: str = "cpu",
+    load_scope: str = "all",
+) -> dict:
     payload = torch.load(path, map_location=map_location, weights_only=False)
     if payload.get("task_context_identity") != task_context_identity:
         raise ValueError("addon checkpoint task-context artifacts or retrieval settings mismatch")
     for name, expected in (("base_checkpoint_sha256", base_checkpoint_sha256), ("cte_checkpoint_sha256", cte_checkpoint_sha256)):
         if expected is not None and payload.get(name) != expected:
             raise ValueError(f"addon checkpoint {name} mismatch")
-    causal_prompt_encoder.load_state_dict(payload["causal_prompt_encoder"], strict=True)
-    behavior_prefix_adapter.load_state_dict(payload["behavior_prefix_adapter"], strict=True)
+    if load_scope == "all":
+        causal_prompt_encoder.load_state_dict(
+            payload["causal_prompt_encoder"], strict=True
+        )
+        behavior_prefix_adapter.load_state_dict(
+            payload["behavior_prefix_adapter"], strict=True
+        )
+    elif load_scope == "policy_injection":
+        adapter_state = payload["behavior_prefix_adapter"]
+        keep_prefixes = (
+            "prior.",
+            "action_prior_adapter.",
+            "behavior_global_projector.",
+        )
+        policy_state = {
+            key: value
+            for key, value in adapter_state.items()
+            if key.startswith(keep_prefixes)
+        }
+        _missing, unexpected = behavior_prefix_adapter.load_state_dict(
+            policy_state, strict=False
+        )
+        if unexpected:
+            raise ValueError(
+                f"unexpected policy-injection checkpoint keys: {unexpected}"
+            )
+    else:
+        raise ValueError("load_scope must be 'all' or 'policy_injection'")
     return payload

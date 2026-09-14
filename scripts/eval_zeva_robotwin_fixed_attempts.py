@@ -18,13 +18,17 @@ def main() -> None:
     parser.add_argument("--task-context-retrieval-checkpoint")
     parser.add_argument("--task-context-top-k", type=int)
     parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--mode", choices=("base", "pim_shadow", "pim_on"), default="pim_on")
+    parser.add_argument(
+        "--mode",
+        choices=("base", "zeva_stage2", "pim_shadow", "pim_on"),
+        default="pim_on",
+    )
     parser.add_argument("--max-attempts", type=int, default=4)
     args = parser.parse_args()
     if args.mode != "base" and not args.cte_checkpoint:
-        parser.error("--cte-checkpoint is required for pim_shadow/pim_on")
-    if args.mode == "pim_on" and not args.addon_checkpoint:
-        parser.error("--addon-checkpoint is required for pim_on")
+        parser.error("--cte-checkpoint is required for non-base Zeva modes")
+    if args.mode != "base" and not args.addon_checkpoint:
+        parser.error("--addon-checkpoint is required for non-base Zeva modes")
     root = Path(__file__).resolve().parents[1]
     cmd = [sys.executable, str(root / "experiments/robotwin/eval_robotwin_single.py"),
            "--config-name", "sim_robotwin_zeva.yaml", f"ckpt={args.ckpt}",

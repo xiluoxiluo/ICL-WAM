@@ -202,14 +202,24 @@ class WorldActionRobotWinPolicy:
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
+        requested_zeva_mode = str(zeva_mode)
+        if requested_zeva_mode not in {
+            "base",
+            "zeva_stage2",
+            "pim_shadow",
+            "pim_on",
+        }:
+            raise ValueError(
+                "zeva_mode must be base, zeva_stage2, pim_shadow, or pim_on"
+            )
         zeva_memory_cfg = model_cfg_copy.get("zeva", {}).get("memory", {})
         task_context_cfg = model_cfg_copy.get("zeva", {}).get("task_context", {})
         self.task_context_bank = None
         self._static_task_context_session = None
         self._last_task_context_retrieval = None
-        self.task_context_mode = str(task_context_cfg.get("mode", "pooling"))
-        self.task_context_top_k = int(task_context_cfg.get("top_k", 1))
-        if self.task_context_mode == "bank":
+        self.task_context_mode = str(task_context_cfg.get("mode", "static"))
+        self.task_context_top_k = int(task_context_cfg.get("top_k", 5))
+        if requested_zeva_mode != "base" and self.task_context_mode == "bank":
             if self.model.zeva_prompt_encoder is None:
                 raise ValueError("task-context bank requires an enabled Zeva prompt encoder")
             bank_path = task_context_cfg.get("bank_path")
@@ -232,7 +242,7 @@ class WorldActionRobotWinPolicy:
                     "zeva.task_context.top_k must be within the task-context bank size; "
                     f"got {self.task_context_top_k}, bank_size={len(self.task_context_bank)}"
                 )
-        elif self.task_context_mode == "static":
+        elif requested_zeva_mode != "base" and self.task_context_mode == "static":
             for name in ("bank_path", "retrieval_checkpoint"):
                 if _is_none_like(task_context_cfg.get(name)):
                     raise ValueError(f"static task context requires zeva.task_context.{name}")
@@ -257,12 +267,10 @@ class WorldActionRobotWinPolicy:
             self.model.zeva_task_context_identity = task_context_identity(
                 "static", bank_path, head_path, self.task_context_top_k,
             )
-        elif self.task_context_mode != "pooling":
+        elif requested_zeva_mode != "base" and self.task_context_mode != "pooling":
             raise ValueError("zeva.task_context.mode must be pooling, bank, or static")
 
-        self.zeva_mode = str(zeva_mode)
-        if self.zeva_mode not in {"base", "pim_shadow", "pim_on"}:
-            raise ValueError("zeva_mode must be base, pim_shadow, or pim_on")
+        self.zeva_mode = requested_zeva_mode
         self.cte = None
         self.lifecycle = None
         self._cte_history = None
@@ -282,7 +290,7 @@ class WorldActionRobotWinPolicy:
                 raise ValueError("Zeva evaluation requires model config zeva.enabled=true")
             if not cte_checkpoint:
                 raise ValueError("cte_checkpoint is required for Zeva evaluation")
-            if self.zeva_mode == "pim_on" and not addon_checkpoint:
+            if not addon_checkpoint:
                 raise ValueError("addon_checkpoint is required for Zeva evaluation")
             cte_payload = torch.load(str(cte_checkpoint), map_location="cpu", weights_only=False)
             cte_values = dict(cte_payload.get("config", cte_payload.get("model_config", {})))
@@ -389,7 +397,7 @@ class WorldActionRobotWinPolicy:
                 PersistentInteractionMemoryConfig(
                     phase_dim=cte_cfg.phase_dim,
                     effect_dim=cte_cfg.effect_dim,
-                    capacity=int(zeva_memory_cfg.get("pim_max_entries", 256)),
+                    capacity=int(zeva_memory_cfg.get("pim_max_entries", 64)),
                     top_k=int(pim_top_k),
                     merge_threshold=float(zeva_memory_cfg.get("merge_threshold", 0.85)),
                     phase_merge_weight=float(zeva_memory_cfg.get("beta_phase", 0.5)),
@@ -593,12 +601,18 @@ class WorldActionRobotWinPolicy:
                 encoded = self._cte_history.forward()
                 phase = encoded["phase"][:, -1]
                 memory = self.lifecycle.memory_inputs(phase, task_tokens)
-                behavior_memory, behavior_memory_mask = self.model.zeva_prompt_encoder(**memory)
+                if self.zeva_mode == "zeva_stage2":
+                    causal_prompt = torch.zeros(
+                        (1, int(self.model.zeva_prompt_encoder.config.hidden_dim)),
+                        device=self.model.device,
+                        dtype=self.model.torch_dtype,
+                    )
+                    pim_mask = torch.zeros_like(memory["pim_mask"], dtype=torch.bool)
+                else:
+                    causal_prompt = self.model.zeva_prompt_encoder(**memory)
+                    pim_mask = memory["pim_mask"]
                 zeva_action_residual = None
-                if (
-                    self.zeva_mode == "pim_on"
-                    and getattr(self.model, "zeva_injection_mode", "memory_residual") == "exact_zeva"
-                ):
+                if getattr(self.model, "zeva_injection_mode", "memory_residual") == "exact_zeva":
                     adapter = self.model.zeva_behavior_prefix_adapter
                     prior_mean, _prior_std = adapter.prior(
                         task_tokens,
@@ -613,8 +627,8 @@ class WorldActionRobotWinPolicy:
                 "prompt": None,
                 "context": context,
                 "context_mask": _context_mask,
-                "behavior_memory": behavior_memory,
-                "behavior_memory_mask": behavior_memory_mask,
+                "causal_prompt": causal_prompt,
+                "pim_mask": pim_mask,
                 "zeva_action_residual": zeva_action_residual,
                 "zeva_task_tokens": task_tokens,
                 "zeva_mode": self.zeva_mode,

@@ -38,7 +38,26 @@ def test_zeva_fastwam_defaults_to_two_branch_policy_injection():
             overrides=["task=robotwin_zeva_fastwam_3cam_384"],
         )
     assert cfg.model.zeva.adapter.mode == "exact_zeva"
+    assert cfg.model.zeva.training_stage == "policy_injection"
+    assert cfg.model.zeva.task_context.mode == "static"
+    assert cfg.model.zeva.memory.pim_max_entries == 64
+    assert cfg.model.zeva.adapter.prior_dropout_rate == 0.4
     assert cfg.model.zeva.adapter.leading_condition_steps == 0
+
+
+def test_stage2_presets_select_disjoint_training_stages():
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base="1.3", config_dir=str(Path("configs").resolve())):
+        policy = compose(
+            config_name="train",
+            overrides=["task=robotwin_zeva_fastwam_policy_3cam_384"],
+        )
+        pim = compose(
+            config_name="train",
+            overrides=["task=robotwin_zeva_fastwam_pim_3cam_384"],
+        )
+    assert policy.model.zeva.training_stage == "policy_injection"
+    assert pim.model.zeva.training_stage == "pim_adapter"
 
 
 def test_static_task_context_preset_matches_fastwam_and_cte_spaces():

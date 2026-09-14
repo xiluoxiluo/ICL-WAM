@@ -65,7 +65,7 @@ class CausalPromptEncoder(nn.Module):
         self.persistent_attention = nn.MultiheadAttention(cfg.hidden_dim, cfg.num_heads, batch_first=True)
         self.fusion = nn.Sequential(nn.LayerNorm(3 * cfg.hidden_dim), nn.Linear(3 * cfg.hidden_dim, cfg.hidden_dim), nn.SiLU(), nn.Linear(cfg.hidden_dim, cfg.hidden_dim))
 
-    def forward(self, task_tokens: Tensor, current_phase: Tensor, bit_effects: Tensor, bit_mask: Tensor, pim_phases: Tensor, pim_effects: Tensor, pim_mask: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, task_tokens: Tensor, current_phase: Tensor, bit_effects: Tensor, bit_mask: Tensor, pim_phases: Tensor, pim_effects: Tensor, pim_mask: Tensor) -> Tensor:
         cfg = self.config; batch = task_tokens.shape[0]
         if task_tokens.shape != (batch, cfg.global_dim) or current_phase.shape != (batch, cfg.phase_dim) or bit_effects.shape != (batch, cfg.brief_length, cfg.effect_dim) or bit_mask.shape != (batch, cfg.brief_length) or pim_phases.shape != (batch, cfg.persistent_length, cfg.phase_dim) or pim_effects.shape != (batch, cfg.persistent_length, cfg.effect_dim) or pim_mask.shape != (batch, cfg.persistent_length):
             raise ValueError("Causal prompt input shapes do not match config")
@@ -92,22 +92,7 @@ class CausalPromptEncoder(nn.Module):
         pim_mask = pim_mask.bool(); pim = torch.where(pim_mask.unsqueeze(-1), pim, self.bos_persistent.expand(batch, -1, -1))
         pim_padding = ~pim_mask; empty = ~pim_mask.any(dim=-1); pim_padding = pim_padding.clone(); pim_padding[empty, 0] = False
         pim_context, _ = self.persistent_attention(query[:, None], pim, pim, key_padding_mask=pim_padding, need_weights=False)
-        tokens = self.fusion(torch.cat((query, bit_context[:, 0], pim_context[:, 0]), dim=-1))
-        # One global token plus causal evidence tokens keeps the adapter contract explicit.
-        # Token order is [fused task/phase, current phase, BIT summary,
-        # retrieved PIM summary].  Keep the mask in exactly the same order;
-        # in particular, current phase is always valid while empty BIT/PIM
-        # summaries must remain masked.
-        output_tokens = torch.stack(
-            (tokens, self.phase_project(current_phase), bit_context[:, 0], pim_context[:, 0]),
-            dim=1,
+        causal_prompt = self.fusion(
+            torch.cat((query, bit_context[:, 0], pim_context[:, 0]), dim=-1)
         )
-        output_mask = torch.cat(
-            (
-                torch.ones((batch, 2), dtype=torch.bool, device=task_tokens.device),
-                bit_mask.any(dim=-1, keepdim=True),
-                pim_mask.any(dim=-1, keepdim=True),
-            ),
-            dim=1,
-        )
-        return output_tokens, output_mask
+        return causal_prompt

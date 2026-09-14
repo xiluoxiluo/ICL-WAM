@@ -122,11 +122,11 @@ def main(cfg: DictConfig) -> None:
             f"got {bit_size} vs {prompt_cfg.get('brief_length', 4)}"
         )
     task_context_cfg = zeva.get("task_context", {})
-    task_context_mode = str(task_context_cfg.get("mode", "pooling"))
+    task_context_mode = str(task_context_cfg.get("mode", "static"))
     task_context_bank = None
     task_context_by_episode = None
     static_identity = None
-    task_context_top_k = int(task_context_cfg.get("top_k", 1))
+    task_context_top_k = int(task_context_cfg.get("top_k", 5))
     if task_context_mode == "bank":
         bank_path = str(task_context_cfg.get("bank_path"))
         if not bank_path or bank_path in {"None", "null"}:

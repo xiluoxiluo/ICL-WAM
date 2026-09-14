@@ -12,6 +12,7 @@ model:
 
 EVALUATION:
   policy_name: fastwam_policy
+  # base | zeva_stage2 | pim_shadow | pim_on
   zeva_mode: pim_on
   fixed_seed: null
   max_attempts: 4

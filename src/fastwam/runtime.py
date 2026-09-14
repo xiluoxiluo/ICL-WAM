@@ -175,7 +175,7 @@ def create_fastwam(
         adapter_cfg = dict(zeva.get("adapter", {}))
         prompt_keys = {"global_dim", "phase_dim", "effect_dim", "brief_length", "persistent_length", "hidden_dim", "num_heads"}
         adapter_keys = {"memory_dim", "action_horizon", "action_hidden_dim", "num_heads", "mlp_ratio", "gate_init"}
-        adapter_mode = str(adapter_cfg.get("mode", "memory_residual"))
+        adapter_mode = str(adapter_cfg.get("mode", "exact_zeva"))
         if adapter_mode == "exact_zeva":
             exact_keys = set(ExactZevaPolicyInjectionConfig.__dataclass_fields__)
             exact_cfg = {
@@ -201,7 +201,15 @@ def create_fastwam(
             CausalPromptEncoder(CausalPromptConfig(**{k: v for k, v in prompt_cfg.items() if k in prompt_keys})),
             policy_adapter,
         )
-        model.zeva_task_context_mode = str(zeva.get("task_context", {}).get("mode", "pooling"))
+        model.zeva_task_context_mode = str(
+            zeva.get("task_context", {}).get("mode", "static")
+        )
+        training_stage = str(zeva.get("training_stage", "policy_injection"))
+        if training_stage not in {"policy_injection", "pim_adapter"}:
+            raise ValueError(
+                "zeva.training_stage must be 'policy_injection' or 'pim_adapter'"
+            )
+        model.set_zeva_training_stage(training_stage)
     return model
 
 

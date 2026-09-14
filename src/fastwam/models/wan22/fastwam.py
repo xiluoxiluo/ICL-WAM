@@ -99,6 +99,7 @@ class FastWAM(torch.nn.Module):
         self.zeva_prompt_encoder = None
         self.zeva_behavior_prefix_adapter = None
         self.zeva_injection_mode = "memory_residual"
+        self.zeva_training_stage = "policy_injection"
         self.zeva_mode = "base"
 
         self.to(self.device)
@@ -300,9 +301,11 @@ class FastWAM(torch.nn.Module):
         self,
         context: torch.Tensor,
         context_mask: torch.Tensor,
-        behavior_memory: torch.Tensor,
-        behavior_memory_mask: torch.Tensor,
-        task_tokens: Optional[torch.Tensor] = None,
+        causal_prompt: torch.Tensor,
+        pim_mask: torch.Tensor,
+        task_tokens: torch.Tensor,
+        *,
+        enable_pim: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Insert the dedicated behavior slot for the exact Zeva adapter."""
         if getattr(self, "zeva_injection_mode", "memory_residual") != "exact_zeva":
@@ -313,9 +316,10 @@ class FastWAM(torch.nn.Module):
         return adapter.prepend_behavior_prefix_slot(
             context=context,
             context_mask=context_mask,
-            memory_tokens=behavior_memory,
-            memory_mask=behavior_memory_mask,
+            causal_prompt=causal_prompt,
+            pim_mask=pim_mask,
             task_tokens=task_tokens,
+            enable_pim=enable_pim,
         )
 
     @torch.no_grad()
@@ -866,10 +870,53 @@ class FastWAM(torch.nn.Module):
         self.zeva_mode = "pim_on"
         return self
 
+    def set_zeva_training_stage(self, stage: str):
+        stage = str(stage)
+        if stage not in {"policy_injection", "pim_adapter"}:
+            raise ValueError(
+                "Zeva training stage must be 'policy_injection' or 'pim_adapter'"
+            )
+        self.zeva_training_stage = stage
+        return self
+
     def zeva_trainable_parameters(self):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
             return []
-        return list(self.zeva_prompt_encoder.parameters()) + list(self.zeva_behavior_prefix_adapter.parameters())
+        adapter = self.zeva_behavior_prefix_adapter
+        if self.zeva_training_stage == "policy_injection":
+            return list(adapter.policy_injection_parameters())
+        if self.zeva_training_stage == "pim_adapter":
+            return (
+                list(self.zeva_prompt_encoder.parameters())
+                + list(adapter.pim_adapter_parameters())
+            )
+        raise RuntimeError(
+            f"unsupported Zeva training stage: {self.zeva_training_stage}"
+        )
+
+    def configure_zeva_trainable_state(self) -> None:
+        if not self.zeva_enabled:
+            raise RuntimeError("Zeva addon is not attached")
+        self.eval()
+        self.requires_grad_(False)
+        adapter = self.zeva_behavior_prefix_adapter
+        stage = self.zeva_training_stage
+        if stage == "policy_injection":
+            adapter.prior.train()
+            adapter.prior.requires_grad_(True)
+            adapter.action_prior_adapter.train()
+            adapter.action_prior_adapter.requires_grad_(True)
+            adapter.behavior_global_projector.train()
+            adapter.behavior_global_projector.requires_grad_(True)
+            return
+        if stage == "pim_adapter":
+            self.zeva_prompt_encoder.train()
+            self.zeva_prompt_encoder.requires_grad_(True)
+            adapter.prefix_project.train()
+            adapter.prefix_project.requires_grad_(True)
+            adapter.pim_gate.requires_grad_(True)
+            return
+        raise RuntimeError(f"unsupported Zeva training stage: {stage}")
 
     def _denoise_action_with_video_cache_zeva(
         self,
@@ -880,16 +927,14 @@ class FastWAM(torch.nn.Module):
         video_cache_k: list[torch.Tensor],
         video_cache_v: list[torch.Tensor],
         action_attention_mask: torch.Tensor,
-        behavior_memory: torch.Tensor,
-        behavior_memory_mask: torch.Tensor,
+        causal_prompt: torch.Tensor,
+        pim_mask: torch.Tensor,
         zeva_action_residual: Optional[torch.Tensor] = None,
         gate_override: Optional[float] = None,
         debug: Optional[dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Zeva addon is not attached to this FastWAM instance")
-        if behavior_memory_mask.ndim != 2 or behavior_memory_mask.shape[1] != 4:
-            raise ValueError("behavior_memory_mask must be the four-token CausalPrompt mask")
         (
             action_tokens,
             _t,
@@ -904,36 +949,30 @@ class FastWAM(torch.nn.Module):
             context_mask=context_mask,
         )
         injection_mode = getattr(self, "zeva_injection_mode", "memory_residual")
-        if gate_override is not None and float(gate_override) == 0.0:
-            # ``pim_shadow`` is a lifecycle-only control.  Short-circuit the
-            # addon entirely so it remains a true vanilla FastWAM comparison
-            # and does not require an otherwise-unused policy prior.
-            gated_residual = torch.zeros_like(action_tokens)
-        elif injection_mode == "exact_zeva":
+        if injection_mode == "exact_zeva":
             if zeva_action_residual is None:
                 raise ValueError("exact Zeva injection requires an action-prior residual")
             gated_residual = zeva_action_residual.to(
                 device=action_tokens.device, dtype=action_tokens.dtype
             )
-            if gate_override is not None:
-                gated_residual = gated_residual * float(gate_override)
         elif gate_override is None and self.zeva_behavior_prefix_adapter.training:
+            memory_tokens = causal_prompt[:, None]
+            memory_mask = pim_mask.any(dim=-1, keepdim=True)
             gated_residual = self.zeva_behavior_prefix_adapter.gated(
-                behavior_memory, behavior_memory_mask, action_horizon=latents_action.shape[1]
+                memory_tokens, memory_mask, action_horizon=latents_action.shape[1]
             )
         else:
+            memory_tokens = causal_prompt[:, None]
+            memory_mask = pim_mask.any(dim=-1, keepdim=True)
             residual = self.zeva_behavior_prefix_adapter(
-                behavior_memory, behavior_memory_mask, action_horizon=latents_action.shape[1]
+                memory_tokens, memory_mask, action_horizon=latents_action.shape[1]
             )
             gate = torch.tanh(self.zeva_behavior_prefix_adapter.pim_gate)
             if gate_override is not None:
                 gate = gate.new_tensor(float(gate_override))
             gated_residual = gate * residual
-        # CausalPromptEncoder places the persistent-memory summary last in its
-        # four-token output. Task/phase/BIT conditioning remains available when
-        # PIM is empty, but the PIM residual itself is an exact no-op.
         if injection_mode != "exact_zeva":
-            has_pim = behavior_memory_mask[:, -1].to(
+            has_pim = pim_mask.any(dim=-1).to(
                 device=gated_residual.device, dtype=gated_residual.dtype
             ).view(-1, 1, 1)
             gated_residual = gated_residual * has_pim
@@ -969,14 +1008,19 @@ class FastWAM(torch.nn.Module):
         )
         return self.action_expert.post(action_tokens)
 
-    def _validate_zeva_memory(self, behavior_memory, behavior_memory_mask, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.zeva_enabled or self.zeva_behavior_prefix_adapter is None:
+    def _validate_zeva_prompt(self, causal_prompt, pim_mask, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            not self.zeva_enabled
+            or self.zeva_prompt_encoder is None
+            or self.zeva_behavior_prefix_adapter is None
+        ):
             raise RuntimeError("Zeva addon is not attached to this FastWAM instance")
-        if behavior_memory.ndim != 3 or behavior_memory.shape[0] != batch_size or behavior_memory.shape[1] != 4:
-            raise ValueError("behavior_memory must be [B,4,d_mem]")
-        if behavior_memory_mask.shape != behavior_memory.shape[:2]:
-            raise ValueError("behavior_memory_mask must be [B,N]")
-        return behavior_memory.to(self.device), behavior_memory_mask.to(self.device, dtype=torch.bool)
+        prompt_dim = int(self.zeva_prompt_encoder.config.hidden_dim)
+        if causal_prompt.ndim != 2 or causal_prompt.shape != (batch_size, prompt_dim):
+            raise ValueError(f"causal_prompt must be [B,{prompt_dim}]")
+        if pim_mask.ndim != 2 or pim_mask.shape[0] != batch_size:
+            raise ValueError("pim_mask must be [B,K]")
+        return causal_prompt.to(self.device), pim_mask.to(self.device, dtype=torch.bool)
 
     def forward_zeva_action_train(
         self,
@@ -984,8 +1028,8 @@ class FastWAM(torch.nn.Module):
         clean_action: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
-        behavior_memory: torch.Tensor,
-        behavior_memory_mask: torch.Tensor,
+        causal_prompt: torch.Tensor,
+        pim_mask: torch.Tensor,
         proprio: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
@@ -1002,8 +1046,8 @@ class FastWAM(torch.nn.Module):
             raise ValueError("clean_action must be [B,T,action_dim]")
         if clean_action.shape[1] != 32 or clean_action.shape[2] != self.action_expert.action_dim:
             raise ValueError("Zeva V1 requires clean_action [B,32,14]")
-        behavior_memory, behavior_memory_mask = self._validate_zeva_memory(
-            behavior_memory, behavior_memory_mask, clean_action.shape[0]
+        causal_prompt, pim_mask = self._validate_zeva_prompt(
+            causal_prompt, pim_mask, clean_action.shape[0]
         )
         context = context.to(self.device, dtype=self.torch_dtype)
         context_mask = context_mask.to(self.device, dtype=torch.bool)
@@ -1011,12 +1055,8 @@ class FastWAM(torch.nn.Module):
             getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
             and zeva_task_tokens is None
         ):
-            # Preserve a useful direct-call fallback while making the normal
-            # bank/static path pass its retrieved task vector explicitly.
-            zeva_task_tokens = task_tokens_from_context(
-                context,
-                context_mask,
-                int(self.zeva_behavior_prefix_adapter.config.global_dim),
+            raise ValueError(
+                "exact Zeva action training requires explicit static task-context tokens"
             )
         if self.proprio_encoder is not None:
             if proprio is None:
@@ -1034,9 +1074,10 @@ class FastWAM(torch.nn.Module):
             context, context_mask = self._prepend_exact_zeva_behavior_slot(
                 context=context,
                 context_mask=context_mask,
-                memory_tokens=behavior_memory,
-                memory_mask=behavior_memory_mask,
+                causal_prompt=causal_prompt,
+                pim_mask=pim_mask,
                 task_tokens=zeva_task_tokens,
+                enable_pim=(self.zeva_training_stage == "pim_adapter"),
             )
         clean_action = clean_action.to(self.device, dtype=self.torch_dtype)
         noise = torch.randn_like(clean_action) if noise is None else noise.to(clean_action)
@@ -1077,7 +1118,7 @@ class FastWAM(torch.nn.Module):
             latents_action=noisy_action, timestep_action=timestep, context=context,
             context_mask=context_mask, video_cache_k=video_cache_k, video_cache_v=video_cache_v,
             action_attention_mask=attention_mask[video_tokens.shape[1]:, :],
-            behavior_memory=behavior_memory, behavior_memory_mask=behavior_memory_mask,
+            causal_prompt=causal_prompt, pim_mask=pim_mask,
             zeva_action_residual=zeva_action_residual,
             debug=debug_metrics,
         )
@@ -1094,7 +1135,10 @@ class FastWAM(torch.nn.Module):
             device=loss_per_sample.device, dtype=loss_per_sample.dtype
         )
         loss = (loss_per_sample * action_weight).mean()
-        if getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva":
+        if (
+            getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
+            and self.zeva_training_stage == "policy_injection"
+        ):
             if zeva_prior_mean is None or zeva_prior_std is None:
                 raise ValueError("exact Zeva training requires action-prior outputs")
             prior_loss = gaussian_prior_nll(
@@ -1106,7 +1150,14 @@ class FastWAM(torch.nn.Module):
             gate = float(torch.tanh(self.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
         else:
             gate = float(torch.tanh(self.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
-            residual = self.zeva_behavior_prefix_adapter(behavior_memory, behavior_memory_mask, action_horizon=clean_action.shape[1])
+            if getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva":
+                residual = zeva_action_residual
+            else:
+                residual = self.zeva_behavior_prefix_adapter(
+                    causal_prompt[:, None],
+                    pim_mask.any(dim=-1, keepdim=True),
+                    action_horizon=clean_action.shape[1],
+                )
             prior_metrics = {}
         residual_norm = float(residual.detach().float().norm(dim=-1).mean().cpu())
         metrics = {
@@ -1385,20 +1436,22 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         compile_action_infer: bool = False,
-        behavior_memory: Optional[torch.Tensor] = None,
-        behavior_memory_mask: Optional[torch.Tensor] = None,
+        causal_prompt: Optional[torch.Tensor] = None,
+        pim_mask: Optional[torch.Tensor] = None,
         zeva_action_residual: Optional[torch.Tensor] = None,
         zeva_task_tokens: Optional[torch.Tensor] = None,
         zeva_mode: str = "base",
     ) -> dict[str, Any]:
         self.eval()
-        if zeva_mode not in {"base", "pim_shadow", "pim_on"}:
-            raise ValueError("zeva_mode must be one of base, pim_shadow, pim_on")
+        if zeva_mode not in {"base", "zeva_stage2", "pim_shadow", "pim_on"}:
+            raise ValueError(
+                "zeva_mode must be one of base, zeva_stage2, pim_shadow, pim_on"
+            )
         if zeva_mode != "base":
-            if behavior_memory is None or behavior_memory_mask is None:
-                raise ValueError("Zeva modes require behavior_memory and behavior_memory_mask")
-            behavior_memory, behavior_memory_mask = self._validate_zeva_memory(
-                behavior_memory, behavior_memory_mask, 1
+            if causal_prompt is None or pim_mask is None:
+                raise ValueError("Zeva modes require causal_prompt and pim_mask")
+            causal_prompt, pim_mask = self._validate_zeva_prompt(
+                causal_prompt, pim_mask, 1
             )
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
@@ -1464,17 +1517,12 @@ class FastWAM(torch.nn.Module):
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
         if (
-            zeva_mode == "pim_on"
+            zeva_mode != "base"
             and getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
             and zeva_task_tokens is None
         ):
-            # The explicit argument is used for bank/static task context.  A
-            # text-pooling fallback keeps the public inference API usable when
-            # callers provide only the original FastWAM prompt context.
-            zeva_task_tokens = task_tokens_from_context(
-                context,
-                context_mask,
-                int(self.zeva_behavior_prefix_adapter.config.global_dim),
+            raise ValueError(
+                "exact Zeva inference requires explicit static task-context tokens"
             )
         if proprio is not None:
             context, context_mask = self._append_proprio_to_context(
@@ -1482,21 +1530,17 @@ class FastWAM(torch.nn.Module):
                 context_mask=context_mask,
                 proprio=proprio,
             )
-        # Keep the model as the single owner of the policy-injection layout.
-        # FastWAM has no unified Zeva packed language stream, so its equivalent
-        # is one dedicated cross-attention context token before the untouched
-        # text/proprio tokens.  Shadow mode deliberately follows the vanilla
-        # context path so it remains a true baseline check.
         if (
-            zeva_mode == "pim_on"
+            zeva_mode != "base"
             and getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
         ):
             context, context_mask = self._prepend_exact_zeva_behavior_slot(
                 context=context,
                 context_mask=context_mask,
-                memory_tokens=behavior_memory,
-                memory_mask=behavior_memory_mask,
+                causal_prompt=causal_prompt,
+                pim_mask=pim_mask,
                 task_tokens=zeva_task_tokens,
+                enable_pim=(zeva_mode == "pim_on"),
             )
 
         timestep_video = torch.zeros(
@@ -1595,10 +1639,18 @@ class FastWAM(torch.nn.Module):
                     video_cache_k=video_cache_k,
                     video_cache_v=video_cache_v,
                     action_attention_mask=action_attention_mask,
-                    behavior_memory=behavior_memory,
-                    behavior_memory_mask=behavior_memory_mask,
+                    causal_prompt=causal_prompt,
+                    pim_mask=pim_mask,
                     zeva_action_residual=zeva_action_residual,
-                    gate_override=0.0 if zeva_mode == "pim_shadow" else None,
+                    gate_override=(
+                        0.0
+                        if (
+                            zeva_mode != "pim_on"
+                            and getattr(self, "zeva_injection_mode", "memory_residual")
+                            != "exact_zeva"
+                        )
+                        else None
+                    ),
                 )
             pred_action = pred_action_posi
 
@@ -1609,11 +1661,11 @@ class FastWAM(torch.nn.Module):
         }
 
     @torch.no_grad()
-    def infer_action_zeva(self, *, behavior_memory, behavior_memory_mask, zeva_mode: str = "pim_on", **kwargs):
+    def infer_action_zeva(self, *, causal_prompt, pim_mask, zeva_mode: str = "pim_on", **kwargs):
         """Explicit Zeva inference entry point; base infer_action remains compatible."""
         return self.infer_action(
-            behavior_memory=behavior_memory,
-            behavior_memory_mask=behavior_memory_mask,
+            causal_prompt=causal_prompt,
+            pim_mask=pim_mask,
             zeva_mode=zeva_mode,
             **kwargs,
         )
@@ -1676,6 +1728,7 @@ class FastWAM(torch.nn.Module):
             "causal_prompt_encoder": self.zeva_prompt_encoder.state_dict(),
             "behavior_prefix_adapter": self.zeva_behavior_prefix_adapter.state_dict(),
             "pim_gate": self.zeva_behavior_prefix_adapter.pim_gate.detach().cpu(),
+            "training_stage": self.zeva_training_stage,
             "step": int(step), "config": config or {},
             "base_checkpoint_sha256": base_checkpoint_sha256,
             "cte_checkpoint_sha256": cte_checkpoint_sha256,
@@ -1683,7 +1736,8 @@ class FastWAM(torch.nn.Module):
         }, path)
 
     def load_zeva_addon_checkpoint(self, path, *, base_checkpoint_sha256: Optional[str] = None,
-                                   cte_checkpoint_sha256: Optional[str] = None):
+                                   cte_checkpoint_sha256: Optional[str] = None,
+                                   load_scope: str = "all"):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Cannot load a Zeva addon before attaching it")
         from fastwam.zeva.checkpoint import load_addon_checkpoint
@@ -1692,16 +1746,42 @@ class FastWAM(torch.nn.Module):
             base_checkpoint_sha256=base_checkpoint_sha256,
             cte_checkpoint_sha256=cte_checkpoint_sha256,
             task_context_identity=getattr(self, "zeva_task_context_identity", None),
+            load_scope=load_scope,
         )
 
     def zeva_parameter_report(self) -> dict[str, object]:
         trainable = [name for name, p in self.named_parameters() if p.requires_grad]
         frozen = [name for name, p in self.named_parameters() if not p.requires_grad]
-        allowed = ("zeva_prompt_encoder.", "zeva_behavior_prefix_adapter.")
-        invalid = [name for name in trainable if not name.startswith(allowed)]
+        stage = self.zeva_training_stage
+        if stage == "policy_injection":
+            allowed = (
+                "zeva_behavior_prefix_adapter.prior.",
+                "zeva_behavior_prefix_adapter.action_prior_adapter.",
+                "zeva_behavior_prefix_adapter.behavior_global_projector.",
+            )
+        elif stage == "pim_adapter":
+            allowed = (
+                "zeva_prompt_encoder.",
+                "zeva_behavior_prefix_adapter.prefix_project.",
+                "zeva_behavior_prefix_adapter.pim_gate",
+            )
+        else:
+            raise RuntimeError(f"unsupported Zeva training stage: {stage}")
+        invalid = [
+            name
+            for name in trainable
+            if not any(name.startswith(prefix) for prefix in allowed)
+        ]
         if invalid:
-            raise AssertionError(f"Non-addon parameters are trainable: {invalid[:5]}")
-        return {"trainable_names": trainable, "trainable_count": sum(self.get_parameter(n).numel() for n in trainable), "frozen_count": sum(self.get_parameter(n).numel() for n in frozen)}
+            raise AssertionError(
+                f"Unexpected trainable Zeva parameters for stage={stage}: {invalid[:10]}"
+            )
+        return {
+            "training_stage": stage,
+            "trainable_names": trainable,
+            "trainable_count": sum(self.get_parameter(n).numel() for n in trainable),
+            "frozen_count": sum(self.get_parameter(n).numel() for n in frozen),
+        }
 
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
@@ -1741,7 +1821,18 @@ class FastWAM(torch.nn.Module):
         """
         if not self.zeva_enabled or self.zeva_prompt_encoder is None:
             raise RuntimeError("Zeva Stage 2 forward requires an attached addon")
-        required = ("video", "action", "context", "context_mask", "phase", "bit_effects", "bit_mask", "pim_phases", "pim_effects", "pim_mask")
+        stage = self.zeva_training_stage
+        required = (
+            "video",
+            "action",
+            "context",
+            "context_mask",
+            "phase",
+            "bit_effects",
+            "bit_mask",
+        )
+        if stage == "pim_adapter":
+            required += ("pim_phases", "pim_effects", "pim_mask")
         missing = [key for key in required if key not in sample]
         if missing:
             raise KeyError(f"Zeva Stage 2 sample is missing fields: {missing}")
@@ -1751,23 +1842,47 @@ class FastWAM(torch.nn.Module):
         context = sample["context"].to(self.device)
         context_mask = sample["context_mask"].to(self.device, dtype=torch.bool)
         task_dim = int(self.zeva_prompt_encoder.config.global_dim)
+        task_mode = str(getattr(self, "zeva_task_context_mode", "static"))
         if sample.get("task_context") is None:
-            if getattr(self, "zeva_task_context_mode", "pooling") == "static":
-                raise ValueError("static task context requires an initial episode task_context vector")
+            if task_mode == "static":
+                raise ValueError("formal Zeva training requires static task_context")
+            if task_mode != "pooling":
+                raise ValueError(f"unsupported Zeva task_context mode: {task_mode}")
             task_tokens = task_tokens_from_context(context, context_mask, task_dim)
         else:
             task_tokens = sample["task_context"].to(device=self.device)
         if task_tokens.shape != (context.shape[0], task_dim):
             raise ValueError("task_context must be [B, prompt.global_dim]")
-        behavior_memory, behavior_memory_mask = self.zeva_prompt_encoder(
-            task_tokens=task_tokens,
-            current_phase=sample["phase"].to(self.device),
-            bit_effects=sample["bit_effects"].to(self.device),
-            bit_mask=sample["bit_mask"].to(self.device),
-            pim_phases=sample["pim_phases"].to(self.device),
-            pim_effects=sample["pim_effects"].to(self.device),
-            pim_mask=sample["pim_mask"].to(self.device),
-        )
+        batch = context.shape[0]
+        prompt_dim = int(self.zeva_prompt_encoder.config.hidden_dim)
+        pim_k = int(self.zeva_prompt_encoder.config.persistent_length)
+        if stage == "policy_injection":
+            causal_prompt = torch.zeros(
+                (batch, prompt_dim),
+                device=self.device,
+                dtype=self.torch_dtype,
+            )
+            pim_mask_for_policy = torch.zeros(
+                (batch, pim_k),
+                device=self.device,
+                dtype=torch.bool,
+            )
+        elif stage == "pim_adapter":
+            causal_prompt = self.zeva_prompt_encoder(
+                task_tokens=task_tokens,
+                current_phase=sample["phase"].to(self.device),
+                bit_effects=sample["bit_effects"].to(self.device),
+                bit_mask=sample["bit_mask"].to(self.device),
+                pim_phases=sample["pim_phases"].to(self.device),
+                pim_effects=sample["pim_effects"].to(self.device),
+                pim_mask=sample["pim_mask"].to(self.device),
+            )
+            pim_mask_for_policy = sample["pim_mask"].to(
+                self.device,
+                dtype=torch.bool,
+            )
+        else:
+            raise RuntimeError(f"unsupported Zeva training stage: {stage}")
         zeva_action_residual = None
         zeva_prior_mean = None
         zeva_prior_std = None
@@ -1787,8 +1902,8 @@ class FastWAM(torch.nn.Module):
             clean_action=sample["action"],
             context=context,
             context_mask=context_mask,
-            behavior_memory=behavior_memory,
-            behavior_memory_mask=behavior_memory_mask,
+            causal_prompt=causal_prompt,
+            pim_mask=pim_mask_for_policy,
             proprio=sample.get("proprio"),
             action_valid=sample.get("action_valid"),
             zeva_action_residual=zeva_action_residual,
@@ -1799,7 +1914,17 @@ class FastWAM(torch.nn.Module):
         metrics.update(
             {
                 "memory/bit_count": float(sample["bit_mask"].to(dtype=torch.float32).sum(dim=-1).mean().detach().cpu()),
-                "memory/pim_count": float(sample["pim_mask"].to(dtype=torch.float32).sum(dim=-1).mean().detach().cpu()),
+                "memory/pim_count": float(
+                    sample.get(
+                        "pim_mask",
+                        torch.zeros((batch, pim_k), dtype=torch.bool),
+                    )
+                    .to(dtype=torch.float32)
+                    .sum(dim=-1)
+                    .mean()
+                    .detach()
+                    .cpu()
+                ),
             }
         )
         return loss, metrics

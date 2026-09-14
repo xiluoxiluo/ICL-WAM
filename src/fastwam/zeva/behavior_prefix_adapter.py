@@ -81,7 +81,7 @@ class ExactZevaPolicyInjectionConfig:
     action_hidden_dim: int = 1024
     leading_condition_steps: int = 0
     prior_loss_weight: float = 0.01
-    prior_dropout_rate: float = 0.0
+    prior_dropout_rate: float = 0.4
     prior_inference_guidance_scale: float = 0.5
     prompt_gate_init: float = 0.0
     min_std: float = 1.0e-3
@@ -246,35 +246,58 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         nn.init.xavier_uniform_(self.prefix_project.weight)
         nn.init.zeros_(self.prefix_project.bias)
 
-    def causal_prompt_prefix(self, memory_tokens: Tensor, memory_mask: Tensor) -> Tensor:
-        if (
-            memory_tokens.ndim != 3
-            or memory_tokens.shape[1] != 4
-            or memory_tokens.shape[-1] != self.config.memory_dim
-        ):
+    def policy_injection_parameters(self):
+        yield from self.prior.parameters()
+        yield from self.action_prior_adapter.parameters()
+        yield from self.behavior_global_projector.parameters()
+
+    def pim_adapter_parameters(self):
+        yield from self.prefix_project.parameters()
+        yield self.pim_gate
+
+    @torch.no_grad()
+    def reset_pim_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.prefix_project.weight)
+        nn.init.zeros_(self.prefix_project.bias)
+        self.pim_gate.fill_(float(self.config.prompt_gate_init))
+
+    def causal_prompt_prefix(
+        self,
+        causal_prompt: Tensor,
+        pim_mask: Tensor,
+        *,
+        enable_pim: bool = True,
+    ) -> Tensor:
+        if causal_prompt.ndim != 2:
+            raise ValueError("causal_prompt must be [B,D]")
+        if causal_prompt.shape[-1] != self.config.memory_dim:
             raise ValueError(
-                "memory_tokens must be the four-token CausalPrompt output with "
-                f"last dim {self.config.memory_dim}"
+                f"causal_prompt last dim must be {self.config.memory_dim}"
             )
-        if memory_mask.shape != memory_tokens.shape[:2]:
-            raise ValueError("memory_mask shape does not match memory_tokens")
-        memory_tokens = memory_tokens.to(
-            device=self.prefix_project.weight.device,
-            dtype=self.prefix_project.weight.dtype,
+        if pim_mask.ndim != 2 or pim_mask.shape[0] != causal_prompt.shape[0]:
+            raise ValueError("pim_mask must be [B,K]")
+        prompt = self.prefix_project(
+            causal_prompt.to(
+                device=self.prefix_project.weight.device,
+                dtype=self.prefix_project.weight.dtype,
+            )
+        )[:, None]
+        if not enable_pim:
+            return torch.zeros_like(prompt)
+        has_pim = (
+            pim_mask.any(dim=-1, keepdim=True)
+            .to(device=prompt.device, dtype=prompt.dtype)
+            .unsqueeze(-1)
         )
-        memory_mask = memory_mask.to(device=memory_tokens.device, dtype=torch.bool)
-        # The prompt encoder always marks the fused task/phase tokens valid.
-        # Zeva's causal-prompt gate is controlled specifically by persistent
-        # evidence, which is the fourth token in FastWAM's fixed contract.
-        has_pim = memory_mask[:, -1:].to(memory_tokens.dtype)
-        prompt = self.prefix_project(memory_tokens[:, 0])[:, None]
-        return torch.tanh(self.pim_gate).to(prompt.dtype) * prompt * has_pim[:, :, None]
+        return torch.tanh(self.pim_gate).to(prompt.dtype) * prompt * has_pim
 
     def behavior_prefix_slot(
         self,
         task_tokens: Tensor,
-        memory_tokens: Tensor,
-        memory_mask: Tensor,
+        causal_prompt: Tensor,
+        pim_mask: Tensor,
+        *,
+        enable_pim: bool = True,
     ) -> Tensor:
         """Build the single token written to the reserved behavior slot."""
         if task_tokens.ndim != 2 or task_tokens.shape[-1] != self.config.global_dim:
@@ -282,15 +305,22 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
                 "task_tokens shape does not match the exact Zeva adapter: "
                 f"expected [B,{self.config.global_dim}], got {tuple(task_tokens.shape)}"
             )
-        if task_tokens.shape[0] != memory_tokens.shape[0]:
-            raise ValueError("task_tokens and memory_tokens must have the same batch size")
-        task_tokens = task_tokens.to(
-            device=self.behavior_global_projector.weight.device,
-            dtype=self.behavior_global_projector.weight.dtype,
+        if task_tokens.shape[0] != causal_prompt.shape[0]:
+            raise ValueError("task_tokens and causal_prompt must have the same batch size")
+        base_prefix = self.behavior_global_projector(
+            task_tokens.to(
+                device=self.behavior_global_projector.weight.device,
+                dtype=self.behavior_global_projector.weight.dtype,
+            )
+        )[:, None]
+        pim_delta = self.causal_prompt_prefix(
+            causal_prompt,
+            pim_mask,
+            enable_pim=enable_pim,
         )
-        base_prefix = self.behavior_global_projector(task_tokens)[:, None]
-        return base_prefix + self.causal_prompt_prefix(memory_tokens, memory_mask).to(
-            device=base_prefix.device, dtype=base_prefix.dtype
+        return base_prefix + pim_delta.to(
+            device=base_prefix.device,
+            dtype=base_prefix.dtype,
         )
 
     def action_prior_residual(self, prior_mean: Tensor, *, training: bool) -> Tensor:
@@ -328,9 +358,11 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         self,
         context: Tensor,
         context_mask: Tensor,
-        memory_tokens: Tensor,
-        memory_mask: Tensor,
-        task_tokens: Tensor | None = None,
+        causal_prompt: Tensor,
+        pim_mask: Tensor,
+        task_tokens: Tensor,
+        *,
+        enable_pim: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """Prepend one independent Causal-Prompt slot to FastWAM context.
 
@@ -343,19 +375,14 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         """
         if context.ndim != 3 or context_mask.shape != context.shape[:2]:
             raise ValueError("context/context_mask shapes do not match")
-        if memory_tokens.ndim != 3 or memory_tokens.shape[0] != context.shape[0]:
-            raise ValueError("memory_tokens must have the same batch size as context")
-        if task_tokens is None:
-            # Keep small direct callers source-compatible when the two spaces
-            # happen to coincide.  Production Stage 2/inference always passes
-            # the explicit task-context readout used by Zeva.
-            if self.config.global_dim != self.config.memory_dim:
-                raise ValueError(
-                    "exact Zeva behavior slot requires explicit task_tokens when "
-                    "global_dim != memory_dim"
-                )
-            task_tokens = memory_tokens[:, 0]
-        prefix = self.behavior_prefix_slot(task_tokens, memory_tokens, memory_mask)
+        if causal_prompt.ndim != 2 or causal_prompt.shape[0] != context.shape[0]:
+            raise ValueError("causal_prompt must have the same batch size as context")
+        prefix = self.behavior_prefix_slot(
+            task_tokens,
+            causal_prompt,
+            pim_mask,
+            enable_pim=enable_pim,
+        )
         if prefix.shape != (context.shape[0], 1, context.shape[-1]):
             raise ValueError(
                 "Causal Prompt prefix dimension must match the raw FastWAM context dimension"

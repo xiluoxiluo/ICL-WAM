@@ -22,7 +22,7 @@ def test_task_token_pooling_rejects_bad_mask():
         raise AssertionError("invalid context mask was accepted")
 
 
-def test_prompt_output_mask_matches_token_order_for_empty_memory():
+def test_causal_prompt_returns_single_fused_vector():
     encoder = CausalPromptEncoder()
     args = (
         torch.randn(2, 256),
@@ -33,5 +33,5 @@ def test_prompt_output_mask_matches_token_order_for_empty_memory():
         torch.zeros(2, 4, 128),
         torch.zeros(2, 4, dtype=torch.bool),
     )
-    _tokens, mask = encoder(*args)
-    assert mask.tolist() == [[True, True, False, False], [True, True, False, False]]
+    causal_prompt = encoder(*args)
+    assert causal_prompt.shape == (2, encoder.config.hidden_dim)
