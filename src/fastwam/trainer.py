@@ -377,11 +377,13 @@ class Wan22Trainer:
         return path
 
     def _initialize_pim_stage_from_policy_checkpoint(self) -> None:
-        policy_checkpoint = self._get_zeva_policy_checkpoint()
         # A resume always restores the current PIM stage and must not be
-        # overwritten by the one-time Stage-2A initialization path.
+        # overwritten by the one-time Stage-2A initialization path.  Keep
+        # this guard before looking up policy_checkpoint: that path may point
+        # to an unavailable location from the machine that created the run.
         if self.resume not in (None, "", "None", "null"):
             return
+        policy_checkpoint = self._get_zeva_policy_checkpoint()
         if policy_checkpoint is None:
             raise ValueError(
                 "pim_adapter training requires model.zeva.policy_checkpoint when resume is not set"

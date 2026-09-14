@@ -205,3 +205,36 @@ def test_pim_stage_initialization_uses_policy_checkpoint_only(tmp_path):
     trainer._initialize_pim_stage_from_policy_checkpoint()
     assert scopes == ["policy_injection"]
     assert target.zeva_behavior_prefix_adapter.reset_calls == 1
+
+
+def test_pim_resume_does_not_require_policy_checkpoint(tmp_path):
+    trainer = Wan22Trainer.__new__(Wan22Trainer)
+    trainer.zeva_training = True
+    trainer.zeva_training_stage = "pim_adapter"
+    trainer.resume = str(tmp_path / "resume_state")
+    trainer.cfg = OmegaConf.create({
+        "model": {
+            "zeva": {
+                "policy_checkpoint": "/definitely/not/exist/stage2A.pt",
+            }
+        }
+    })
+    trainer._initialize_pim_stage_from_policy_checkpoint()
+
+
+def test_pim_resume_skips_policy_checkpoint_lookup(monkeypatch):
+    trainer = Wan22Trainer.__new__(Wan22Trainer)
+    trainer.zeva_training = True
+    trainer.zeva_training_stage = "pim_adapter"
+    trainer.resume = "/tmp/stage2b_resume"
+    called = {"policy_lookup": 0}
+
+    def fail_policy_lookup():
+        called["policy_lookup"] += 1
+        raise AssertionError(
+            "policy checkpoint lookup must not run during pim_adapter resume"
+        )
+
+    monkeypatch.setattr(trainer, "_get_zeva_policy_checkpoint", fail_policy_lookup)
+    trainer._initialize_pim_stage_from_policy_checkpoint()
+    assert called["policy_lookup"] == 0
