@@ -7,3 +7,4 @@ defaults:
 model:
   zeva:
     training_stage: pim_adapter
+    policy_checkpoint: null

@@ -57,13 +57,31 @@ class CausalPromptEncoder(nn.Module):
         self.global_project = nn.Sequential(nn.LayerNorm(cfg.global_dim), nn.Linear(cfg.global_dim, cfg.hidden_dim))
         self.phase_project = nn.Sequential(nn.LayerNorm(cfg.phase_dim), nn.Linear(cfg.phase_dim, cfg.hidden_dim))
         self.effect_project = nn.Sequential(nn.LayerNorm(cfg.effect_dim), nn.Linear(cfg.effect_dim, cfg.hidden_dim))
-        self.brief_position = nn.Parameter(torch.randn(1, cfg.brief_length, cfg.hidden_dim) * 0.02)
-        self.persistent_position = nn.Parameter(torch.randn(1, cfg.persistent_length, cfg.hidden_dim) * 0.02)
-        self.bos_brief = nn.Parameter(torch.randn(1, 1, cfg.hidden_dim) * 0.02)
-        self.bos_persistent = nn.Parameter(torch.randn(1, 1, cfg.hidden_dim) * 0.02)
+        self.brief_position = nn.Parameter(torch.empty(1, cfg.brief_length, cfg.hidden_dim))
+        self.persistent_position = nn.Parameter(torch.empty(1, cfg.persistent_length, cfg.hidden_dim))
+        self.bos_brief = nn.Parameter(torch.empty(1, 1, cfg.hidden_dim))
+        self.bos_persistent = nn.Parameter(torch.empty(1, 1, cfg.hidden_dim))
         self.brief_attention = nn.MultiheadAttention(cfg.hidden_dim, cfg.num_heads, batch_first=True)
         self.persistent_attention = nn.MultiheadAttention(cfg.hidden_dim, cfg.num_heads, batch_first=True)
         self.fusion = nn.Sequential(nn.LayerNorm(3 * cfg.hidden_dim), nn.Linear(3 * cfg.hidden_dim, cfg.hidden_dim), nn.SiLU(), nn.Linear(cfg.hidden_dim, cfg.hidden_dim))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm) and module.elementwise_affine:
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+        self.brief_attention._reset_parameters()
+        self.persistent_attention._reset_parameters()
+        nn.init.normal_(self.brief_position, std=0.02)
+        nn.init.normal_(self.persistent_position, std=0.02)
+        nn.init.normal_(self.bos_brief, std=0.02)
+        nn.init.normal_(self.bos_persistent, std=0.02)
 
     def forward(self, task_tokens: Tensor, current_phase: Tensor, bit_effects: Tensor, bit_mask: Tensor, pim_phases: Tensor, pim_effects: Tensor, pim_mask: Tensor) -> Tensor:
         cfg = self.config; batch = task_tokens.shape[0]

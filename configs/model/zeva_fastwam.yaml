@@ -5,6 +5,9 @@ defaults:
 zeva:
   enabled: true
   training_stage: policy_injection
+  # Used only to initialize pim_adapter from a Stage-2A checkpoint.
+  # Current-stage checkpoint resumption uses `resume` instead.
+  policy_checkpoint: null
   action_only: true
   freeze_fastwam: true
   freeze_cte_stage2: true

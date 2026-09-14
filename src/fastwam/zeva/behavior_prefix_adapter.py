@@ -189,12 +189,8 @@ class FastWAMPolicyInjectionPrior(nn.Module):
             self.bos_effect.expand(batch, cfg.effect_history_length, -1),
         )
         bit = self.effect_project(bit_input) + self.effect_position
-        padding = ~bit_mask
-        empty = ~bit_mask.any(dim=-1)
-        padding = padding.clone()
-        padding[empty, 0] = False
         effect_context, _ = self.effect_attention(
-            phase_query[:, None], bit, bit, key_padding_mask=padding, need_weights=False
+            phase_query[:, None], bit, bit, need_weights=False
         )
         effect_context = self.effect_norm(effect_context[:, 0])
         gate = self.effect_gate(torch.cat((phase_query, effect_context), dim=-1))

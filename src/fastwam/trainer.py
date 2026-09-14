@@ -93,8 +93,28 @@ class Wan22Trainer:
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         self._apply_dit_only_train_mode(self.model)
+        if self.zeva_training and self.zeva_training_stage == "pim_adapter":
+            self._initialize_pim_stage_from_policy_checkpoint()
         if self.zeva_training:
-            trainable_params = list(self.model.zeva_trainable_parameters())
+            if self.zeva_training_stage == "policy_injection":
+                trainable_params = list(self.model.zeva_trainable_parameters())
+                optimizer_params = trainable_params
+            elif self.zeva_training_stage == "pim_adapter":
+                adapter = self.model.zeva_behavior_prefix_adapter
+                prompt_params = list(self.model.zeva_prompt_encoder.parameters())
+                projector_params = list(adapter.prefix_project.parameters())
+                gate_params = [adapter.pim_gate]
+                trainable_params = prompt_params + projector_params + gate_params
+                optimizer_params = [
+                    {"params": prompt_params, "lr": self.learning_rate * 5.0},
+                    {"params": projector_params, "lr": self.learning_rate * 5.0},
+                    {"params": gate_params, "lr": self.learning_rate},
+                ]
+                logger.info(
+                    "PIM LR multipliers: prompt_encoder=5.0 prefix_project=5.0 pim_gate=1.0"
+                )
+            else:
+                raise RuntimeError(f"unsupported Zeva training stage: {self.zeva_training_stage}")
             if not trainable_params:
                 raise ValueError("zeva_enabled model did not expose trainable addon parameters")
             report = self.model.zeva_parameter_report()
@@ -113,13 +133,14 @@ class Wan22Trainer:
             proprio_encoder = getattr(self.model, "proprio_encoder", None)
             if proprio_encoder is not None:
                 trainable_params.extend(list(proprio_encoder.parameters()))
+            optimizer_params = trainable_params
         logger.info(
             "trainable parameter count=%d frozen parameter count=%d",
             sum(p.numel() for p in trainable_params),
             sum(p.numel() for p in self.model.parameters() if not p.requires_grad),
         )
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
+            optimizer_params,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
@@ -331,6 +352,48 @@ class Wan22Trainer:
         eta_m, eta_s = divmod(eta_rem, 60)
         return f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}", steps_per_sec
 
+    def _get_zeva_policy_checkpoint(self) -> Path | None:
+        if not self.zeva_training:
+            return None
+        zeva_cfg = self.cfg.model.get("zeva", {})
+        value = zeva_cfg.get("policy_checkpoint") if hasattr(zeva_cfg, "get") else None
+        if value in (None, "", "None", "null"):
+            return None
+        path = Path(str(value))
+        if not path.is_file():
+            raise FileNotFoundError(f"zeva.policy_checkpoint does not exist: {path}")
+        return path
+
+    def _initialize_pim_stage_from_policy_checkpoint(self) -> None:
+        policy_checkpoint = self._get_zeva_policy_checkpoint()
+        # A resume always restores the current PIM stage and must not be
+        # overwritten by the one-time Stage-2A initialization path.
+        if self.resume not in (None, "", "None", "null"):
+            return
+        if policy_checkpoint is None:
+            raise ValueError(
+                "pim_adapter training requires model.zeva.policy_checkpoint when resume is not set"
+            )
+        base_path = self.cfg.get("ckpt")
+        zeva_cfg = self.cfg.model.get("zeva", {})
+        cte_path = zeva_cfg.get("cte", {}).get("checkpoint") if hasattr(zeva_cfg, "get") else None
+        if base_path in (None, "", "None", "null"):
+            raise ValueError("pim_adapter initialization requires cfg.ckpt")
+        if cte_path in (None, "", "None", "null"):
+            raise ValueError("pim_adapter initialization requires model.zeva.cte.checkpoint")
+        model = self.model
+        payload = model.load_zeva_addon_checkpoint(
+            str(policy_checkpoint),
+            base_checkpoint_sha256=checkpoint_sha256(str(base_path)),
+            cte_checkpoint_sha256=checkpoint_sha256(str(cte_path)),
+            load_scope="policy_injection",
+        )
+        if payload.get("training_stage") != "policy_injection":
+            raise ValueError("model.zeva.policy_checkpoint must be a policy_injection checkpoint")
+        model.zeva_behavior_prefix_adapter.reset_pim_parameters()
+        model.configure_zeva_trainable_state()
+        logger.info("Initialized pim_adapter from policy checkpoint: %s", policy_checkpoint)
+
     def _resume_or_load_checkpoint(self):
         resume = self.resume
         if not resume:
@@ -354,32 +417,19 @@ class Wan22Trainer:
                 if base_path in (None, "", "None", "null") or cte_path in (None, "", "None", "null"):
                     raise ValueError("Zeva resume requires cfg.ckpt and zeva.cte.checkpoint")
                 model = self.accelerator.unwrap_model(self.model)
-                load_scope = (
-                    "policy_injection"
-                    if self.zeva_training_stage == "pim_adapter"
-                    else "all"
-                )
                 addon_payload = model.load_zeva_addon_checkpoint(
                     str(addon_path),
                     base_checkpoint_sha256=checkpoint_sha256(str(base_path)),
                     cte_checkpoint_sha256=checkpoint_sha256(str(cte_path)),
-                    load_scope=load_scope,
+                    load_scope="all",
                 )
-                if self.zeva_training_stage == "pim_adapter":
-                    if addon_payload.get("training_stage") != "policy_injection":
-                        raise ValueError(
-                            "pim_adapter training must initialize from a "
-                            "policy_injection checkpoint"
-                        )
-                    model.zeva_behavior_prefix_adapter.reset_pim_parameters()
-                    model.configure_zeva_trainable_state()
-                self.addon_weights_path = str(addon_path)
-                if self.zeva_training_stage == "pim_adapter":
-                    logger.info(
-                        "Initialized PIM adapter from Stage-2A addon weights: %s",
-                        addon_path,
+                checkpoint_stage = addon_payload.get("training_stage")
+                if checkpoint_stage != self.zeva_training_stage:
+                    raise ValueError(
+                        "Zeva resume stage mismatch: "
+                        f"checkpoint={checkpoint_stage}, current={self.zeva_training_stage}"
                     )
-                    return
+                self.addon_weights_path = str(addon_path)
                 payload = torch.load(resume_path / "optimizer_scheduler.pt", map_location="cpu")
                 self.optimizer.load_state_dict(payload["optimizer"])
                 self.scheduler.load_state_dict(payload["scheduler"])
@@ -403,25 +453,18 @@ class Wan22Trainer:
             if base_path in (None, "", "None", "null") or cte_path in (None, "", "None", "null"):
                 raise ValueError("Zeva resume requires cfg.ckpt and zeva.cte.checkpoint")
             model = self.accelerator.unwrap_model(self.model)
-            load_scope = (
-                "policy_injection"
-                if self.zeva_training_stage == "pim_adapter"
-                else "all"
-            )
             payload = model.load_zeva_addon_checkpoint(
                 str(resume_path),
                 base_checkpoint_sha256=checkpoint_sha256(str(base_path)),
                 cte_checkpoint_sha256=checkpoint_sha256(str(cte_path)),
-                load_scope=load_scope,
+                load_scope="all",
             )
-            if self.zeva_training_stage == "pim_adapter":
-                if payload.get("training_stage") != "policy_injection":
-                    raise ValueError(
-                        "pim_adapter training must initialize from a "
-                        "policy_injection checkpoint"
-                    )
-                model.zeva_behavior_prefix_adapter.reset_pim_parameters()
-                model.configure_zeva_trainable_state()
+            checkpoint_stage = payload.get("training_stage")
+            if checkpoint_stage != self.zeva_training_stage:
+                raise ValueError(
+                    "Zeva resume stage mismatch: "
+                    f"checkpoint={checkpoint_stage}, current={self.zeva_training_stage}"
+                )
             self.addon_weights_path = str(resume_path)
             logger.info("Loaded Zeva addon weights only: %s", resume)
             return

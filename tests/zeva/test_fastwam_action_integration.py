@@ -179,6 +179,44 @@ def _inference_model():
     return model.eval()
 
 
+def _native_inference_model():
+    """A true FastWAM action path with no Zeva addon attached."""
+    model = FastWAM.__new__(FastWAM)
+    nn.Module.__init__(model)
+    model.device = torch.device("cpu")
+    model.torch_dtype = torch.float32
+    model.action_expert = _InferenceActionExpert()
+    model.video_expert = _InferenceVideoExpert()
+    model.mot = _InferenceMoT()
+    model.infer_action_scheduler = _InferenceScheduler()
+    model.proprio_dim = None
+    model.proprio_encoder = None
+    model.zeva_enabled = False
+    model.zeva_prompt_encoder = None
+    model.zeva_behavior_prefix_adapter = None
+    model.zeva_injection_mode = "exact_zeva"
+    model.zeva_training_stage = "policy_injection"
+    model._encode_input_image_latents_tensor = MethodType(
+        lambda self, input_image, tiled=False: input_image.new_zeros((1, 4, 1, 1, 1)),
+        model,
+    )
+    model._build_mot_attention_mask = MethodType(
+        lambda self, video_seq_len, action_seq_len, **kwargs: torch.zeros(
+            video_seq_len + action_seq_len, video_seq_len + action_seq_len
+        ),
+        model,
+    )
+    return model.eval()
+
+
+def _copy_fastwam_test_weights(source, target):
+    target.action_expert.load_state_dict(source.action_expert.state_dict())
+    if any(True for _ in source.video_expert.parameters()):
+        target.video_expert.load_state_dict(source.video_expert.state_dict())
+    if any(True for _ in source.mot.parameters()):
+        target.mot.load_state_dict(source.mot.state_dict())
+
+
 def _infer_mode(model, mode, causal_prompt, *, seed=17):
     return model.infer_action(
         prompt=None,
@@ -415,6 +453,24 @@ def test_formal_inference_mode_equivalences_and_pim_effect():
     assert not torch.equal(pim_a, pim_b)
 
 
+def test_base_mode_matches_true_native_fastwam():
+    zeva_model = _inference_model()
+    native_model = _native_inference_model()
+    _copy_fastwam_test_weights(zeva_model, native_model)
+    kwargs = {
+        "prompt": None,
+        "context": torch.zeros(1, 2, 4),
+        "context_mask": torch.ones(1, 2, dtype=torch.bool),
+        "input_image": torch.zeros(1, 3, 16, 16),
+        "action_horizon": 32,
+        "num_inference_steps": 1,
+        "seed": 17,
+    }
+    native_action = native_model.infer_action(zeva_mode="base", **kwargs)["action"]
+    addon_base_action = zeva_model.infer_action(zeva_mode="base", **kwargs)["action"]
+    torch.testing.assert_close(native_action, addon_base_action, rtol=0.0, atol=0.0)
+
+
 def test_parameter_report_rejects_trainable_base():
     model = _model()
     model.zeva_behavior_prefix_adapter = ExactZevaPolicyInjectionAdapter(
@@ -599,3 +655,34 @@ def test_pim_stage_loads_only_policy_injection_checkpoint(tmp_path):
     torch.testing.assert_close(
         target.zeva_behavior_prefix_adapter.pim_gate, gate_before
     )
+
+
+def _clone_non_zeva_state(model):
+    return {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items()
+        if not name.startswith(("zeva_prompt_encoder.", "zeva_behavior_prefix_adapter."))
+    }
+
+
+def test_policy_injection_step_does_not_modify_fastwam():
+    model = _stage_model()
+    model.set_zeva_training_stage("policy_injection")
+    model.configure_zeva_trainable_state()
+    before = _clone_non_zeva_state(model)
+    optimizer = torch.optim.AdamW(model.zeva_trainable_parameters(), lr=1e-4)
+    adapter = model.zeva_behavior_prefix_adapter
+    task_tokens = torch.randn(2, adapter.config.global_dim)
+    phase = torch.randn(2, adapter.config.phase_dim)
+    bit_effects = torch.randn(2, adapter.config.effect_history_length, adapter.config.effect_dim)
+    bit_mask = torch.ones(2, adapter.config.effect_history_length, dtype=torch.bool)
+    prior_mean, prior_std = adapter.prior(task_tokens, phase, bit_effects, bit_mask)
+    residual = adapter.action_prior_residual(prior_mean, training=True)
+    loss = residual.float().square().mean() + prior_std.float().mean()
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    after = _clone_non_zeva_state(model)
+    assert before.keys() == after.keys()
+    for name in before:
+        torch.testing.assert_close(before[name], after[name], rtol=0.0, atol=0.0)
