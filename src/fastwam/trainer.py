@@ -1,6 +1,7 @@
 import logging
 import json
 import inspect
+import math
 import os
 import re
 from math import ceil
@@ -12,7 +13,7 @@ import torch
 from accelerate import Accelerator
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import ConstantLR, LambdaLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
@@ -155,6 +156,11 @@ class Wan22Trainer:
             total_train_steps=total_train_steps,
             warmup_steps=warmup_steps,
         )
+        if self.zeva_training and self.zeva_training_stage == "pim_adapter":
+            logger.info(
+                "PIM optimizer initial LRs: %s",
+                [float(group["lr"]) for group in self.optimizer.param_groups],
+            )
         self.global_step = 0
         self.epoch = 0
         self.batch_in_epoch = 0
@@ -314,11 +320,17 @@ class Wan22Trainer:
 
         remaining_steps = max(total_train_steps - warmup_steps, 1)
         if scheduler_type == "cosine":
-            main_scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=remaining_steps,
-                eta_min=self.learning_rate * 0.01,
-            )
+            def cosine_factor(step: int) -> float:
+                progress = min(
+                    max(float(step) / float(max(remaining_steps, 1)), 0.0),
+                    1.0,
+                )
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                # Apply one scalar to every group so their initial LR ratios
+                # remain unchanged throughout warmup and cosine decay.
+                return 0.01 + 0.99 * cosine
+
+            main_scheduler = LambdaLR(self.optimizer, lr_lambda=cosine_factor)
         elif scheduler_type == "constant":
             main_scheduler = ConstantLR(self.optimizer, factor=1.0, total_iters=remaining_steps)
         else:
