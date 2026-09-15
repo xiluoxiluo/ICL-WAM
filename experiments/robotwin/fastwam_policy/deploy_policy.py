@@ -219,7 +219,7 @@ class WorldActionRobotWinPolicy:
         self._last_task_context_retrieval = None
         self.task_context_mode = str(task_context_cfg.get("mode", "static"))
         self.task_context_top_k = int(task_context_cfg.get("top_k", 5))
-        if requested_zeva_mode != "base" and self.task_context_mode == "bank":
+        if requested_zeva_mode not in {"base", "pim_shadow"} and self.task_context_mode == "bank":
             if self.model.zeva_prompt_encoder is None:
                 raise ValueError("task-context bank requires an enabled Zeva prompt encoder")
             bank_path = task_context_cfg.get("bank_path")
@@ -242,7 +242,7 @@ class WorldActionRobotWinPolicy:
                     "zeva.task_context.top_k must be within the task-context bank size; "
                     f"got {self.task_context_top_k}, bank_size={len(self.task_context_bank)}"
                 )
-        elif requested_zeva_mode != "base" and self.task_context_mode == "static":
+        elif requested_zeva_mode not in {"base", "pim_shadow"} and self.task_context_mode == "static":
             for name in ("bank_path", "retrieval_checkpoint"):
                 if _is_none_like(task_context_cfg.get(name)):
                     raise ValueError(f"static task context requires zeva.task_context.{name}")
@@ -267,7 +267,7 @@ class WorldActionRobotWinPolicy:
             self.model.zeva_task_context_identity = task_context_identity(
                 "static", bank_path, head_path, self.task_context_top_k,
             )
-        elif requested_zeva_mode != "base" and self.task_context_mode != "pooling":
+        elif requested_zeva_mode not in {"base", "pim_shadow"} and self.task_context_mode != "pooling":
             raise ValueError("zeva.task_context.mode must be pooling, bank, or static")
 
         self.zeva_mode = requested_zeva_mode
@@ -290,8 +290,10 @@ class WorldActionRobotWinPolicy:
                 raise ValueError("Zeva evaluation requires model config zeva.enabled=true")
             if not cte_checkpoint:
                 raise ValueError("cte_checkpoint is required for Zeva evaluation")
-            if not addon_checkpoint:
-                raise ValueError("addon_checkpoint is required for Zeva evaluation")
+            if requested_zeva_mode in {"zeva_stage2", "pim_on"} and not addon_checkpoint:
+                raise ValueError(
+                    "addon_checkpoint is required for zeva_stage2 and pim_on evaluation"
+                )
             cte_payload = torch.load(str(cte_checkpoint), map_location="cpu", weights_only=False)
             cte_values = dict(cte_payload.get("config", cte_payload.get("model_config", {})))
             cte_values = dict(cte_values.get("cte", cte_values))
@@ -387,7 +389,7 @@ class WorldActionRobotWinPolicy:
                 raise ValueError(
                     f"Unsupported CTE input type {cte_input_type!r}; expected rgb_frame or wan_vae_latent"
                 )
-            if addon_checkpoint:
+            if addon_checkpoint and requested_zeva_mode in {"zeva_stage2", "pim_on"}:
                 self.model.load_zeva_addon_checkpoint(
                     str(addon_checkpoint),
                     base_checkpoint_sha256=checkpoint_sha256(checkpoint_path),
@@ -573,7 +575,13 @@ class WorldActionRobotWinPolicy:
             with torch.no_grad():
                 context, _context_mask = self.model.encode_prompt(prompt)
                 task_dim = int(self.model.zeva_prompt_encoder.config.global_dim)
-                if self._static_task_context_session is not None:
+                if self.zeva_mode == "pim_shadow":
+                    # Shadow mode exercises CTE/BIT/PIM retrieval but must not
+                    # depend on task-context artifacts or an addon checkpoint.
+                    task_tokens = torch.zeros(
+                        (1, task_dim), device=self.model.device, dtype=self.model.torch_dtype
+                    )
+                elif self._static_task_context_session is not None:
                     task_context_result = self._static_task_context_session.resolve(
                         self.model, image_tensor, context, _context_mask, instruction,
                     )
@@ -601,7 +609,14 @@ class WorldActionRobotWinPolicy:
                 encoded = self._cte_history.forward()
                 phase = encoded["phase"][:, -1]
                 memory = self.lifecycle.memory_inputs(phase, task_tokens)
-                if self.zeva_mode == "zeva_stage2":
+                if self.zeva_mode == "pim_shadow":
+                    causal_prompt = torch.zeros(
+                        (1, int(self.model.zeva_prompt_encoder.config.hidden_dim)),
+                        device=self.model.device,
+                        dtype=self.model.torch_dtype,
+                    )
+                    pim_mask = memory["pim_mask"]
+                elif self.zeva_mode == "zeva_stage2":
                     causal_prompt = torch.zeros(
                         (1, int(self.model.zeva_prompt_encoder.config.hidden_dim)),
                         device=self.model.device,
@@ -612,7 +627,10 @@ class WorldActionRobotWinPolicy:
                     causal_prompt = self.model.zeva_prompt_encoder(**memory)
                     pim_mask = memory["pim_mask"]
                 zeva_action_residual = None
-                if getattr(self.model, "zeva_injection_mode", "memory_residual") == "exact_zeva":
+                if (
+                    self.zeva_mode != "pim_shadow"
+                    and getattr(self.model, "zeva_injection_mode", "memory_residual") == "exact_zeva"
+                ):
                     adapter = self.model.zeva_behavior_prefix_adapter
                     prior_mean, _prior_std = adapter.prior(
                         task_tokens,
@@ -632,6 +650,8 @@ class WorldActionRobotWinPolicy:
                 "zeva_action_residual": zeva_action_residual,
                 "zeva_task_tokens": task_tokens,
                 "zeva_mode": self.zeva_mode,
+                "enable_prefix_injection": self.zeva_mode in {"zeva_stage2", "pim_on"},
+                "enable_action_prior": self.zeva_mode in {"zeva_stage2", "pim_on"},
                 "input_image": image_tensor,
                 "action_horizon": self.action_horizon,
                 "proprio": proprio,

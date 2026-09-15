@@ -438,7 +438,9 @@ def test_formal_inference_mode_equivalences_and_pim_effect():
 
     stage2 = _infer_mode(model, "zeva_stage2", prompt_a)
     shadow = _infer_mode(model, "pim_shadow", prompt_b)
-    torch.testing.assert_close(stage2, shadow, rtol=0.0, atol=0.0)
+    # Shadow mode runs the causal memory lifecycle only.  It must not depend
+    # on the addon or change the vanilla FastWAM action output.
+    torch.testing.assert_close(native, shadow, rtol=0.0, atol=0.0)
     assert not torch.equal(native, stage2)
 
     with torch.no_grad():

@@ -931,6 +931,8 @@ class FastWAM(torch.nn.Module):
         pim_mask: torch.Tensor,
         zeva_action_residual: Optional[torch.Tensor] = None,
         gate_override: Optional[float] = None,
+        enable_prefix_injection: bool = True,
+        enable_action_prior: bool = True,
         debug: Optional[dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if self.zeva_behavior_prefix_adapter is None:
@@ -950,11 +952,16 @@ class FastWAM(torch.nn.Module):
         )
         injection_mode = getattr(self, "zeva_injection_mode", "memory_residual")
         if injection_mode == "exact_zeva":
-            if zeva_action_residual is None:
+            if not enable_action_prior:
+                gated_residual = torch.zeros_like(action_tokens)
+            elif zeva_action_residual is None:
                 raise ValueError("exact Zeva injection requires an action-prior residual")
-            gated_residual = zeva_action_residual.to(
-                device=action_tokens.device, dtype=action_tokens.dtype
-            )
+            else:
+                gated_residual = zeva_action_residual.to(
+                    device=action_tokens.device, dtype=action_tokens.dtype
+                )
+        elif not enable_prefix_injection:
+            gated_residual = torch.zeros_like(action_tokens)
         elif gate_override is None and self.zeva_behavior_prefix_adapter.training:
             memory_tokens = causal_prompt[:, None]
             memory_mask = pim_mask.any(dim=-1, keepdim=True)
@@ -1441,12 +1448,21 @@ class FastWAM(torch.nn.Module):
         zeva_action_residual: Optional[torch.Tensor] = None,
         zeva_task_tokens: Optional[torch.Tensor] = None,
         zeva_mode: str = "base",
+        enable_prefix_injection: Optional[bool] = None,
+        enable_action_prior: Optional[bool] = None,
     ) -> dict[str, Any]:
         self.eval()
         if zeva_mode not in {"base", "zeva_stage2", "pim_shadow", "pim_on"}:
             raise ValueError(
                 "zeva_mode must be one of base, zeva_stage2, pim_shadow, pim_on"
             )
+        if enable_prefix_injection is None:
+            enable_prefix_injection = zeva_mode in {"zeva_stage2", "pim_on"}
+        if enable_action_prior is None:
+            enable_action_prior = zeva_mode in {"zeva_stage2", "pim_on"}
+        if zeva_mode == "base":
+            enable_prefix_injection = False
+            enable_action_prior = False
         if zeva_mode != "base":
             if causal_prompt is None or pim_mask is None:
                 raise ValueError("Zeva modes require causal_prompt and pim_mask")
@@ -1533,6 +1549,7 @@ class FastWAM(torch.nn.Module):
         if (
             zeva_mode != "base"
             and getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
+            and enable_prefix_injection
         ):
             context, context_mask = self._prepend_exact_zeva_behavior_slot(
                 context=context,
@@ -1642,6 +1659,8 @@ class FastWAM(torch.nn.Module):
                     causal_prompt=causal_prompt,
                     pim_mask=pim_mask,
                     zeva_action_residual=zeva_action_residual,
+                    enable_prefix_injection=enable_prefix_injection,
+                    enable_action_prior=enable_action_prior,
                     gate_override=(
                         0.0
                         if (

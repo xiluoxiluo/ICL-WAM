@@ -27,14 +27,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.mode != "base" and not args.cte_checkpoint:
         parser.error("--cte-checkpoint is required for non-base Zeva modes")
-    if args.mode != "base" and not args.addon_checkpoint:
-        parser.error("--addon-checkpoint is required for non-base Zeva modes")
+    if args.mode in {"zeva_stage2", "pim_on"} and not args.addon_checkpoint:
+        parser.error("--addon-checkpoint is required for zeva_stage2 and pim_on")
     root = Path(__file__).resolve().parents[1]
     cmd = [sys.executable, str(root / "experiments/robotwin/eval_robotwin_single.py"),
            "--config-name", "sim_robotwin_zeva.yaml", f"ckpt={args.ckpt}",
            f"EVALUATION.task_name={args.task}", f"EVALUATION.fixed_seed={args.seed}",
            f"EVALUATION.max_attempts={args.max_attempts}", f"EVALUATION.zeva_mode={args.mode}",
-           f"EVALUATION.cte_checkpoint={args.cte_checkpoint}", f"EVALUATION.addon_checkpoint={args.addon_checkpoint}"]
+           f"EVALUATION.cte_checkpoint={args.cte_checkpoint}"]
+    if args.mode in {"zeva_stage2", "pim_on"}:
+        cmd.append(f"EVALUATION.addon_checkpoint={args.addon_checkpoint}")
     if args.task_context_bank:
         cmd.extend([
             "model.zeva.task_context.mode=bank",
