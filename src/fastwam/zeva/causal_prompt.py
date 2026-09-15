@@ -35,6 +35,11 @@ class CausalPromptConfig:
     persistent_length: int = 4
     hidden_dim: int = 256
     num_heads: int = 4
+    # Stage-2 regularization: support=BIT slots, context=PIM slots.
+    # Applied only while this encoder is in training mode; inference keeps
+    # the complete retrieved memory unchanged.
+    pim_context_dropout: float = 0.0
+    pim_support_dropout: float = 0.0
 
     def __post_init__(self) -> None:
         if min(
@@ -49,6 +54,8 @@ class CausalPromptConfig:
             raise ValueError("prompt dimensions, lengths, and heads must be positive")
         if self.hidden_dim % self.num_heads:
             raise ValueError("prompt hidden_dim must be divisible by num_heads")
+        if not 0 <= self.pim_context_dropout < 1 or not 0 <= self.pim_support_dropout < 1:
+            raise ValueError("PIM context/support dropout must be in [0,1)")
 
 
 class CausalPromptEncoder(nn.Module):
@@ -103,11 +110,19 @@ class CausalPromptEncoder(nn.Module):
         pim_effects = pim_effects.to(dtype=dtype)
         query = self.global_project(task_tokens) + self.phase_project(current_phase)
         bit = self.effect_project(bit_effects) + self.brief_position
-        bit_mask = bit_mask.bool(); bit = torch.where(bit_mask.unsqueeze(-1), bit, self.bos_brief.expand(batch, -1, -1))
+        bit_mask = bit_mask.bool()
+        if self.training and cfg.pim_support_dropout:
+            keep = torch.rand(bit_mask.shape, device=device) >= cfg.pim_support_dropout
+            bit_mask = bit_mask & keep
+        bit = torch.where(bit_mask.unsqueeze(-1), bit, self.bos_brief.expand(batch, -1, -1))
         bit_padding = ~bit_mask; empty = ~bit_mask.any(dim=-1); bit_padding = bit_padding.clone(); bit_padding[empty, 0] = False
         bit_context, _ = self.brief_attention(query[:, None], bit, bit, key_padding_mask=bit_padding, need_weights=False)
         pim = self.phase_project(pim_phases) + self.effect_project(pim_effects) + self.persistent_position
-        pim_mask = pim_mask.bool(); pim = torch.where(pim_mask.unsqueeze(-1), pim, self.bos_persistent.expand(batch, -1, -1))
+        pim_mask = pim_mask.bool()
+        if self.training and cfg.pim_context_dropout:
+            keep = torch.rand(pim_mask.shape, device=device) >= cfg.pim_context_dropout
+            pim_mask = pim_mask & keep
+        pim = torch.where(pim_mask.unsqueeze(-1), pim, self.bos_persistent.expand(batch, -1, -1))
         pim_padding = ~pim_mask; empty = ~pim_mask.any(dim=-1); pim_padding = pim_padding.clone(); pim_padding[empty, 0] = False
         pim_context, _ = self.persistent_attention(query[:, None], pim, pim, key_padding_mask=pim_padding, need_weights=False)
         causal_prompt = self.fusion(

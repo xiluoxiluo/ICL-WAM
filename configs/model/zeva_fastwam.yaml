@@ -73,6 +73,8 @@ zeva:
     persistent_length: 4
     hidden_dim: 256
     num_heads: 4
+    pim_context_dropout: 0.2
+    pim_support_dropout: 0.2
   adapter:
     # exact_zeva keeps Causal Prompt prefix injection and action-prior
     # injection as two separate branches, matching Zeva's policy path.
