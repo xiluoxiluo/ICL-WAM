@@ -1,340 +1,384 @@
-# ICLWAM：FastWAM + Zeva 因果记忆
+# ICLWAM：把 Zeva 因果记忆接到 FastWAM
 
-本目录是在 FastWAM RoboTwin action path 上增加 Zeva causal memory 的实验实现。原有 FastWAM、Joint、IDM 和 Optional-IDM 模块仍按原逻辑工作；只有选择 `model=zeva_fastwam`（或评测配置 `sim_robotwin_zeva.yaml`）并设置 `zeva.enabled=true` 时，才会挂载 CTE、BIT/PIM、CausalPromptEncoder 和 Zeva policy-injection addon。默认 addon 模式为 `exact_zeva`：Causal Prompt prefix 使用独立 behavior prefix slot，Gaussian action prior 走另一条独立注入支路。
+ICLWAM 在 FastWAM 的 RoboTwin action path 上加入 Zeva 的因果记忆模块。FastWAM 仍然负责根据图像、语言和本体状态生成动作；Zeva 负责从历史交互中提取当前 phase、短期 BIT 和跨尝试保留的 PIM，再把这些信息转换成 FastWAM action hidden space 中的条件。
 
-FastWAM 原始的 LIBERO/RoboTwin 安装、数据下载和基线说明见 [`docs/README_newzh.md`](docs/README_newzh.md)；本文只补充 ICLWAM/Zeva 新增部分以及可复现实验的完整串联方式。
+一次推理可以简单理解为：
 
-基于示范行为的静态 task-context 链路见 [建库、检索头训练与部署说明](docs/static_task_context.md)。选择 `task=robotwin_zeva_fastwam_static_3cam_384` 可启用 FastWAM 初始图像与指令 readout、CTE 行为原型和训练后的检索头；原配置继续使用文本 pooling。该路径需要重新建库并训练检索头和 addon，不能直接复用 pooling addon。
+~~~text
+历史图像和动作
+        ↓
+       CTE
+        ↓
+   BIT / PIM 检索
+        ↓
+  Causal Prompt + Gaussian Action Prior
+        ↓
+   冻结的 FastWAM action path
+        ↓
+      RoboTwin 动作
+~~~
 
-下面的命令都假设在 `ICLWAM/` 根目录执行：
+FastWAM 主干不重新训练。CTE 先单独训练，Stage 2 只训练 Zeva addon，部署时按 episode 在线更新 BIT/PIM。
 
-```bash
+本文只说明已有 FastWAM RoboTwin checkpoint 之后的训练和测试流程。FastWAM 本身的安装、预训练和数据下载请参考原项目文档。
+
+## 1. 准备环境和数据
+
+下面假设在仓库根目录 ICLWAM/ 执行命令：
+
+~~~bash
 cd /path/to/ICL-WAM/ICLWAM
 export PYTHONPATH="$PWD/src"
 export DIFFSYNTH_MODEL_BASE_PATH="$PWD/checkpoints"
-```
+~~~
 
-## 1. 实验流程概览
+至少需要：
 
-Zeva 实验不是用一个新 checkpoint 替换 FastWAM，而是四个阶段串联：
+~~~text
+data/robotwin2.0/robotwin2.0/       # RoboTwin LeRobot 数据
+data/robotwin2.0/dataset_stats.json # 与该数据集对应的统计量
+third_party/RoboTwin/               # RoboTwin 代码和 assets
+/absolute/path/to/fastwam_base.pt   # 已有的 FastWAM RoboTwin checkpoint
+~~~
 
-1. 准备 RoboTwin 数据、`dataset_stats.json`、Wan/ActionDiT 预训练文件和 T5 文本 embedding cache。
-2. （可选）将数据导出为带 episode 顺序的 32-action/8-transition 视图。
-3. Stage 1 只训练 Causal Transition Encoder（CTE），得到 `cte.pt`。
-4. 用冻结的 CTE 生成 phase/effect cache，再进行 Stage 2；Stage 2 只训练 Zeva addon，FastWAM 和 CTE 都冻结。
-5. 评测时将 FastWAM 基座、CTE 和 Stage 2 addon 组合起来，并用固定 seed 比较 `base`、`pim_shadow` 和 `pim_on`。
+当前 Zeva RoboTwin V1 的数据合同固定为：
 
-`pim_shadow` 会运行完整的因果生命周期但不加载 addon，用于检查 memory/retrieval 是否改变；`pim_on` 才会把训练得到的 behavior prefix slot 和 action prior 注入 FastWAM action path。
+- 三路相机：cam_high、cam_left_wrist、cam_right_wrist；
+- action/state 维度：14；
+- 一个 action chunk：32 个 action；
+- 每 4 个 action 组成一个 CTE transition；
+- 每 4 个 transition 形成一个 completed effect；
+- 最终图像尺寸：[3, 384, 320]；
+- action 和 state 使用同一个 dataset_stats.json。
 
-## 2. 环境和数据
+Stage 1 和评测还需要 Wan2.2、tokenizer、VAE 以及 ActionDiT 初始化文件。若 ActionDiT 文件不存在，可以先生成：
 
-### 2.1 Python/CUDA 环境
-
-生产训练和 RoboTwin 仿真建议使用 Linux、CUDA GPU、Python 3.10。项目依赖（包括与 CUDA 对应的 PyTorch、DeepSpeed、torchcodec 和 torchvision）写在 `pyproject.toml` 中：
-
-```bash
-conda create -n iclwam python=3.10 -y
-conda activate iclwam
-python -m pip install -U pip
-python -m pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 \
-  --extra-index-url https://download.pytorch.org/whl/cu128
-python -m pip install -e .
-python - <<'PY'
-import torch
-print("torch:", torch.__version__, "cuda:", torch.cuda.is_available())
-PY
-```
-
-Stage 1 可以用 `device=cpu` 做小规模数据/逻辑调试；Stage 2 的冻结 Wan2.2 action path 明确要求 CUDA。CPU 只能作为 smoke test，不能作为完整训练或 RoboTwin rollout 环境。
-
-### 2.2 Wan 和 ActionDiT 文件
-
-Wan2.2-TI2V-5B、Wan2.1 tokenizer、T5 和 VAE 文件会由 FastWAM loader 下载或从 `DIFFSYNTH_MODEL_BASE_PATH` 读取。Stage 2/评测构造模型时还会读取 ActionDiT 初始化权重，默认路径是：
-
-```text
-checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
-```
-
-如果该文件尚未生成，先执行：
-
-```bash
+~~~bash
 python scripts/preprocess_action_dit_backbone.py \
   --model-config configs/model/fastwam.yaml \
   --output checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt \
   --device cuda --dtype bfloat16
-```
+~~~
 
-也可以通过 Hydra 覆盖 `model.action_dit_pretrained_path=/absolute/path/to/file.pt`。不要在没有完整 base checkpoint 的情况下使用 `model.skip_dit_load_from_pretrain=true`，否则模型初始化不会得到所需的 ActionDiT 参数。
+首次使用数据集时，先生成文本 embedding cache：
 
-### 2.3 RoboTwin 数据和仿真 assets
-
-当前 Zeva 配置固定使用三路相机和 14 维 RoboTwin action/state。默认路径为：
-
-```text
-data/robotwin2.0/robotwin2.0/       # LeRobot 数据集，包含 data/meta/videos
-data/robotwin2.0/dataset_stats.json # 所有阶段共用的 z-score 统计
-third_party/RoboTwin/               # vendored RoboTwin 代码
-```
-
-可以使用 FastWAM 发布的 RoboTwin 数据，或替换 `configs/data/robotwin.yaml` 中的 `dataset_dirs`。自定义数据必须提供 `meta/tasks.jsonl`、对应的 episode/video 文件和同一数据集计算出的 `dataset_stats.json`；Zeva 的三个构建/训练入口会拒绝不存在的 stats 文件。
-
-RoboTwin rollout 还需要按其官方教程安装 SAPIEN、Curobo、pytorch3d 并下载 assets。vendored 安装脚本位于 `third_party/RoboTwin/script/_install.sh` 和 `third_party/RoboTwin/script/_download_assets.sh`。评测入口会自动创建 `third_party/RoboTwin/policy/fastwam_policy` 软链接；若直接调用官方 `script/eval_policy.py`，需要手动建立该链接。
-
-### 2.4 T5 文本 embedding cache
-
-`configs/data/robotwin.yaml` 的 `text_embedding_cache_dir` 默认是 `data/text_embeds_cache/robotwin`，`context_len=128`。训练数据默认启用 cache；每一个任务 instruction 都必须有对应的 `.t5_len128.wan22ti2v5b.pt` 文件。因此首次运行 Zeva 前先执行：
-
-```bash
+~~~bash
 python scripts/precompute_text_embeds.py \
   --config-name train \
   task=robotwin_zeva_fastwam_3cam_384
-```
+~~~
 
-多卡预计算示例：
+如果 stats 或文本 cache 不在默认位置，需要在训练和测试命令中用 Hydra 覆盖对应路径。
 
-```bash
-torchrun --standalone --nproc_per_node=8 \
-  scripts/precompute_text_embeds.py \
-  --config-name train task=robotwin_zeva_fastwam_3cam_384
-```
+## 2. 训练流程
 
-若改了 cache 目录，必须同时覆盖 `data.train.text_embedding_cache_dir` 和 `data.val.text_embedding_cache_dir`。只改目录而不重新生成 embedding，数据集会在第一个缺失 instruction 处报错。
+已有 FastWAM checkpoint 后，按下面顺序执行：
 
-## 3. Zeva 配置和关键参数
+~~~text
+FastWAM checkpoint
+        ↓
+Stage 1：训练 CTE
+        ↓
+构建 phase/effect cache
+        ↓
+Stage 2A：训练 policy injection addon
+        ↓（可选）
+Stage 2B：加载 Stage 2A，只训练 PIM adapter
+        ↓
+RoboTwin 固定 seed 测试
+~~~
 
-主配置文件是 [`configs/model/zeva_fastwam.yaml`](configs/model/zeva_fastwam.yaml)，任务配置是 [`configs/task/robotwin_zeva_fastwam_3cam_384.yaml`](configs/task/robotwin_zeva_fastwam_3cam_384.yaml)，仿真配置是 [`configs/sim_robotwin_zeva.yaml`](configs/sim_robotwin_zeva.yaml)。所有路径均可用 Hydra 命令行覆盖。
+最简路径先使用 task_context.mode=pooling，只验证 Zeva 到 FastWAM 的训练和部署链路；正式实验再构建 static task-context bank。
 
-| 配置 | 当前 V1 值 | 作用 |
-| --- | ---: | --- |
-| `action_dim` | 14 | RoboTwin action/state 维度 |
-| `num_frames` | 33 | 原始窗口的 RGB/action 对齐长度 |
-| `action_video_freq_ratio` | 4 | 32 个 action 对应 9 个 RGB 帧 |
-| `action_horizon` | 32 | 一个 FastWAM action chunk |
-| `action_group_size` / CTE `transition_steps` | 4 | 每个 transition 执行 4 个 action |
-| transition 数 | 8 | 一个窗口内的 `32 = 8 x 4` |
-| camera 顺序 | `cam_high`, `cam_left_wrist`, `cam_right_wrist` | 顺序不能改变 |
-| CTE 输入 | `[B,9,C,H,W]` | 生产默认由冻结 Wan2.2 VAE38 将 RGB mosaic 编码为 `C=48`；`C=3` 仅用于独立 debug 合同 |
-| 最终图像 | `[3, 384, 320]` mosaic | 与 FastWAM RoboTwin processor 一致，RGB 归一化到 `[-1, 1]` |
-| action normalization | `fastwam_processor_output` | 使用同一份 `dataset_stats.json` 的 z-score |
-| CTE `phase_dim/effect_dim` | 128 / 128 | 必须与 prompt encoder 相同 |
-| `memory.bit_size` | 4 | BIT brief 长度，必须等于 `prompt.brief_length` |
-| `memory.pim_top_k` | 4 | PIM 检索条数，必须等于 `prompt.persistent_length` |
-| `pim_max_entries` | 256 | 每个 episode memory bank 容量 |
-| `merge_threshold` | 0.85 | V1 provisional phase/effect 合并阈值，正式实验应在 held-out 集上重新校准 |
-| `beta_phase/beta_effect` | 0.5 / 0.5 | PIM 相似度两部分权重 |
-| prompt hidden / adapter hidden | 256 / 1024 | CausalPromptEncoder 和 prefix adapter 宽度 |
-| `adapter.gate_init` | 0 | addon 初始为精确 no-op |
-| `adapter.output` / gate formula | Xavier / `tanh(gate)` | 输出投影非零；训练与评测使用同一 gate 公式 |
-| action scheduler shift | 1.0 / 1.0 | `train_shift` / `infer_shift`，与 FastWAM action path 对齐 |
-| Stage 2 batch/lr/steps | 16 / `2e-4` / 10000 | 任务配置默认值，可按显存覆盖 |
+## 3. Stage 1：训练 CTE
 
-因果顺序必须保持：正式 CTE 使用 Zeva 的 full-history `[B,T,C,H,W]` 接口，RGB 到 Wan latent 的转换只在冻结的外部 adapter 中执行，action stream 采用 right-shift；每 4 个 action 形成一个 transition，每 4 个 transition（16 个 action）才产生一个 completed effect。BIT 在每次 attempt 开始和结束时清空，PIM 在 completed effect 形成时立即写入，以 effect-window 起点的 phase 配对 observed `effect_post`，在同一 episode 的 retry 间保留并做 running mean/count 合并；只有已完成的 effect 才能被后续 query 检索。
+CTE 学习历史视觉、动作与 phase/effect 的因果表示。它不需要 FastWAM checkpoint，但需要 RoboTwin 数据、统计量和 Wan VAE。
 
-评测时 `EVALUATION.skip_get_obs_within_replan=false` 是强制要求，否则无法为每个已执行 action 配对 after-frame。Zeva 模式下 `replan_steps` 必须是 4 的倍数，默认 24；`action_horizon` 必须是 32。
-
-## 4. Checkpoint、cache 和路径约定
-
-| 名称 | 示例路径 | 谁生成 | 用在哪里 |
-| --- | --- | --- | --- |
-| FastWAM base checkpoint | `runs/robotwin_uncond_3cam_384_1e-4/<run>/checkpoints/weights/step_XXXXXX.pt` 或 release `.pt` | 原 FastWAM 训练 | Stage 2 的 `ckpt=`、所有评测的 `--ckpt` |
-| CTE checkpoint | `runs/zeva_cte/cte.pt` | Stage 1 | cache 构建、Stage 2、`pim_shadow/pim_on` 评测 |
-| phase/effect cache | `data/robotwin2.0/zeva_cache/v4/` | `build_zeva_robotwin_cache.py` | Stage 2 离线 memory prefix |
-| Stage 2 addon | `runs/zeva_stage2/checkpoints/weights/step_XXXXXX_addon.pt` | Stage 2 | 仅 `pim_on` 评测 |
-| dataset stats | `data/robotwin2.0/dataset_stats.json` | 数据预处理/已有发布文件 | Stage 1、cache、Stage 2、评测 |
-| ActionDiT backbone | `checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt` | 预处理脚本 | 构造 FastWAM 模型 |
-
-base checkpoint 必须是兼容 14 维 RoboTwin FastWAM 的 checkpoint，通常包含 `mot`（以及可选的 `proprio_encoder`）键。CTE 和 addon 都不是完整 FastWAM，不能单独传给 `ckpt`。Stage 2 addon 只保存 `CausalPromptEncoder`、`BehaviorPrefixAdapter` 和 gate；加载时会校验 base/CTE SHA256，防止把 addon 错配到另一套模型。
-
-cache 目录至少包含：
-
-```text
-zeva_cache/v4/
-├── manifest.json
-├── episode_index.json
-└── phase_effect-*.safetensors
-```
-
-`manifest.json` 记录 CTE hash、stats hash、数据路径、相机顺序、action normalization、维度和 schema。默认 `model.zeva.cache.strict_manifest=true`，换数据、stats、CTE 或 action 对齐参数后必须重建 cache，不能复用旧目录。
-
-## 5. 完整训练命令
-
-### 5.0 先准备 FastWAM base（已有 release/base 可跳过）
-
-Zeva 不重新训练或覆盖 FastWAM 主干。若没有兼容 RoboTwin 的 base checkpoint，先按原 FastWAM 入口训练；该任务使用同一份三相机、14 维数据配置：
-
-```bash
-RUN_ID=fastwam_base bash scripts/train_zero1.sh 8 \
-  task=robotwin_uncond_3cam_384_1e-4
-```
-
-实际多卡数可将 `8` 改为可用 GPU 数。上述命令的输出目录为 `runs/robotwin_uncond_3cam_384_1e-4/fastwam_base/`；训练完成后使用其中的 `checkpoints/weights/step_XXXXXX.pt`（或 FastWAM 发布的 `robotwin_uncond_3cam_384.pt`）作为后续 Stage 2 的 `ckpt=`。base 的 action horizon、相机顺序和 `dataset_stats.json` 必须与 Zeva 配置一致。
-
-### 5.1 （可选）导出 transition view
-
-这一步用于检查并物化 episode-aware 的 32-action/8-transition 样本，不需要 FastWAM 或 CTE checkpoint；输出到 `model.zeva.transition_path`，默认 `data/robotwin2.0/zeva_transitions/`。Stage 1/cache builder 会直接读取同一底层数据，因此该步骤不是硬性前置条件。
-
-```bash
-python scripts/build_zeva_robotwin_transitions.py \
-  --config-name train \
-  task=robotwin_zeva_fastwam_3cam_384 \
-  model.zeva.transition_path=./data/robotwin2.0/zeva_transitions
-```
-
-### 5.2 Stage 1：训练 CTE
-
-Stage 1 不需要传 FastWAM base checkpoint，但需要数据、`dataset_stats.json` 和 T5 cache。CTE 训练输出 `cte.pt`、解析后的 `config.yaml`、`dataset_manifest.json` 和 `metrics.jsonl`。
-训练脚本先建立 episode 内不重叠的 32-action 索引，再按 task 组织 minibatch（默认每 task 4 个样本）；`metrics.jsonl` 会记录实际 batch、同 task positive 数、窗口起点和各项 CTE loss。数据不足以形成平衡 batch 时会保留剩余样本并在日志中体现实际退化情况。
-
-```bash
+~~~bash
 python scripts/train_zeva_cte.py \
   --config-name train \
   task=robotwin_zeva_fastwam_3cam_384 \
   device=cuda \
   output_dir=./runs/zeva_cte
-```
+~~~
 
-断点续训（会恢复 CTE optimizer/scheduler 状态）：
+训练完成后主要文件是：
 
-```bash
+~~~text
+runs/zeva_cte/cte.pt
+runs/zeva_cte/config.yaml
+runs/zeva_cte/dataset_manifest.json
+runs/zeva_cte/metrics.jsonl
+~~~
+
+断点续训：
+
+~~~bash
 python scripts/train_zeva_cte.py \
-  --config-name train task=robotwin_zeva_fastwam_3cam_384 \
-  device=cuda output_dir=./runs/zeva_cte \
+  --config-name train \
+  task=robotwin_zeva_fastwam_3cam_384 \
+  device=cuda \
+  output_dir=./runs/zeva_cte \
   resume=./runs/zeva_cte/cte.pt
-```
+~~~
 
-### 5.3 构建 CTE phase/effect cache
+cte.pt 必须和后面的数据尺寸、相机顺序、action 维度保持一致。不要把 CTE checkpoint 当作 FastWAM 的 ckpt 使用。
 
-该脚本加载冻结的 Stage 1 CTE，按 episode 顺序构建连续 full-history 前缀；phase query 与 completed effect 使用独立记录，并写出 v4 safetensors shards 和严格 manifest。query 保留部署可能使用的 raw-step 位置，不把 32-action 监督窗口结束后的未来 phase 当作当前输入。
+## 4. 构建 phase/effect cache
 
-```bash
+Stage 2 使用离线 cache 对齐训练窗口中的 CTE phase、BIT 和 PIM 输入。cache 由冻结的 CTE 根据完整 episode 历史生成：
+
+~~~bash
 python scripts/build_zeva_robotwin_cache.py \
   --config-name train \
   task=robotwin_zeva_fastwam_3cam_384 \
   model.zeva.cte.checkpoint=./runs/zeva_cte/cte.pt \
   model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v4
-```
+~~~
 
-如果更换 `dataset_stats.json`、相机顺序、CTE 维度或数据集路径，请使用新的 cache 目录或先删除旧 cache 后重建。
+生成目录至少包含：
 
-### 5.4 Stage 2：只训练 Zeva addon
+~~~text
+data/robotwin2.0/zeva_cache/v4/
+├── manifest.json
+├── episode_index.json
+└── phase_effect-*.safetensors
+~~~
 
-Stage 2 必须传三项：
+如果更换数据集、dataset_stats.json、CTE checkpoint、相机顺序或 action 对齐参数，需要重新构建 cache。manifest.json 会检查这些身份信息，防止错误复用旧 cache。
 
-* `ckpt=`：冻结的 FastWAM base checkpoint；
-* `model.zeva.cte.checkpoint=`：Stage 1 的 `cte.pt`；
-* `model.zeva.cache.path=`：与该 CTE、stats 和数据完全匹配的 cache。
+## 5. Stage 2A：训练 Zeva policy injection addon
 
-```bash
+Stage 2A 使用已有 FastWAM checkpoint 作为冻结 backbone，只训练 Gaussian action prior、action-prior adapter 和 task/global behavior projector。
+
+先用 pooling 路径跑通训练，不需要额外的 static task-context 文件：
+
+~~~bash
+BASE_CKPT=/absolute/path/to/fastwam_base.pt
+CTE_CKPT=./runs/zeva_cte/cte.pt
+CACHE_DIR=./data/robotwin2.0/zeva_cache/v4
+
 python scripts/train_zeva_fastwam.py \
   --config-name train \
-  task=robotwin_zeva_fastwam_3cam_384 \
-  ckpt=./runs/robotwin_uncond_3cam_384_1e-4/fastwam_base/checkpoints/weights/step_010000.pt \
-  model.zeva.cte.checkpoint=./runs/zeva_cte/cte.pt \
-  model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v4 \
-  output_dir=./runs/zeva_stage2 \
+  task=robotwin_zeva_fastwam_policy_3cam_384 \
+  ckpt=$BASE_CKPT \
+  model.zeva.cte.checkpoint=$CTE_CKPT \
+  model.zeva.cache.path=$CACHE_DIR \
+  model.zeva.task_context.mode=pooling \
+  output_dir=./runs/zeva_stage2a \
   mixed_precision=bf16
-```
+~~~
 
-输出 addon 的命名格式为 `runs/zeva_stage2/checkpoints/weights/step_XXXXXX_addon.pt`；同时会保存 `base_checkpoint.sha256`、`cte_checkpoint.sha256` 和 cache manifest 副本。Stage 2 断点续训传 state directory，而不是把 state 当成 base checkpoint：
+输出的 addon 通常位于：
 
-```bash
+~~~text
+runs/zeva_stage2a/checkpoints/weights/step_XXXXXX_addon.pt
+~~~
+
+这个文件只保存 Zeva addon，不包含 FastWAM 主干。部署时仍然必须同时提供同一份 BASE_CKPT 和 CTE_CKPT。
+
+Stage 2A 续训使用 state directory：
+
+~~~bash
 python scripts/train_zeva_fastwam.py \
-  --config-name train task=robotwin_zeva_fastwam_3cam_384 \
-  ckpt=./runs/robotwin_uncond_3cam_384_1e-4/fastwam_base/checkpoints/weights/step_010000.pt \
-  model.zeva.cte.checkpoint=./runs/zeva_cte/cte.pt \
-  model.zeva.cache.path=./data/robotwin2.0/zeva_cache/v4 \
-  output_dir=./runs/zeva_stage2 \
-  resume=./runs/zeva_stage2/checkpoints/state/step_005000
-```
+  --config-name train \
+  task=robotwin_zeva_fastwam_policy_3cam_384 \
+  ckpt=$BASE_CKPT \
+  model.zeva.cte.checkpoint=$CTE_CKPT \
+  model.zeva.cache.path=$CACHE_DIR \
+  model.zeva.task_context.mode=pooling \
+  output_dir=./runs/zeva_stage2a \
+  resume=./runs/zeva_stage2a/checkpoints/state/step_005000
+~~~
 
-### 5.5 文本 embedding、Wan 下载和多卡训练的关系
+## 6. Stage 2B：可选的 PIM adapter 训练
 
-Zeva Stage 1/2 都沿用 FastWAM 的 dataset/processor，不会改变原有 image resize、action normalization 或 prompt 格式。需要多卡时，CTE 脚本可由外部 launcher 启动；Stage 2 推荐沿用 FastWAM 的 Accelerate/DeepSpeed 配置。不要通过随机打乱 Stage 1 的 episode 顺序来“增加数据量”，因为 cache manifest 依赖确定的 episode/window 对齐。
+Stage 2B 先加载 Stage 2A addon，然后冻结 policy-injection 分支，只训练 CausalPromptEncoder、prefix_project 和 pim_gate。
 
-## 6. RoboTwin 固定 seed 评测
+~~~bash
+POLICY_CKPT=./runs/zeva_stage2a/checkpoints/weights/step_010000_addon.pt
 
-推荐使用封装入口。它会检查 checkpoint、解析 `dataset_stats.json`、创建 policy 链接，并将固定 seed、retry 次数和 Zeva 参数传给 vendored RoboTwin：
+python scripts/train_zeva_fastwam.py \
+  --config-name train \
+  task=robotwin_zeva_fastwam_pim_3cam_384 \
+  ckpt=$BASE_CKPT \
+  model.zeva.cte.checkpoint=$CTE_CKPT \
+  model.zeva.cache.path=$CACHE_DIR \
+  model.zeva.policy_checkpoint=$POLICY_CKPT \
+  model.zeva.task_context.mode=pooling \
+  output_dir=./runs/zeva_stage2b \
+  mixed_precision=bf16
+~~~
 
-```bash
+如果只验证 action-prior 路径，Stage 2A 完成后可以直接测试；如果要测试完整的 PIM residual，则使用 Stage 2B addon：
+
+~~~bash
+PIM_CKPT=./runs/zeva_stage2b/checkpoints/weights/step_XXXXXX_addon.pt
+~~~
+
+## 7. Static task context（正式实验可选）
+
+默认配置的正式模式是 static，它会从初始图像、文本和 CTE 行为原型中读取 task context。没有这些文件时，可以使用 pooling 作为 baseline；使用 static 时，先构建 behavior bank 和 FastWAM 初始 readout：
+
+~~~bash
+python scripts/build_zeva_behavior_bank.py \
+  --config-name train \
+  task=robotwin_zeva_fastwam_static_3cam_384 \
+  ckpt=$BASE_CKPT \
+  model.zeva.cte.checkpoint=$CTE_CKPT \
+  model.zeva.task_context.bank_path=./runs/zeva_task_context/behavior_bank.pt \
+  model.zeva.task_context.readout_cache_path=./runs/zeva_task_context/readouts.pt
+~~~
+
+再训练 retrieval head：
+
+~~~bash
+python scripts/train_zeva_task_context_retrieval.py \
+  --config-name train \
+  task=robotwin_zeva_fastwam_static_3cam_384 \
+  model.zeva.task_context.bank_path=./runs/zeva_task_context/behavior_bank.pt \
+  model.zeva.task_context.readout_cache_path=./runs/zeva_task_context/readouts.pt \
+  model.zeva.task_context.retrieval_checkpoint=./runs/zeva_task_context/retrieval_head.pt
+~~~
+
+之后训练和测试时去掉 task_context.mode=pooling，并传入这三个 static 文件。static bank、retrieval head、FastWAM checkpoint、CTE checkpoint 和 stats 必须属于同一套实验，代码会检查它们的 hash 和尺寸。
+
+例如 Stage 2A 使用 static task context：
+
+~~~bash
+STATIC_BANK=./runs/zeva_task_context/behavior_bank.pt
+STATIC_READOUT=./runs/zeva_task_context/readouts.pt
+STATIC_HEAD=./runs/zeva_task_context/retrieval_head.pt
+
+python scripts/train_zeva_fastwam.py \
+  --config-name train \
+  task=robotwin_zeva_fastwam_policy_3cam_384 \
+  ckpt=$BASE_CKPT \
+  model.zeva.cte.checkpoint=$CTE_CKPT \
+  model.zeva.cache.path=$CACHE_DIR \
+  model.zeva.task_context.mode=static \
+  model.zeva.task_context.bank_path=$STATIC_BANK \
+  model.zeva.task_context.readout_cache_path=$STATIC_READOUT \
+  model.zeva.task_context.retrieval_checkpoint=$STATIC_HEAD \
+  output_dir=./runs/zeva_stage2a_static \
+  mixed_precision=bf16
+~~~
+
+## 8. RoboTwin 测试
+
+### 8.1 固定 seed 测试
+
+先确认 RoboTwin assets 已安装，且 third_party/RoboTwin/policy/fastwam_policy 可以由脚本创建。对同一个 task 和 seed，建议分别测试 base、zeva_stage2、pim_shadow 和 pim_on。
+
+base 只测试原始 FastWAM：
+
+~~~bash
 python scripts/eval_zeva_robotwin_fixed_attempts.py \
   --task click_alarmclock \
-  --ckpt ./runs/robotwin_uncond_3cam_384_1e-4/fastwam_base/checkpoints/weights/step_010000.pt \
-  --cte-checkpoint ./runs/zeva_cte/cte.pt \
-  --addon-checkpoint ./runs/zeva_stage2/checkpoints/weights/step_010000_addon.pt \
-  --seed 0 --max-attempts 4 --mode pim_on
-```
+  --ckpt $BASE_CKPT \
+  --seed 0 \
+  --max-attempts 4 \
+  --mode base
+~~~
 
-三种 mode 的依赖如下：
+pim_shadow 运行 CTE/BIT/PIM lifecycle，但不加载 addon，也不改变 FastWAM 输出：
 
-```text
-base       只需要 --ckpt；不启动 CTE/PIM/addon
-pim_shadow 需要 --ckpt + --cte-checkpoint；运行 memory lifecycle，但不加载 addon
-pim_on     需要 --ckpt + --cte-checkpoint + --addon-checkpoint
-```
+~~~bash
+python scripts/eval_zeva_robotwin_fixed_attempts.py \
+  --task click_alarmclock \
+  --ckpt $BASE_CKPT \
+  --cte-checkpoint $CTE_CKPT \
+  --seed 0 \
+  --max-attempts 4 \
+  --mode pim_shadow
+~~~
 
-为了进行严格的同 episode 对比，使用同一个 `--task`、`--seed` 和 `--max-attempts`，分别运行三个 mode。`--max-attempts 4` 表示同一 fixed-seed episode 最多重试四次，不等价于四个独立随机 episode。
+zeva_stage2 和 pim_on 需要 addon。若沿用 Stage 2 的 pooling baseline，直接用 Hydra 入口显式覆盖 task-context mode：
 
-封装入口会从 base checkpoint 的父目录向上查找 `dataset_stats.json`。如果 stats 在其他位置，直接使用 Hydra 入口显式指定：
-
-```bash
+~~~bash
 python experiments/robotwin/eval_robotwin_single.py \
   --config-name sim_robotwin_zeva.yaml \
-  ckpt=./runs/robotwin_uncond_3cam_384_1e-4/fastwam_base/checkpoints/weights/step_010000.pt \
+  task=robotwin_zeva_fastwam_policy_3cam_384 \
+  model.zeva.task_context.mode=pooling \
+  ckpt=$BASE_CKPT \
   EVALUATION.task_name=click_alarmclock \
   EVALUATION.dataset_stats_path=./data/robotwin2.0/dataset_stats.json \
-  EVALUATION.cte_checkpoint=./runs/zeva_cte/cte.pt \
-  EVALUATION.addon_checkpoint=./runs/zeva_stage2/checkpoints/weights/step_010000_addon.pt \
+  EVALUATION.cte_checkpoint=$CTE_CKPT \
+  EVALUATION.addon_checkpoint=$PIM_CKPT \
   EVALUATION.zeva_mode=pim_on \
   EVALUATION.fixed_seed=0 \
   EVALUATION.max_attempts=4 \
   EVALUATION.action_horizon=32 \
   EVALUATION.replan_steps=8 \
   EVALUATION.skip_get_obs_within_replan=false
-```
+~~~
 
-评测构造模型时仍需要 Wan/ActionDiT 文件；评测只加载 addon 的 prompt/adapter 参数，不会从 addon 恢复 FastWAM base。若 `replan_steps` 不是 4 的倍数，或 `skip_get_obs_within_replan=true`，入口会在 rollout 前直接拒绝。
+如果要测试 Stage 2A，只需把 addon 改成 Stage 2A addon，并把 zeva_mode 改成 zeva_stage2。
 
-## 7. 常见报错和排查顺序
+如果使用 static task context，可以改用固定 seed 封装入口，并传入 bank 和 retrieval head：
 
-1. `requires an existing ... pretrained_norm_stats`：确认 `data/robotwin2.0/dataset_stats.json` 存在，并通过 `data.train.pretrained_norm_stats=/absolute/path/to/dataset_stats.json` 覆盖；Zeva 入口不接受 `null` stats。
-2. `Missing text embedding cache`：先运行 `scripts/precompute_text_embeds.py`，检查 `data.train/val.text_embedding_cache_dir` 和 `context_len=128` 是否一致。
-3. `requires an existing frozen FastWAM base checkpoint`：Stage 2 的 `ckpt` 必须是 FastWAM base，不是 `cte.pt`、cache 目录或 addon。
-4. `cache manifest mismatch`：不要混用不同 stats、CTE、dataset path、相机顺序或 action horizon 生成的 cache；重建 cache。
-5. `pim_top_k ... persistent_length` 或 `bit_size ... brief_length`：评测/训练 override 必须与训练 addon 的配置一致，默认均为 4。
-6. `CUDA is unavailable`：Stage 2 需要 CUDA；评测的 CPU fallback 只用于轻量 smoke test，不能代表 RoboTwin 性能。
-7. `RoboTwin root/policy/assets not found`：确认 `EVALUATION.robotwin_root`（默认 `third_party/RoboTwin`）、policy 软链接和官方 assets 已安装。
+~~~bash
+python scripts/eval_zeva_robotwin_fixed_attempts.py \
+  --task click_alarmclock \
+  --ckpt $BASE_CKPT \
+  --cte-checkpoint $CTE_CKPT \
+  --addon-checkpoint $PIM_CKPT \
+  --task-context-bank ./runs/zeva_task_context/behavior_bank.pt \
+  --task-context-retrieval-checkpoint ./runs/zeva_task_context/retrieval_head.pt \
+  --task-context-top-k 5 \
+  --seed 0 \
+  --max-attempts 4 \
+  --mode pim_on
+~~~
 
-## 8. 结果文件和可复现性
+### 8.2 四种测试模式
 
-一次完整实验通常具有如下结构：
+| 模式 | 需要的 checkpoint | 作用 |
+| --- | --- | --- |
+| base | FastWAM | 原始 FastWAM baseline |
+| zeva_stage2 | FastWAM + CTE + Stage 2A addon | task behavior prefix + Gaussian action prior |
+| pim_shadow | FastWAM + CTE | 只运行 memory lifecycle，检查 memory 是否影响 vanilla output |
+| pim_on | FastWAM + CTE + Stage 2 addon | 完整 Zeva 条件，包括 PIM residual |
 
-```text
-runs/
-├── zeva_cte/
-│   ├── cte.pt
-│   ├── config.yaml
-│   ├── dataset_manifest.json
-│   └── metrics.jsonl
-└── zeva_stage2/
-    ├── config.yaml
-    ├── metrics.jsonl
-    ├── base_checkpoint.sha256
-    ├── cte_checkpoint.sha256
-    └── checkpoints/
-        ├── weights/step_XXXXXX_addon.pt
-        └── state/step_XXXXXX/
-```
+固定 seed 对比时，task、seed、max_attempts 和 replan_steps 要保持一致。max_attempts=4 表示同一个 fixed-seed episode 最多重试四次，不是四个独立 episode。
 
-不要只保存 addon 文件而丢弃对应的 base/CTE hash、cache manifest 和 stats。只有在固定 seed、固定 task、固定 retry protocol 下比较 `base → pim_shadow → pim_on`，才能判断 causal memory 是否真正提升成功率或减少重试；当前配置中的 `merge_threshold=0.85` 仍是 V1 provisional 值，不应直接解释为已经完成的最优超参。
+Zeva 测试必须满足：
 
-## 9. 本地静态回归
+- action_horizon=32；
+- replan_steps 是 4 的倍数；
+- skip_get_obs_within_replan=false，因为 CTE 需要每个已执行 action 对应的 after-frame；
+- pim_top_k 与训练时的 prompt.persistent_length 一致，默认都是 4。
 
-在没有真实 RoboTwin 数据、CUDA、SAPIEN 和 checkpoint 的机器上，可以运行代码级回归：
+## 9. 结果和排错
 
-```bash
+常见输出位置：
+
+~~~text
+runs/zeva_cte/                       # CTE checkpoint 和日志
+data/robotwin2.0/zeva_cache/v4/      # phase/effect cache
+runs/zeva_stage2a/                   # Stage 2A addon
+runs/zeva_stage2b/                   # Stage 2B addon
+evaluate_results/robotwin/            # RoboTwin 测试结果和日志
+~~~
+
+常见问题：
+
+1. requires an existing pretrained_norm_stats：检查 data/robotwin2.0/dataset_stats.json，并确认训练、cache 和评测使用同一份文件。
+2. Missing text embedding cache：重新运行 scripts/precompute_text_embeds.py，并确认 context_len=128。
+3. requires an existing frozen FastWAM base checkpoint：ckpt 必须是 FastWAM checkpoint，不能填 cte.pt、addon 或 cache 目录。
+4. cache manifest mismatch：数据、stats、CTE、相机顺序或尺寸不一致，重新构建 cache。
+5. static task context requires ...：没有 static bank 时，在训练和 pooling 测试命令中加入 model.zeva.task_context.mode=pooling。
+6. addon checkpoint mismatch：addon 必须由同一个 FastWAM base、同一个 CTE 和同一套 task-context artifacts 训练得到。
+7. CUDA 或 RoboTwin assets 报错：Stage 2 和正式 rollout 需要 CUDA、SAPIEN/Curobo/pytorch3d 以及 RoboTwin assets；CPU 只适合做小型代码 smoke test。
+
+## 10. 本地代码检查
+
+没有真实 checkpoint 或 RoboTwin 环境时，可以先运行：
+
+~~~bash
 PYTHONPATH=src pytest -q
-python -m compileall -q src scripts experiments/robotwin/fastwam_policy third_party/RoboTwin/script
+python -m compileall -q src scripts experiments/robotwin/fastwam_policy
 git diff --check
-```
+~~~
 
-这些检查不能替代真实 rollout；最终验收仍应在具备 CUDA、RoboTwin assets、数据 stats、base/CTE/cache/addon 的环境中完成固定 seed 三模式对比。
+这些检查只能验证代码和接口，不能替代真实 RoboTwin rollout。最终比较应在相同 task、相同 seed 和相同 retry 设置下进行 base → zeva_stage2/pim_shadow → pim_on 对照。
