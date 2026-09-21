@@ -102,6 +102,16 @@ python scripts/train_zeva_cte.py \
   output_dir=./runs/zeva_cte
 ~~~
 
+多卡训练使用分布式启动器。第一个参数是每台机器的 GPU 数量；`batch_size` 按每个进程计算，`NNODES`、`NODE_RANK`、`MASTER_ADDR` 和 `MASTER_PORT` 可用于多机启动：
+
+~~~bash
+bash scripts/train_zeva_cte.sh 8 \
+  --config-name train \
+  task=robotwin_zeva_fastwam_3cam_384 \
+  device=cuda \
+  output_dir=./runs/zeva_cte
+~~~
+
 训练完成后主要文件是：
 
 ~~~text
@@ -115,6 +125,17 @@ runs/zeva_cte/metrics.jsonl
 
 ~~~bash
 python scripts/train_zeva_cte.py \
+  --config-name train \
+  task=robotwin_zeva_fastwam_3cam_384 \
+  device=cuda \
+  output_dir=./runs/zeva_cte \
+  resume=./runs/zeva_cte/cte.pt
+~~~
+
+分布式断点续训将同一组覆盖参数传给启动器即可：
+
+~~~bash
+bash scripts/train_zeva_cte.sh 8 \
   --config-name train \
   task=robotwin_zeva_fastwam_3cam_384 \
   device=cuda \

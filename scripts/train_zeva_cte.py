@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import json
+import os
+from pathlib import Path
 
 import hydra
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from torch.optim import AdamW
@@ -40,8 +43,39 @@ def _video_size_hw(cfg: DictConfig) -> tuple[int, int]:
     return size
 
 
+def _distributed_context() -> tuple[int, int, int, bool]:
+    """Initialize torch.distributed when launched by torchrun."""
+
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size < 1 or rank < 0 or rank >= world_size:
+        raise ValueError(
+            f"invalid distributed environment: rank={rank}, world_size={world_size}"
+        )
+    if world_size > 1 and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+    return rank, local_rank, world_size, rank == 0
+
+
+def _barrier(world_size: int) -> None:
+    if world_size > 1:
+        dist.barrier()
+
+
+def _reduce_mean(values: list[float], device: torch.device, world_size: int) -> list[float]:
+    if world_size == 1:
+        return values
+    tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor.div_(world_size)
+    return [float(value) for value in tensor.cpu()]
+
+
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    rank, local_rank, world_size, is_main_process = _distributed_context()
     configured_device = cfg.get("device")
     if configured_device is None or str(configured_device).strip().lower() in {"", "none", "null"}:
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
@@ -52,7 +86,17 @@ def main(cfg: DictConfig) -> None:
             "Stage 1 requested CUDA but torch.cuda.is_available() is false; "
             "set device=cpu only for a small debug run"
         )
-    device = torch.device(device_name)
+    if device_name == "cuda":
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device(device_name)
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+    seed = int(cfg.get("seed", 42))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     stats_value = str(cfg.data.train.get("pretrained_norm_stats", ""))
     if stats_value in {"", "None", "null"} or not Path(stats_value).is_file():
         raise FileNotFoundError(
@@ -80,7 +124,7 @@ def main(cfg: DictConfig) -> None:
         vae, vae_metadata = load_frozen_wan_vae(
             model_id=str(model_values.get("model_id", "Wan-AI/Wan2.2-TI2V-5B")),
             tokenizer_model_id=str(model_values.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B")),
-            device=device_name,
+            device=str(device),
             torch_dtype=torch.float32 if device.type == "cpu" else torch.bfloat16,
             redirect_common_files=bool(model_values.get("redirect_common_files", True)),
         )
@@ -131,20 +175,33 @@ def main(cfg: DictConfig) -> None:
         batch_size=batch_size,
         tasks_per_batch=tasks_per_batch,
         samples_per_task=samples_per_task,
-        seed=int(cfg.get("seed", 42)),
+        seed=seed,
     )
-    if tasks_per_batch < 2:
+    if tasks_per_batch < 2 and is_main_process:
         print(
             "Stage 1 warning: configured batch_size cannot provide two tasks "
             f"with {samples_per_task} samples per task; task contrastive loss may be sparse."
         )
     scheduler = CosineAnnealingLR(optimizer, T_max=max(steps, 1))
     model.train(); step = 0
+    train_model = model
+    if world_size > 1:
+        train_model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            # Task/effect contrastive terms can be empty for a rank-local
+            # remainder batch, so parameter usage is intentionally dynamic.
+            find_unused_parameters=True,
+        )
     output_dir = Path(str(cfg.output_dir))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    _barrier(world_size)
     # Keep the exact resolved run configuration and data identity alongside the
     # weights so a cache cannot be mistaken for a different CTE/data pair.
-    OmegaConf.save(config=cfg, f=str(output_dir / "config.yaml"), resolve=True)
+    if is_main_process:
+        OmegaConf.save(config=cfg, f=str(output_dir / "config.yaml"), resolve=True)
     dataset_manifest = {
         "dataset_dirs": [str(value) for value in cfg.data.train.dataset_dirs],
         "dataset_stats": stats_value,
@@ -160,23 +217,23 @@ def main(cfg: DictConfig) -> None:
         "cte_vae_input_size": list(cte_vae_input_size),
         "camera_keys": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
     }
-    (output_dir / "dataset_manifest.json").write_text(
-        json.dumps(dataset_manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    if is_main_process:
+        (output_dir / "dataset_manifest.json").write_text(
+            json.dumps(dataset_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    _barrier(world_size)
     resume_path = cfg.get("resume")
     if resume_path not in (None, "", "None", "null"):
         resume_payload = load_cte_checkpoint(
-            str(resume_path), model, optimizer=optimizer, scheduler=scheduler, map_location=device
+            str(resume_path), model, optimizer=optimizer, scheduler=scheduler, map_location=str(device)
         )
         step = int(resume_payload.get("step", 0))
-        if step >= steps:
+        if step >= steps and is_main_process:
             print(f"Stage 1 checkpoint already reached max_steps={steps}: {resume_path}")
-            metrics_file = (output_dir / "metrics.jsonl").open("a", encoding="utf-8")
-        else:
-            metrics_file = (output_dir / "metrics.jsonl").open("a", encoding="utf-8")
+        metrics_file = (output_dir / "metrics.jsonl").open("a", encoding="utf-8") if is_main_process else None
     else:
-        metrics_file = (output_dir / "metrics.jsonl").open("w", encoding="utf-8")
+        metrics_file = (output_dir / "metrics.jsonl").open("w", encoding="utf-8") if is_main_process else None
     semantic_lookup: dict[str, int] = {}
 
     def train_batch(batch: list[dict]) -> None:
@@ -214,7 +271,7 @@ def main(cfg: DictConfig) -> None:
         actions = torch.stack(actions_list, dim=0).to(device)
         valid = torch.stack(valid_list, dim=0).to(device)
         transition_valid = torch.stack(transition_valid_list, dim=0).to(device)
-        output = model(
+        output = train_model(
             frames,
             actions,
             valid_mask=valid,
@@ -232,23 +289,36 @@ def main(cfg: DictConfig) -> None:
         optimizer.zero_grad(set_to_none=True)
         losses["total"].backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), float(cfg.get("max_grad_norm", 1.0))
+            train_model.parameters(), float(cfg.get("max_grad_norm", 1.0))
         )
         if not torch.isfinite(grad_norm):
             raise FloatingPointError(f"non-finite CTE gradient norm at step {step + 1}: {grad_norm.item()}")
         optimizer.step()
         scheduler.step()
         model.update_ema_target()
+        reduced_loss_values = _reduce_mean(
+            [
+                float(losses["total"].detach()),
+                float(losses["action"].detach()),
+                float(losses["vision"].detach()),
+                float(losses["loss_task"].detach()),
+                float(losses["loss_phase"].detach()),
+                float(losses["loss_effect"].detach()),
+                float(grad_norm.detach()),
+            ],
+            device,
+            world_size,
+        )
         metric_payload = {
             "step": int(step + 1),
-            "loss": float(losses["total"].detach().cpu()),
-            "action": float(losses["action"].detach().cpu()),
-            "vision": float(losses["vision"].detach().cpu()),
-            "task": float(losses["loss_task"].detach().cpu()),
-            "phase": float(losses["loss_phase"].detach().cpu()),
-            "effect": float(losses["loss_effect"].detach().cpu()),
-            "grad_norm": float(grad_norm.detach().cpu()),
-            "actual_batch_size": len(batch),
+            "loss": reduced_loss_values[0],
+            "action": reduced_loss_values[1],
+            "vision": reduced_loss_values[2],
+            "task": reduced_loss_values[3],
+            "phase": reduced_loss_values[4],
+            "effect": reduced_loss_values[5],
+            "grad_norm": reduced_loss_values[6],
+            "actual_batch_size": len(batch) * world_size,
             "distinct_task_count": len(set(batch_task_keys)),
             "task_positive_anchor_count": sum(
                 count for count in {key: batch_task_keys.count(key) for key in set(batch_task_keys)}.values()
@@ -277,8 +347,9 @@ def main(cfg: DictConfig) -> None:
             "cte/task_positive_pair_count": metric_payload["task_positive_pair_count"],
             "cte/distinct_episode_count": metric_payload["distinct_episode_count"],
         })
-        metrics_file.write(json.dumps(metric_payload) + "\n")
-        metrics_file.flush()
+        if is_main_process:
+            metrics_file.write(json.dumps(metric_payload) + "\n")
+            metrics_file.flush()
 
     epoch = 0
     while step < steps:
@@ -288,7 +359,18 @@ def main(cfg: DictConfig) -> None:
         batch_sampler.set_epoch(epoch)
         epoch += 1
         progressed = False
-        for index_batch in batch_sampler:
+        all_batches = list(batch_sampler)
+        if not all_batches:
+            raise RuntimeError("Stage 1 sampler produced no training batch")
+        if world_size > 1:
+            batches_per_rank = (len(all_batches) + world_size - 1) // world_size
+            padded_batches = all_batches + [all_batches[0]] * (
+                batches_per_rank * world_size - len(all_batches)
+            )
+            local_batches = padded_batches[rank::world_size]
+        else:
+            local_batches = all_batches
+        for index_batch in local_batches:
             if step >= steps:
                 break
             batch = [dataset[row.dataset_index] for row in index_batch]
@@ -297,19 +379,23 @@ def main(cfg: DictConfig) -> None:
             progressed = True
         if not progressed:
             raise RuntimeError("Stage 1 sampler produced no training batch")
-    metrics_file.close()
-    save_cte_checkpoint(
-        output_dir / "cte.pt",
-        model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        step=step,
-        config=_cfg_dict(zeva),
-        cte_input_type=cte_input_type,
-        vae_metadata=vae_metadata,
-        cte_vae_input_size=cte_vae_input_size,
-    )
-    print(f"saved Stage 1 checkpoint: {output_dir / 'cte.pt'}")
+    if is_main_process:
+        metrics_file.close()
+    _barrier(world_size)
+    if is_main_process:
+        save_cte_checkpoint(
+            output_dir / "cte.pt",
+            model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step=step,
+            config=_cfg_dict(zeva),
+            cte_input_type=cte_input_type,
+            vae_metadata=vae_metadata,
+            cte_vae_input_size=cte_vae_input_size,
+        )
+        print(f"saved Stage 1 checkpoint: {output_dir / 'cte.pt'}")
+    _barrier(world_size)
 
 
 if __name__ == "__main__":
