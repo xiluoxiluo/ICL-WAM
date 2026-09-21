@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from tqdm import tqdm
 
 import hydra
 import torch
@@ -14,6 +15,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader
 
 from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset
 from fastwam.zeva import (
@@ -32,6 +34,9 @@ from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_va
 def _cfg_dict(value) -> dict:
     return {} if value is None else dict(OmegaConf.to_container(value, resolve=True))
 
+def _identity_collate(batch):
+    """Keep Zeva samples as a list of dicts."""
+    return batch
 
 def _video_size_hw(cfg: DictConfig) -> tuple[int, int]:
     value = cfg.data.train.get("video_size")
@@ -238,64 +243,194 @@ def main(cfg: DictConfig) -> None:
 
     def train_batch(batch: list[dict]) -> None:
         frames_list, actions_list, valid_list, transition_valid_list = [], [], [], []
+        preencoded_flags = []
+
         semantic_ids = []
         batch_task_keys: list[str] = []
         batch_episode_ids: list[str] = []
         batch_window_starts: list[int] = []
+
+        # ------------------------------------------------------------
+        # 1. Collect the whole batch first.
+        #
+        # IMPORTANT:
+        # Do NOT run Wan VAE inside this per-sample loop.
+        # ------------------------------------------------------------
         for sample in batch:
             frames = sample.get("cte_frames")
             preencoded = frames is not None
+
             if frames is None:
-                frames = torch.cat((sample["before_frames"], sample["after_frames"][-1:]), dim=0)
+                frames = torch.cat(
+                    (
+                        sample["before_frames"],
+                        sample["after_frames"][-1:],
+                    ),
+                    dim=0,
+                )
             elif frames.ndim != 4 or frames.shape[0] != 9:
-                raise ValueError("sample['cte_frames'] must be [9,C,H,W]")
-            if frame_encoder is not None and not preencoded:
-                frames = frame_encoder(frames.unsqueeze(0))[0].cpu()
+                raise ValueError(
+                    "sample['cte_frames'] must be [9,C,H,W]"
+                )
+
             frames_list.append(frames)
+            preencoded_flags.append(preencoded)
+
             actions_list.append(sample["transition_actions"])
             valid_list.append(sample["frame_valid"])
             transition_valid_list.append(sample["transition_valid"])
+
             episode = sample["episode"]
+
             task_key = (
                 f"id:{episode.task_id}"
                 if episode.task_id not in (None, 0, "0")
                 else f"name:{episode.task_name}"
             )
-            semantic_lookup.setdefault(task_key, len(semantic_lookup))
-            semantic_ids.append(semantic_lookup[task_key])
-            batch_task_keys.append(task_key)
-            batch_episode_ids.append(str(episode.episode_id))
-            batch_window_starts.append(int(episode.episode_step))
 
-        frames = torch.stack(frames_list, dim=0).to(device)
-        actions = torch.stack(actions_list, dim=0).to(device)
-        valid = torch.stack(valid_list, dim=0).to(device)
-        transition_valid = torch.stack(transition_valid_list, dim=0).to(device)
+            semantic_lookup.setdefault(
+                task_key,
+                len(semantic_lookup),
+            )
+
+            semantic_ids.append(
+                semantic_lookup[task_key]
+            )
+
+            batch_task_keys.append(task_key)
+            batch_episode_ids.append(
+                str(episode.episode_id)
+            )
+            batch_window_starts.append(
+                int(episode.episode_step)
+            )
+
+        # ------------------------------------------------------------
+        # 2. Stack RGB/latent histories.
+        #
+        # RGB case:
+        #   [B, 9, 3, H, W]
+        #
+        # preencoded case:
+        #   [B, 9, C_latent, H_latent, W_latent]
+        # ------------------------------------------------------------
+        frames = torch.stack(
+            frames_list,
+            dim=0,
+        )
+
+        # A batch must not mix raw RGB and pre-encoded CTE latents.
+        if any(preencoded_flags) and not all(preencoded_flags):
+            raise ValueError(
+                "A CTE batch cannot mix raw RGB frames "
+                "and pre-encoded CTE frames."
+            )
+
+        # ------------------------------------------------------------
+        # 3. Encode the WHOLE batch with the frozen Wan VAE.
+        #
+        # OLD:
+        #
+        #   for sample in batch:
+        #       frame_encoder(frames.unsqueeze(0))
+        #
+        #   => B independent VAE calls
+        #
+        # NEW:
+        #
+        #   frame_encoder([B, 9, 3, H, W])
+        #
+        #   => one batched VAE call
+        #
+        # FastWAMCTELatentEncoder.encode_history() internally:
+        #
+        #   [B,9,3,H,W]
+        #       ↓ flatten
+        #   [B*9,3,H,W]
+        #       ↓ Wan VAE
+        #   [B*9,C,H',W']
+        #       ↓ reshape
+        #   [B,9,C,H',W']
+        #
+        # Do NOT move the result back to CPU here.
+        # ------------------------------------------------------------
+        if frame_encoder is not None and not all(preencoded_flags):
+            frames = frame_encoder(frames)
+
+        # frame_encoder normally already returns a CUDA tensor when the
+        # frozen Wan VAE lives on CUDA. Keep this .to(device) for both
+        # RGB and pre-encoded paths.
+        frames = frames.to(device)
+
+        actions = torch.stack(
+            actions_list,
+            dim=0,
+        ).to(device)
+
+        valid = torch.stack(
+            valid_list,
+            dim=0,
+        ).to(device)
+
+        transition_valid = torch.stack(
+            transition_valid_list,
+            dim=0,
+        ).to(device)
+
+        # ------------------------------------------------------------
+        # 4. CTE forward
+        # ------------------------------------------------------------
         output = train_model(
             frames,
             actions,
             valid_mask=valid,
             transition_valid=transition_valid,
         )
+
         losses = causal_transition_encoder_loss(
             output,
             actions,
             valid,
-            torch.tensor(semantic_ids, dtype=torch.long, device=device),
+            torch.tensor(
+                semantic_ids,
+                dtype=torch.long,
+                device=device,
+            ),
             CTELossConfig(),
         )
+
         if not torch.isfinite(losses["total"]):
-            raise FloatingPointError(f"non-finite CTE loss at step {step + 1}: {losses['total'].item()}")
+            raise FloatingPointError(
+                f"non-finite CTE loss at step {step + 1}: "
+                f"{losses['total'].item()}"
+            )
+
+        # ------------------------------------------------------------
+        # 5. Backward
+        # ------------------------------------------------------------
         optimizer.zero_grad(set_to_none=True)
+
         losses["total"].backward()
+
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            train_model.parameters(), float(cfg.get("max_grad_norm", 1.0))
+            train_model.parameters(),
+            float(cfg.get("max_grad_norm", 1.0)),
         )
+
         if not torch.isfinite(grad_norm):
-            raise FloatingPointError(f"non-finite CTE gradient norm at step {step + 1}: {grad_norm.item()}")
+            raise FloatingPointError(
+                f"non-finite CTE gradient norm at step {step + 1}: "
+                f"{grad_norm.item()}"
+            )
+
         optimizer.step()
         scheduler.step()
+
         model.update_ema_target()
+
+        # ------------------------------------------------------------
+        # 6. DDP metric reduction
+        # ------------------------------------------------------------
         reduced_loss_values = _reduce_mean(
             [
                 float(losses["total"].detach()),
@@ -309,6 +444,7 @@ def main(cfg: DictConfig) -> None:
             device,
             world_size,
         )
+
         metric_payload = {
             "step": int(step + 1),
             "loss": reduced_loss_values[0],
@@ -318,70 +454,200 @@ def main(cfg: DictConfig) -> None:
             "phase": reduced_loss_values[4],
             "effect": reduced_loss_values[5],
             "grad_norm": reduced_loss_values[6],
+
             "actual_batch_size": len(batch) * world_size,
-            "distinct_task_count": len(set(batch_task_keys)),
+
+            "distinct_task_count": len(
+                set(batch_task_keys)
+            ),
+
             "task_positive_anchor_count": sum(
-                count for count in {key: batch_task_keys.count(key) for key in set(batch_task_keys)}.values()
+                count
+                for count in {
+                    key: batch_task_keys.count(key)
+                    for key in set(batch_task_keys)
+                }.values()
                 if count > 1
             ),
+
             "task_positive_pair_count": sum(
                 count * (count - 1) // 2
-                for count in {key: batch_task_keys.count(key) for key in set(batch_task_keys)}.values()
+                for count in {
+                    key: batch_task_keys.count(key)
+                    for key in set(batch_task_keys)
+                }.values()
             ),
-            "distinct_episode_count": len(set(batch_episode_ids)),
-            "dataset_index": [int(sample.get("dataset_index", -1)) for sample in batch],
+
+            "distinct_episode_count": len(
+                set(batch_episode_ids)
+            ),
+
+            "dataset_index": [
+                int(sample.get("dataset_index", -1))
+                for sample in batch
+            ],
+
             "episode_id": batch_episode_ids,
             "task_id": batch_task_keys,
             "episode_step": batch_window_starts,
         }
-        metric_payload.update({
-            "cte/loss": metric_payload["loss"],
-            "cte/loss_action": metric_payload["action"],
-            "cte/loss_vision": metric_payload["vision"],
-            "cte/loss_task": metric_payload["task"],
-            "cte/loss_phase": metric_payload["phase"],
-            "cte/loss_effect": metric_payload["effect"],
-            "cte/actual_batch_size": metric_payload["actual_batch_size"],
-            "cte/distinct_task_count": metric_payload["distinct_task_count"],
-            "cte/task_positive_anchor_count": metric_payload["task_positive_anchor_count"],
-            "cte/task_positive_pair_count": metric_payload["task_positive_pair_count"],
-            "cte/distinct_episode_count": metric_payload["distinct_episode_count"],
-        })
+
+        metric_payload.update(
+            {
+                "cte/loss": metric_payload["loss"],
+                "cte/loss_action": metric_payload["action"],
+                "cte/loss_vision": metric_payload["vision"],
+                "cte/loss_task": metric_payload["task"],
+                "cte/loss_phase": metric_payload["phase"],
+                "cte/loss_effect": metric_payload["effect"],
+                "cte/actual_batch_size": metric_payload[
+                    "actual_batch_size"
+                ],
+                "cte/distinct_task_count": metric_payload[
+                    "distinct_task_count"
+                ],
+                "cte/task_positive_anchor_count": metric_payload[
+                    "task_positive_anchor_count"
+                ],
+                "cte/task_positive_pair_count": metric_payload[
+                    "task_positive_pair_count"
+                ],
+                "cte/distinct_episode_count": metric_payload[
+                    "distinct_episode_count"
+                ],
+            }
+        )
+
         if is_main_process:
-            metrics_file.write(json.dumps(metric_payload) + "\n")
+            metrics_file.write(
+                json.dumps(metric_payload) + "\n"
+            )
             metrics_file.flush()
 
+    # ================================================================
+    # Training loop
+    # ================================================================
     epoch = 0
+
     while step < steps:
         # Temporal selection is complete before batching. This prevents a
         # same-episode overlap row (e.g. step 1) from being flushed into the
         # next optimizer batch after step 0 was selected.
+
         batch_sampler.set_epoch(epoch)
         epoch += 1
+
         progressed = False
+
         all_batches = list(batch_sampler)
+
         if not all_batches:
-            raise RuntimeError("Stage 1 sampler produced no training batch")
-        if world_size > 1:
-            batches_per_rank = (len(all_batches) + world_size - 1) // world_size
-            padded_batches = all_batches + [all_batches[0]] * (
-                batches_per_rank * world_size - len(all_batches)
+            raise RuntimeError(
+                "Stage 1 sampler produced no training batch"
             )
-            local_batches = padded_batches[rank::world_size]
+
+        # ------------------------------------------------------------
+        # DDP batch sharding
+        # ------------------------------------------------------------
+        if world_size > 1:
+            batches_per_rank = (
+                len(all_batches) + world_size - 1
+            ) // world_size
+
+            padded_batches = (
+                all_batches
+                + [all_batches[0]]
+                * (
+                    batches_per_rank * world_size
+                    - len(all_batches)
+                )
+            )
+
+            local_batches = padded_batches[
+                rank::world_size
+            ]
+
         else:
             local_batches = all_batches
-        for index_batch in local_batches:
+
+        # ------------------------------------------------------------
+        # Progress bar
+        # ------------------------------------------------------------
+                # ------------------------------------------------------------
+        # Multi-process RGB/video loading
+        # ------------------------------------------------------------
+        local_index_batches = [
+            [int(row.dataset_index) for row in index_batch]
+            for index_batch in local_batches
+        ]
+
+        num_workers = max(
+            int(cfg.get("num_workers") or 0),
+            0,
+        )
+
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_sampler": local_index_batches,
+            "num_workers": num_workers,
+            "collate_fn": _identity_collate,
+            "pin_memory": device.type == "cuda",
+        }
+
+        # prefetch_factor is valid only when num_workers > 0
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = 2
+
+        train_loader = DataLoader(
+            **loader_kwargs,
+        )
+
+        iterator = tqdm(
+            train_loader,
+            total=len(local_index_batches),
+            desc=f"CTE training rank {rank}",
+            disable=not is_main_process,
+            dynamic_ncols=True,
+        )
+
+        for batch in iterator:
             if step >= steps:
                 break
-            batch = [dataset[row.dataset_index] for row in index_batch]
+
+            if is_main_process:
+                print(
+                    f"[step {step + 1}] "
+                    f"RGB batch loaded by {num_workers} workers, "
+                    "running batched VAE + CTE...",
+                    flush=True,
+                )
+
             train_batch(batch)
+
             step += 1
             progressed = True
+
+            if is_main_process:
+                iterator.set_postfix(
+                    step=step
+                )
+
         if not progressed:
-            raise RuntimeError("Stage 1 sampler produced no training batch")
+            raise RuntimeError(
+                "Stage 1 sampler produced no training batch"
+            )
+
+    # ================================================================
+    # Finish training
+    # ================================================================
     if is_main_process:
         metrics_file.close()
+
     _barrier(world_size)
+
+    # ================================================================
+    # Save Stage-1 CTE checkpoint
+    # ================================================================
     if is_main_process:
         save_cte_checkpoint(
             output_dir / "cte.pt",
@@ -394,7 +660,12 @@ def main(cfg: DictConfig) -> None:
             vae_metadata=vae_metadata,
             cte_vae_input_size=cte_vae_input_size,
         )
-        print(f"saved Stage 1 checkpoint: {output_dir / 'cte.pt'}")
+
+        print(
+            f"saved Stage 1 checkpoint: "
+            f"{output_dir / 'cte.pt'}"
+        )
+
     _barrier(world_size)
 
 

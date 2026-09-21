@@ -48,6 +48,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         tolerance_s: Optional[float] = None,
         video_backend: Optional[str] = None,
     ):
+        self.dataset_dirs = list(dataset_dirs)
         self.lerobot_dataset = self.base_dataset_cls(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),

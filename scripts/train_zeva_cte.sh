@@ -13,6 +13,10 @@ if (( NPROC_PER_NODE < 1 )); then
   exit 1
 fi
 
+cd /data/share/1919650160032350208/zjj/ICL-WAM
+export DIFFSYNTH_MODEL_BASE_PATH="/data/share/1919650160032350208/zjj/fastwam/checkpoints"
+export PYTHONPATH="/data/share/1919650160032350208/zjj/ICL-WAM/src:${PYTHONPATH:-}"
+
 EXTRA_ARGS=("$@")
 PYTHON_BIN="${PYTHON_BIN:-python}"
 NUM_MACHINES="${NNODES:-1}"
