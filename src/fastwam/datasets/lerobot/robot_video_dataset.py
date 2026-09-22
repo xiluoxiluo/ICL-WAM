@@ -16,11 +16,14 @@ from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_fro
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
+from fastwam.zeva.semantic_tasks import SemanticTaskMap
 from accelerate import PartialState
+
 logger = get_logger(__name__)
 
 
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
+
 
 class RobotVideoDataset(torch.utils.data.Dataset):
     base_dataset_cls = BaseLerobotDataset
@@ -43,10 +46,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
-        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
-        override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        concat_multi_camera: str = "horizontal",  # horizontal, vertical, robotwin, or None
+        override_instruction: Optional[str] = None,
         tolerance_s: Optional[float] = None,
         video_backend: Optional[str] = None,
+        # Zeva semantic identity.  Optional for ordinary FastWAM, required by
+        # the repaired RoboTwin Zeva configs.
+        semantic_task_map_path: Optional[str] = None,
+        require_semantic_task_id: bool = False,
     ):
         self.dataset_dirs = list(dataset_dirs)
         self.lerobot_dataset = self.base_dataset_cls(
@@ -61,10 +68,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             tolerance_s=tolerance_s,
             video_backend=video_backend,
         )
-    
+
         self.num_frames = num_frames
         self.action_video_freq_ratio = action_video_freq_ratio
-        
+
         assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
@@ -83,6 +90,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
 
+        self.require_semantic_task_id = bool(require_semantic_task_id)
+        self.semantic_task_map_path = (
+            None
+            if semantic_task_map_path in (None, "", "None", "null")
+            else str(semantic_task_map_path)
+        )
+        self.semantic_task_map = (
+            None
+            if self.semantic_task_map_path is None
+            else SemanticTaskMap.load(self.semantic_task_map_path)
+        )
+        if self.require_semantic_task_id and self.semantic_task_map is None:
+            raise ValueError(
+                "require_semantic_task_id=true but semantic_task_map_path is not set"
+            )
+
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
         )
@@ -99,12 +122,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 processor.num_image_steps = len(self.video_sample_indices)
             if not pretrained_norm_stats:
                 if not is_training_set:
-                    raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
+                    raise ValueError(
+                        "pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them."
+                    )
                 if PartialState().is_main_process:
                     logger.info("Calculating dataset stats for normalization...")
                     dataset_stats = self.lerobot_dataset.get_dataset_stats(processor)
                     work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    save_dataset_stats_to_json(
+                        dataset_stats, os.path.join(work_dir, "dataset_stats.json")
+                    )
                 else:
                     dataset_stats = None
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -116,11 +143,50 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
                 if PartialState().is_main_process:
                     work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    save_dataset_stats_to_json(
+                        dataset_stats, os.path.join(work_dir, "dataset_stats.json")
+                    )
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
-        
+
+    @property
+    def semantic_task_identity(self) -> dict | None:
+        if self.semantic_task_map is None:
+            return None
+        return self.semantic_task_map.identity.to_dict()
+
+    def resolve_semantic_task_id(
+        self,
+        *,
+        episode_index: int | None,
+        raw_task_index: int | str | None = None,
+        strict: bool | None = None,
+    ) -> str | int:
+        """Return canonical RoboTwin task identity for Zeva.
+
+        When no semantic map is configured we preserve the historical fallback
+        for ordinary FastWAM/non-Zeva uses.  Repaired Zeva configs set
+        ``require_semantic_task_id=true``, so a missing mapping is a hard error.
+        """
+        if strict is None:
+            strict = self.require_semantic_task_id
+        if self.semantic_task_map is not None:
+            resolved = self.semantic_task_map.resolve(
+                episode_index=episode_index,
+                raw_task_index=raw_task_index,
+                strict=bool(strict),
+            )
+            if resolved is not None:
+                return resolved
+        if strict:
+            raise KeyError(
+                f"missing semantic task for episode_index={episode_index}, raw_task_index={raw_task_index}"
+            )
+        if raw_task_index is not None:
+            return raw_task_index
+        return "unknown-task"
+
     def __len__(self):
         return len(self.lerobot_dataset)
 
@@ -148,24 +214,24 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 break
 
             sample_idx = np.random.randint(len(self.lerobot_dataset))
-        
+
         image_is_pad = sample["image_is_pad"]
 
-        video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+        video = sample["pixel_values"]
         num_cameras = 1
         if video.ndim == 5:
             if not self.lerobot_dataset.presample_images:
-                video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+                video = video[:, self.video_sample_indices, :, :, :]
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
             if not self.lerobot_dataset.presample_images:
-                video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+                video = video[self.video_sample_indices, :, :, :]
             T_video, C, H, W = video.shape
         if not self.lerobot_dataset.presample_images:
             image_is_pad = image_is_pad[self.video_sample_indices]
 
-        video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
+        video = video.view(num_cameras, T_video, C, H, W)
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
@@ -176,46 +242,41 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 size=[256, 320],
                 interpolation=transforms_F.InterpolationMode.BILINEAR,
                 antialias=True,
-            )  # [T_video, C, 256, 320]
+            )
             cam_left = transforms_F.resize(
                 video[1],
                 size=[128, 160],
                 interpolation=transforms_F.InterpolationMode.BILINEAR,
                 antialias=True,
-            )  # [T_video, C, 128, 160]
+            )
             cam_right = transforms_F.resize(
                 video[2],
                 size=[128, 160],
                 interpolation=transforms_F.InterpolationMode.BILINEAR,
                 antialias=True,
-            )  # [T_video, C, 128, 160]
-            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
-            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
+            )
+            bottom = torch.cat([cam_left, cam_right], dim=-1)
+            video = torch.cat([cam_top, bottom], dim=-2)
         elif num_cameras > 1:
             if self.concat_multi_camera == "horizontal":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
+                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)
             elif self.concat_multi_camera == "vertical":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # [T_video, C, num_cameras*H, W]
+                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)
             else:
                 raise ValueError(
                     f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
                     "Expected one of: horizontal, vertical, robotwin."
                 )
         else:
-            video = video.squeeze(0)  # [T_video, C, H, W]
+            video = video.squeeze(0)
 
-        # final resize and normalization
         video = self.resize_transform(video)
         video = self.crop_transform(video)
-        video = self.normalize_transform(video)  # [T_video, C, H, W]
+        video = self.normalize_transform(video)
+        video = video.permute(1, 0, 2, 3)
 
-        video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
-
-        # Proxy (from lerobot): 
-        #   action: [num_frames-1, action_dim] # start from t0, except the last frame
-        #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
-        action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        action = sample["action"]
+        proprio = sample["proprio"][:-1, :]
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
         if action.shape[0] % (video.shape[1] - 1) != 0:
@@ -224,8 +285,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )
 
         task = sample["instruction"]
-        
-        # FIXME
         if self.override_instruction is not None:
             task = self.override_instruction
         instruction = DEFAULT_PROMPT.format(task=task)
@@ -234,45 +293,47 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "video": video,
             "action": action,
             "proprio": proprio,
-            # BaseLerobotDataset may retry a failed request with a random
-            # source index. Keep the actual returned index for cache joins.
             "dataset_index": int(sample.get("idx", sample_idx)),
             "prompt": instruction,
             "image_is_pad": image_is_pad,
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
-        # Preserve the source episode coordinates for causal Zeva sampling.
-        # These fields are metadata only and do not alter the FastWAM tensor
-        # contract consumed by the existing trainer.
+
         for key in ("episode_index", "frame_index", "index", "task_index"):
             if key in sample:
                 value = sample[key]
                 if torch.is_tensor(value):
-                    # LeRobot returns queried metadata at every timestamp;
-                    # the first value is the window's causal start coordinate.
                     value = value.flatten()[0].item() if value.numel() else 0
                 elif isinstance(value, np.ndarray):
                     value = value.reshape(-1)[0].item() if value.size else 0
                 data[key] = value
+
         if "episode_index" in data:
-            data["episode_id"] = f"{self.dataset_dirs[0]}::episode-{data['episode_index']}"
+            episode_index = int(data["episode_index"])
+            data["episode_id"] = f"{self.dataset_dirs[0]}::episode-{episode_index}"
             data["episode_step"] = int(data.get("frame_index", data.get("index", 0)))
         else:
-            # Some legacy datasets do not expose episode coordinates. Treat
-            # each returned window as independent rather than inventing one
-            # shared episode and silently dropping almost all Stage 1 rows.
+            episode_index = None
             data["episode_id"] = f"{self.dataset_dirs[0]}::window-{data['dataset_index']}"
             data["episode_step"] = 0
-        # Prefer the dataset's numeric task index, but retain the instruction
-        # as a stable identity for legacy exports that omit task_index. Using
-        # a shared sentinel (0) would incorrectly make every task eligible
-        # for same-task PIM retrieval.
-        data["task_id"] = data.get("task_index", str(task))
-        data["task_name"] = str(task)
+
+        raw_task_index = data.get("task_index")
+        data["raw_task_index"] = raw_task_index
+        data["raw_task_name"] = str(task)
+
+        semantic_task_id = self.resolve_semantic_task_id(
+            episode_index=episode_index,
+            raw_task_index=raw_task_index if raw_task_index is not None else str(task),
+        )
+        data["semantic_task_id"] = semantic_task_id
+        data["task_id"] = semantic_task_id
+        # task_name is the semantic task identity for Zeva bookkeeping; the
+        # original natural-language instruction remains in raw_task_name/prompt.
+        data["task_name"] = str(semantic_task_id)
+
         if self.use_text_embed_cache:
             context, context_mask = self._get_cached_text_context(instruction)
-            # NOTE: to keep consistent with wan2.2's behavior
             context[~context_mask] = 0.0
             data["context"] = context
             data["context_mask"] = torch.ones_like(context_mask)
@@ -284,7 +345,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         cache_dir = self.text_embedding_cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
+        cache_path = os.path.join(
+            cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt"
+        )
         if not os.path.exists(cache_path):
             raise FileNotFoundError(
                 f"Missing text embedding cache: {cache_path}. "
@@ -309,7 +372,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"Cached mask_len mismatch: expected {self.context_len}, got {context_mask.shape[0]} in {cache_path}"
             )
-
         return context, context_mask
 
     def __getitem__(self, idx):
@@ -317,7 +379,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             data = self._get(idx)
         except Exception as e:
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
-            # trace back
             print(traceback.format_exc())
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
