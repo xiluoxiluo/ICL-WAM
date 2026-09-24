@@ -29,6 +29,7 @@ from fastwam.zeva import (
     causal_transition_encoder_loss,
 )
 from fastwam.zeva.checkpoint import load_cte_checkpoint, save_cte_checkpoint
+from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.semantic_tasks import parse_episode_index_from_id
 from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_vae
@@ -185,21 +186,11 @@ def main(cfg: DictConfig) -> None:
                 "Zeva Stage 1 requires an existing data.train.pretrained_norm_stats file"
             )
 
-        base = instantiate(cfg.data.train)
-        if not bool(getattr(base, "require_semantic_task_id", False)):
-            raise ValueError(
-                "Formal semantic CTE training requires data.train.require_semantic_task_id=true"
-            )
-        semantic_identity = getattr(base, "semantic_task_identity", None)
-        if semantic_identity is None:
-            raise ValueError("formal semantic CTE training requires semantic_task_map_path")
-
-        dataset = ZevaRobotWinDataset(base)
-        if len(dataset) == 0:
-            raise ValueError("Stage 1 dataset is empty")
-
         zeva = cfg.model.get("zeva", {})
         cte_values = _cfg_dict(zeva.get("cte"))
+        latent_cache_value = cte_values.get("latent_cache_path")
+        use_latent_cache = latent_cache_value not in (None, "", "None", "null")
+
         allowed = set(CausalTransitionEncoderConfig.__dataclass_fields__)
         model = CausalTransitionEncoder(
             CausalTransitionEncoderConfig(**{k: v for k, v in cte_values.items() if k in allowed})
@@ -210,24 +201,80 @@ def main(cfg: DictConfig) -> None:
         if cte_input_type == "rgb_frame" and model.cfg.image_channels != 3:
             raise ValueError("rgb_frame CTE training requires image_channels=3")
 
+        cte_vae_input_size = _video_size_hw(cfg)
         frame_encoder = None
         vae_metadata: dict[str, object] = {}
-        cte_vae_input_size = _video_size_hw(cfg)
-        if cte_input_type == "wan_vae_latent":
-            model_values = _cfg_dict(cfg.model)
-            vae, vae_metadata = load_frozen_wan_vae(
-                model_id=str(model_values.get("model_id", "Wan-AI/Wan2.2-TI2V-5B")),
-                tokenizer_model_id=str(model_values.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B")),
-                device=str(device),
-                torch_dtype=torch.float32 if device.type == "cpu" else torch.bfloat16,
-                redirect_common_files=bool(model_values.get("redirect_common_files", True)),
+        base = None
+
+        if use_latent_cache:
+            if cte_input_type != "wan_vae_latent":
+                raise ValueError(
+                    "model.zeva.cte.latent_cache_path requires input_type=wan_vae_latent"
+                )
+
+            semantic_map_value = str(cfg.data.train.get("semantic_task_map_path", ""))
+            if semantic_map_value in {"", "None", "null"} or not Path(semantic_map_value).is_file():
+                raise FileNotFoundError(
+                    "cached Stage-1 training still requires semantic_task_map_path "
+                    "for strict cache identity validation"
+                )
+
+            dataset = CachedCTELatentWindowDataset(
+                str(latent_cache_value),
+                expected_dataset_stats_sha256=sha256_file(stats_value),
+                expected_semantic_task_sha256=sha256_file(semantic_map_value),
+                expected_video_size=cte_vae_input_size,
+                expected_action_dim=model.cfg.action_dim,
+                expected_transition_steps=model.cfg.transition_steps,
+                expected_latent_channels=model.cfg.image_channels,
             )
-            frame_encoder = FastWAMCTELatentEncoder(
-                vae,
-                resize=cte_vae_input_size,
-                expected_channels=model.cfg.image_channels,
-                input_range="minus_one_one",
-            ).encode_history
+            semantic_identity = dataset.semantic_task_identity
+            vae_metadata = dict(dataset.vae_metadata)
+
+            if tuple(dataset.cte_vae_input_size) != tuple(cte_vae_input_size):
+                raise ValueError(
+                    "CTE latent cache / training VAE input-size mismatch: "
+                    f"cache={dataset.cte_vae_input_size}, train={cte_vae_input_size}"
+                )
+
+            if is_main_process:
+                print("========== CTE input ==========")
+                print(f"precomputed latent cache: {Path(str(latent_cache_value)).resolve()}")
+                print(f"cached windows: {len(dataset):,}")
+                print(f"latent shape: {dataset.latent_shape}")
+                print("RGB decode: DISABLED")
+                print("Wan VAE in training: DISABLED")
+        else:
+            base = instantiate(cfg.data.train)
+            if not bool(getattr(base, "require_semantic_task_id", False)):
+                raise ValueError(
+                    "Formal semantic CTE training requires data.train.require_semantic_task_id=true"
+                )
+            semantic_identity = getattr(base, "semantic_task_identity", None)
+            if semantic_identity is None:
+                raise ValueError("formal semantic CTE training requires semantic_task_map_path")
+
+            dataset = ZevaRobotWinDataset(base)
+            if len(dataset) == 0:
+                raise ValueError("Stage 1 dataset is empty")
+
+            if cte_input_type == "wan_vae_latent":
+                model_values = _cfg_dict(cfg.model)
+                vae, vae_metadata = load_frozen_wan_vae(
+                    model_id=str(model_values.get("model_id", "Wan-AI/Wan2.2-TI2V-5B")),
+                    tokenizer_model_id=str(
+                        model_values.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B")
+                    ),
+                    device=str(device),
+                    torch_dtype=torch.float32 if device.type == "cpu" else torch.bfloat16,
+                    redirect_common_files=bool(model_values.get("redirect_common_files", True)),
+                )
+                frame_encoder = FastWAMCTELatentEncoder(
+                    vae,
+                    resize=cte_vae_input_size,
+                    expected_channels=model.cfg.image_channels,
+                    input_range="minus_one_one",
+                ).encode_history
 
         if (
             model.cfg.action_dim != 14
@@ -252,15 +299,21 @@ def main(cfg: DictConfig) -> None:
             raise ValueError("RoboTwin Zeva requires data.train.global_sample_stride=1")
         steps = int(cfg.get("max_steps") or 1000)
 
-        raw_training_index = build_cte_training_index(
-            dataset,
-            source_window_actions=32,
-            sample_stride=sample_stride,
-        )
-        if not raw_training_index:
-            raise ValueError("Stage 1 contains no complete, non-overlapping CTE windows")
+        if use_latent_cache:
+            training_index = list(dataset.training_index)
+            if not training_index:
+                raise ValueError("CTE latent cache contains no training windows")
+        else:
+            raw_training_index = build_cte_training_index(
+                dataset,
+                source_window_actions=32,
+                sample_stride=sample_stride,
+            )
+            if not raw_training_index:
+                raise ValueError("Stage 1 contains no complete, non-overlapping CTE windows")
+            assert base is not None
+            training_index = _semantic_remap_training_index(raw_training_index, base)
 
-        training_index = _semantic_remap_training_index(raw_training_index, base)
         semantic_stats = _validate_semantic_index(training_index, cfg)
         semantic_tasks = tuple(sorted({str(row.task_id) for row in training_index}))
         semantic_lookup = {task: index for index, task in enumerate(semantic_tasks)}
@@ -327,6 +380,16 @@ def main(cfg: DictConfig) -> None:
                 "vae_metadata": vae_metadata,
                 "cte_vae_input_size": list(cte_vae_input_size),
                 "camera_keys": ["cam_high", "cam_left_wrist", "cam_right_wrist"],
+                "cte_latent_cache": (
+                    str(Path(str(latent_cache_value)).resolve())
+                    if use_latent_cache
+                    else None
+                ),
+                "cte_latent_cache_manifest_sha256": (
+                    sha256_file(Path(str(latent_cache_value)) / "manifest.json")
+                    if use_latent_cache
+                    else None
+                ),
             }
             (output_dir / "dataset_manifest.json").write_text(
                 json.dumps(dataset_manifest, indent=2, sort_keys=True) + "\n",
@@ -404,10 +467,33 @@ def main(cfg: DictConfig) -> None:
             if frame_encoder is not None and not all(preencoded_flags):
                 frames = frame_encoder(frames)
 
-            frames = frames.to(device)
-            actions = torch.stack(actions_list, dim=0).to(device)
-            valid = torch.stack(valid_list, dim=0).to(device)
-            transition_valid = torch.stack(transition_valid_list, dim=0).to(device)
+            if all(preencoded_flags):
+                # Cached values are stored as exact BF16 bit patterns. The
+                # online VAE path historically returns float32 to CTE, so cast
+                # after H2D to preserve the original Stage-1 numeric contract.
+                frames = frames.to(
+                    device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+            else:
+                frames = frames.to(device, non_blocking=True)
+
+            actions = torch.stack(actions_list, dim=0).to(
+                device,
+                non_blocking=True,
+            )
+            valid = torch.stack(valid_list, dim=0).to(
+                device,
+                non_blocking=True,
+            )
+            transition_valid = torch.stack(
+                transition_valid_list,
+                dim=0,
+            ).to(
+                device,
+                non_blocking=True,
+            )
 
             output = train_model(
                 frames,
@@ -526,6 +612,9 @@ def main(cfg: DictConfig) -> None:
             }
             if num_workers > 0:
                 loader_kwargs["prefetch_factor"] = 2
+                # Particularly useful for mmap latent-cache workers: keep the
+                # per-worker mmap handles alive instead of reopening them.
+                loader_kwargs["persistent_workers"] = True
             train_loader = DataLoader(**loader_kwargs)
 
             remaining_steps = steps - step

@@ -1,37 +1,68 @@
-import json
 from pathlib import Path
-from collections import defaultdict, Counter
+import pandas as pd
+import pyarrow.parquet as pq
 
-root = Path("runs/zeva_cache/phase_effect_v4")
-rows = json.loads((root / "episode_index.json").read_text())
+ROOT = Path(
+    "/data/share/1919650160032350208/"
+    "foundation_model/datasets/robotwin2.0"
+)
 
-task_episodes = defaultdict(set)
+# 读取 task_index -> instruction
+task_file = ROOT / "meta" / "tasks.parquet"
 
-for r in rows:
-    task_episodes[str(r["task_id"])].add(str(r["episode_id"]))
+if task_file.exists():
+    tasks = pd.read_parquet(task_file)
+else:
+    task_file = ROOT / "meta" / "tasks.jsonl"
+    tasks = pd.read_json(task_file, lines=True)
 
-counts = [len(v) for v in task_episodes.values()]
-hist = Counter(counts)
+print("tasks columns:", list(tasks.columns))
+print("total task strings:", len(tasks))
 
-print("tasks:", len(task_episodes))
-print("episodes:", len({e for v in task_episodes.values() for e in v}))
+task_map = {
+    int(row.task_index): str(row.task)
+    for row in tasks[["task_index", "task"]].itertuples(index=False)
+}
 
-print("\n========== episodes per task ==========")
-print("min:", min(counts))
-print("max:", max(counts))
-print("mean:", sum(counts) / len(counts))
+# 专门检查可能的任务边界
+episode_ids = [
+    0, 1, 48, 49, 50, 51,
+    548, 549, 550, 551,
+    999, 1000,
+    2498, 2499, 2500, 2501,
+    2999, 3000,
+]
 
-for n in [1, 2, 3, 4, 5, 10]:
-    print(f"tasks with exactly {n} episodes:", hist[n])
+for ep in episode_ids:
+    matches = list(
+        (ROOT / "data").rglob(
+            f"episode_{ep:06d}.parquet"
+        )
+    )
 
-print("tasks >= 2 episodes:", sum(x >= 2 for x in counts))
-print("tasks >= 4 episodes:", sum(x >= 4 for x in counts))
-print("tasks >= 10 episodes:", sum(x >= 10 for x in counts))
+    if not matches:
+        print(f"\nepisode {ep}: FILE NOT FOUND")
+        continue
 
-print("\nTop 20:")
-for task, eps in sorted(
-    task_episodes.items(),
-    key=lambda x: len(x[1]),
-    reverse=True
-)[:20]:
-    print(task, len(eps))
+    path = matches[0]
+
+    table = pq.read_table(
+        path,
+        columns=["task_index"],
+    )
+
+    raw_indices = sorted({
+        int(x)
+        for x in table.column("task_index").to_pylist()
+    })
+
+    print("\n" + "=" * 80)
+    print(f"episode {ep}")
+    print(f"path: {path}")
+    print(f"num task_index: {len(raw_indices)}")
+
+    for idx in raw_indices[:8]:
+        print(
+            f"  {idx}: "
+            f"{task_map.get(idx, '<missing>')}"
+        )

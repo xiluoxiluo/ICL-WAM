@@ -31,6 +31,7 @@ train:
   pretrained_norm_stats: /data/share/1919650160032350208/foundation_model/datasets/robotwin2.0/robotw_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
+  video_backend: "pyav"
 
   # IMPORTANT: Zeva identity is canonical RoboTwin task, not LeRobot task_index.
   semantic_task_map_path: /data/share/1919650160032350208/foundation_model/datasets/robotwin2.0/meta/semantic_task_map.json
@@ -93,6 +94,7 @@ val:
   pretrained_norm_stats: /data/share/1919650160032350208/foundation_model/datasets/robotwin2.0/robotw_stats.json
   skip_padding_as_possible: false
   concat_multi_camera: "robotwin"
+  video_backend: "pyav"
 
   semantic_task_map_path: /data/share/1919650160032350208/foundation_model/datasets/robotwin2.0/meta/semantic_task_map.json
   require_semantic_task_id: true

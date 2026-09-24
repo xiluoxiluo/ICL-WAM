@@ -310,6 +310,8 @@ def _build_episode_plans_metadata_only(
     plans: list[EpisodePlan] = []
     global_dataset_offset = 0
 
+    robot_video_dataset = dataset.base_dataset
+
     inner_datasets = _get_inner_lerobot_datasets(dataset)
 
     for inner_pos, inner_dataset in enumerate(inner_datasets):
@@ -365,9 +367,11 @@ def _build_episode_plans_metadata_only(
 
             # Cache queries must coincide with grouped CTE boundaries: 0,4,8,...
             max_query_start = (max_start // query_stride) * query_stride
-            task_id = _task_id_from_metadata(
-                inner_dataset,
-                task_values[episode_pos],
+            
+            task_id = robot_video_dataset.resolve_semantic_task_id(
+                episode_index=episode_id,
+                raw_task_index=task_values[episode_pos],
+                strict=True,
             )
 
             plans.append(

@@ -79,6 +79,12 @@ def build_cte_training_index(
     # ------------------------------------------------------------------
     zeva_base = getattr(dataset, "base_dataset", None)
 
+    semantic_resolver = (
+        getattr(zeva_base, "resolve_semantic_task_id", None)
+        if zeva_base is not None
+        else None
+    )
+
     lerobot_base = (
         getattr(zeva_base, "lerobot_dataset", None)
         if zeva_base is not None
@@ -98,6 +104,13 @@ def build_cte_training_index(
     )
 
     if inner_datasets is not None and sample_stride == 1:
+        if not callable(semantic_resolver):
+            raise RuntimeError(
+                "RoboTwin Zeva Stage-1 metadata fast path requires "
+                "RobotVideoDataset.resolve_semantic_task_id(). "
+                "Do not use raw LeRobot task_index as the CTE task identity."
+            )
+
         rows: list[CTETrainIndex] = []
 
         global_dataset_offset = 0
@@ -217,21 +230,11 @@ def build_cte_training_index(
                     task_values,
                     strict=True,
                 ):
-                    # task_value may be numpy scalar / Python int.
-                    try:
-                        task_id: str | int = int(task_value)
-                    except (TypeError, ValueError):
-                        task_id = str(task_value)
-
-                    # Keep the existing Zeva convention:
-                    # task id 0 is not used as a shared sentinel.
-                    if task_id in (0, "0"):
-                        try:
-                            task_id = str(
-                                inner_dataset.meta.tasks[int(task_id)]
-                            )
-                        except (KeyError, TypeError, ValueError):
-                            task_id = f"task-{task_id}"
+                    task_id = semantic_resolver(
+                        episode_index=int(episode_id),
+                        raw_task_index=task_value,
+                        strict=True,
+                    )
 
                     rows.append(
                         CTETrainIndex(
