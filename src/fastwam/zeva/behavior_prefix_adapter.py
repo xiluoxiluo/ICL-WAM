@@ -212,7 +212,8 @@ def gaussian_prior_nll(target: Tensor, mean: Tensor, std: Tensor, valid: Tensor 
         return nll.mean()
     if valid.shape != nll.shape:
         raise ValueError("valid must have shape [B,H]")
-    return (nll * valid.to(nll.dtype)).sum() / valid.sum().clamp_min(1)
+    valid = valid.to(device=nll.device, dtype=nll.dtype)
+    return (nll * valid).sum() / valid.sum().clamp_min(1.0)
 
 
 class ExactZevaPolicyInjectionAdapter(nn.Module):

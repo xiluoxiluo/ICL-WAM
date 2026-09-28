@@ -20,7 +20,11 @@ from fastwam.datasets.zeva_robotwin_dataset import EpisodeMetadata
 from fastwam.zeva.stage1_sampling import CTETrainIndex
 
 
-CACHE_FORMAT = "zeva_cte_latent_cache_v1"
+CACHE_FORMAT = "zeva_cte_window_latent_cache_v1"
+CACHE_FORMAT_ALIASES = {
+    CACHE_FORMAT,
+    "zeva_cte_latent_cache_v1",
+}
 LATENT_STORAGE_DTYPE = "bfloat16_bits_u16"
 
 
@@ -69,10 +73,11 @@ class CachedCTELatentWindowDataset(Dataset):
         self.manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.rows: list[dict[str, Any]] = json.loads(index_path.read_text(encoding="utf-8"))
 
-        if str(self.manifest.get("format")) != CACHE_FORMAT:
+        actual_format = str(self.manifest.get("format"))
+        if actual_format not in CACHE_FORMAT_ALIASES:
             raise ValueError(
-                f"unsupported latent cache format: {self.manifest.get('format')!r}; "
-                f"expected {CACHE_FORMAT!r}"
+                f"unsupported latent cache format: {actual_format!r}; "
+                f"expected one of {sorted(CACHE_FORMAT_ALIASES)!r}"
             )
         if str(self.manifest.get("latent_storage_dtype")) != LATENT_STORAGE_DTYPE:
             raise ValueError(
@@ -89,6 +94,28 @@ class CachedCTELatentWindowDataset(Dataset):
         self.cte_vae_input_size = tuple(int(v) for v in self.manifest["cte_vae_input_size"])
         self.vae_metadata = dict(self.manifest.get("vae_metadata", {}))
         self.semantic_task_identity = dict(self.manifest.get("semantic_task_identity", {}))
+
+        if len(self.latent_shape) != 4:
+            raise ValueError(
+                f"latent_shape must be [T,C,H,W], got {self.latent_shape}"
+            )
+        if self.latent_shape[0] != 9:
+            raise ValueError(
+                f"RoboTwin Stage-1 cache requires 9 latent boundaries/window, got {self.latent_shape[0]}"
+            )
+        if len(self.cte_vae_input_size) != 2 or min(self.cte_vae_input_size) < 1:
+            raise ValueError(
+                f"cte_vae_input_size must be [H,W], got {self.cte_vae_input_size}"
+            )
+        latent_channels = int(self.manifest.get("latent_channels", -1))
+        if latent_channels != self.latent_shape[1]:
+            raise ValueError(
+                "latent cache channel metadata mismatch: "
+                f"latent_channels={latent_channels}, latent_shape={self.latent_shape}"
+            )
+        if min(self.latent_shape) < 1:
+            raise ValueError(f"latent_shape must contain positive dimensions, got {self.latent_shape}")
+
 
         def _expect(name: str, actual: Any, expected: Any) -> None:
             if expected is not None and actual != expected:
@@ -157,6 +184,81 @@ class CachedCTELatentWindowDataset(Dataset):
         # mmap handles are process-local and opened lazily, which is safe when
         # this Dataset is copied into DataLoader workers.
         self._rank_arrays: dict[int, dict[str, np.ndarray]] = {}
+
+    def validate_storage_layout(self, *, require_complete_windows: bool = False) -> dict[str, int]:
+        """Validate every rank mmap header and all index rank/offset references.
+
+        This is intentionally cheap: ``np.load(..., mmap_mode="r")`` reads array
+        headers without materializing the 67 GiB payload.  Boolean validity arrays
+        are small enough to scan when ``require_complete_windows=True``.
+        """
+        rows_by_rank: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in self.rows:
+            rows_by_rank[int(row["rank"])].append(row)
+
+        seen_slots: set[tuple[int, int]] = set()
+        total_slots = 0
+        expected_t, expected_c, expected_h, expected_w = self.latent_shape
+        transition_steps = int(self.manifest["transition_steps"])
+        action_dim = int(self.manifest["action_dim"])
+
+        for rank, rank_rows in sorted(rows_by_rank.items()):
+            arrays = self._arrays(rank)
+            latents = arrays["latents"]
+            actions = arrays["actions"]
+            frame_valid = arrays["frame_valid"]
+            transition_valid = arrays["transition_valid"]
+            n = int(latents.shape[0])
+
+            if latents.dtype != np.uint16 or tuple(latents.shape[1:]) != self.latent_shape:
+                raise ValueError(
+                    f"rank {rank} latent mmap mismatch: dtype={latents.dtype}, "
+                    f"shape={latents.shape}, expected=[N,{expected_t},{expected_c},{expected_h},{expected_w}] uint16"
+                )
+            expected_action_shape = (n, expected_t - 1, transition_steps, action_dim)
+            if tuple(actions.shape) != expected_action_shape:
+                raise ValueError(
+                    f"rank {rank} action mmap shape mismatch: got={actions.shape}, "
+                    f"expected={expected_action_shape}"
+                )
+            if tuple(frame_valid.shape) != (n, expected_t):
+                raise ValueError(
+                    f"rank {rank} frame_valid shape mismatch: {frame_valid.shape}"
+                )
+            if tuple(transition_valid.shape) != (n, expected_t - 1, transition_steps):
+                raise ValueError(
+                    f"rank {rank} transition_valid shape mismatch: {transition_valid.shape}"
+                )
+            if actions.dtype != np.float32:
+                raise ValueError(
+                    f"rank {rank} transition_actions must be float32 to preserve Stage-1 precision, got {actions.dtype}"
+                )
+
+            for row in rank_rows:
+                offset = int(row["offset"])
+                if offset < 0 or offset >= n:
+                    raise ValueError(
+                        f"latent cache row offset out of range: rank={rank}, offset={offset}, size={n}"
+                    )
+                slot = (rank, offset)
+                if slot in seen_slots:
+                    raise ValueError(f"duplicate latent cache rank/offset slot: {slot}")
+                seen_slots.add(slot)
+            total_slots += len(rank_rows)
+
+            if require_complete_windows:
+                # Phase/effect cache-v4 uses all-ones masks.  Refuse to silently
+                # turn a padded Stage-1 source window into a valid full-prefix step.
+                if not bool(np.asarray(frame_valid, dtype=np.bool_).all()):
+                    raise ValueError(f"rank {rank} latent cache contains invalid/padded frame boundaries")
+                if not bool(np.asarray(transition_valid, dtype=np.bool_).all()):
+                    raise ValueError(f"rank {rank} latent cache contains invalid/padded transitions")
+
+        if total_slots != len(self.rows):
+            raise RuntimeError(
+                f"latent cache storage validation counted {total_slots} rows, expected {len(self.rows)}"
+            )
+        return {"rows": len(self.rows), "ranks": len(rows_by_rank)}
 
     def __len__(self) -> int:
         return len(self.rows)

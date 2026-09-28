@@ -8,7 +8,7 @@ export DIFFSYNTH_MODEL_BASE_PATH=/data/share/1919650160032350208/zjj/fastwam/che
 # Examples:
 #   GPU_IDS=0,1 bash scripts/build_zeva_robotwin_cache_from_latents.sh
 #   GPU_IDS=0,1,2,...,15 bash scripts/build_zeva_robotwin_cache_from_latents.sh
-GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
+GPU_IDS="${GPU_IDS:-0,1}"
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 IFS=',' read -ra GPU_ARRAY <<< "${GPU_IDS}"
 NPROC_PER_NODE="${#GPU_ARRAY[@]}"
