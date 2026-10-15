@@ -66,7 +66,7 @@ def test_exact_zeva_adapter_has_separate_prefix_and_action_prior_branches():
     assert torch.count_nonzero(pim_prefix) > 0
 
 
-def test_exact_zeva_prompt_uses_an_independent_context_slot():
+def test_exact_zeva_behavior_slot_is_static_prefix_plus_gated_causal_prompt():
     cfg = ExactZevaPolicyInjectionConfig(
         memory_dim=8, context_dim=16, global_dim=8, phase_dim=4, effect_dim=4,
         effect_history_length=2, action_dim=3, action_horizon=5,
@@ -75,24 +75,33 @@ def test_exact_zeva_prompt_uses_an_independent_context_slot():
     adapter = ExactZevaPolicyInjectionAdapter(cfg)
     with torch.no_grad():
         adapter.pim_gate.fill_(0.5)
-    context = torch.randn(2, 3, 16)
-    original_context = context.clone()
-    context_mask = torch.tensor([[True, True, False], [True, False, False]])
     causal_prompt = torch.randn(2, 8)
     pim_mask = torch.tensor([[True, True, True, True], [False, False, False, False]])
     task = torch.randn(2, 8)
-    augmented, augmented_mask = adapter.prepend_behavior_prefix_slot(
-        context, context_mask, causal_prompt, pim_mask, task_tokens=task
+    base = adapter.behavior_global_projector(task)[:, None]
+    pim_delta = adapter.causal_prompt_prefix(causal_prompt, pim_mask)
+    slot = adapter.behavior_prefix_slot(task, causal_prompt, pim_mask)
+    torch.testing.assert_close(slot, base + pim_delta)
+    torch.testing.assert_close(slot[1], base[1])
+
+
+def test_legacy_context_prepend_helper_is_only_backward_compatibility():
+    cfg = ExactZevaPolicyInjectionConfig(
+        memory_dim=8, context_dim=16, global_dim=8, phase_dim=4, effect_dim=4,
+        effect_history_length=2, action_dim=3, action_horizon=5,
+        prior_hidden_dim=8, prior_num_heads=2, action_hidden_dim=6,
     )
-    assert augmented.shape == (2, 4, 16)
-    assert augmented_mask.shape == (2, 4)
-    expected_slot = adapter.behavior_prefix_slot(task, causal_prompt, pim_mask)
-    torch.testing.assert_close(augmented[:, :1], expected_slot)
+    adapter = ExactZevaPolicyInjectionAdapter(cfg)
+    context = torch.randn(2, 3, 16)
+    original = context.clone()
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    augmented, augmented_mask = adapter.prepend_behavior_prefix_slot(
+        context, mask, torch.randn(2, 8), torch.ones(2, 4, dtype=torch.bool),
+        task_tokens=torch.randn(2, 8),
+    )
     torch.testing.assert_close(augmented[:, 1:], context)
-    torch.testing.assert_close(augmented_mask[:, 1:], context_mask)
-    assert torch.equal(augmented_mask[:, 0], torch.ones(2, dtype=torch.bool))
-    # The instruction context remains byte-for-byte unchanged.
-    assert torch.equal(context, original_context)
+    torch.testing.assert_close(augmented_mask[:, 1:], mask)
+    assert torch.equal(context, original)
 
 
 def test_pim_disable_preserves_the_global_behavior_prefix():

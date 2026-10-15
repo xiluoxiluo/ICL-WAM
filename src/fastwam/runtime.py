@@ -189,7 +189,9 @@ def create_fastwam(
             # from memory_residual to the exact two-branch adapter.
             if "prompt_gate_init" not in exact_cfg and "gate_init" in adapter_cfg:
                 exact_cfg["prompt_gate_init"] = adapter_cfg["gate_init"]
-            exact_cfg.setdefault("context_dim", int(video_dit_config["text_dim"]))
+            # Zeva's behavior projectors output policy hidden size directly.
+            # The FastWAM behavior token lives on the video-side MoT prefix.
+            exact_cfg.setdefault("context_dim", int(video_dit_config["hidden_dim"]))
             exact_cfg.setdefault("action_dim", int(action_dit_config["action_dim"]))
             exact_cfg.setdefault("action_hidden_dim", int(action_dit_config["hidden_dim"]))
             policy_adapter = ExactZevaPolicyInjectionAdapter(

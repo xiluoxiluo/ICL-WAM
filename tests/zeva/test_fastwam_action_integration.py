@@ -66,16 +66,21 @@ class _InferenceActionExpert(nn.Module):
 class _InferenceVideoExpert(nn.Module):
     video_attention_mask_mode = "first_frame_causal"
     fuse_vae_embedding_in_latents = False
+    hidden_dim = 8
+
+    def build_video_to_video_mask(self, video_seq_len, video_tokens_per_frame, device):
+        return torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
 
     def prepare(self, x, timestep, context, context_mask, **kwargs):
-        tokens = x.new_zeros((x.shape[0], 1, 8))
+        tokens = x.new_zeros((x.shape[0], 1, self.hidden_dim))
+        expanded_mask = context_mask.unsqueeze(1).expand(-1, tokens.shape[1], -1)
         return (
             tokens,
             timestep,
-            torch.ones_like(tokens),
+            torch.ones(tokens.shape[0], tokens.shape[1], 6, tokens.shape[2]),
             context,
-            context_mask,
-            torch.zeros(1, 1),
+            expanded_mask,
+            torch.zeros(tokens.shape[1], 1),
             1,
             1,
             1,
@@ -85,11 +90,11 @@ class _InferenceVideoExpert(nn.Module):
 
 class _InferenceMoT(nn.Module):
     def prefill_video_cache_tensor(self, video_tokens, **kwargs):
-        cache = [video_tokens.new_zeros((video_tokens.shape[0], 1, 1, 1))]
-        return cache, [value.clone() for value in cache]
+        summary = video_tokens.mean(dim=1, keepdim=True)
+        return [summary], [summary.clone()]
 
-    def forward_action_with_video_cache_tensor(self, action_tokens, **kwargs):
-        return action_tokens
+    def forward_action_with_video_cache_tensor(self, action_tokens, video_cache_k, **kwargs):
+        return action_tokens + video_cache_k[0]
 
 
 class _InferenceScheduler:
@@ -144,7 +149,7 @@ def _inference_model():
     model.zeva_behavior_prefix_adapter = ExactZevaPolicyInjectionAdapter(
         ExactZevaPolicyInjectionConfig(
             memory_dim=8,
-            context_dim=4,
+            context_dim=8,
             global_dim=8,
             phase_dim=4,
             effect_dim=4,
@@ -317,47 +322,59 @@ def test_nonzero_addon_gate_changes_action_path():
     assert not torch.equal(base, conditioned)
 
 
-def test_exact_model_owns_the_independent_behavior_prefix_slot():
+def test_exact_model_puts_behavior_prefix_in_main_mot_stream():
     model = _model()
+    model.video_expert = _InferenceVideoExpert()
     model.zeva_injection_mode = "exact_zeva"
     model.zeva_behavior_prefix_adapter = ExactZevaPolicyInjectionAdapter(
         ExactZevaPolicyInjectionConfig(
-            memory_dim=8,
-            context_dim=4,
-            global_dim=8,
-            phase_dim=4,
-            effect_dim=4,
-            effect_history_length=2,
-            action_dim=3,
-            action_horizon=5,
-            prior_hidden_dim=8,
-            prior_num_heads=2,
-            action_hidden_dim=8,
+            memory_dim=8, context_dim=8, global_dim=8, phase_dim=4, effect_dim=4,
+            effect_history_length=2, action_dim=3, action_horizon=5,
+            prior_hidden_dim=8, prior_num_heads=2, action_hidden_dim=8,
         )
     )
     with torch.no_grad():
         model.zeva_behavior_prefix_adapter.pim_gate.fill_(0.5)
-    context = torch.randn(1, 3, 4)
-    context_mask = torch.tensor([[True, True, False]])
     memory = torch.randn(1, 8)
     memory_mask = torch.ones(1, 4, dtype=torch.bool)
     task = torch.randn(1, 8)
-    augmented, augmented_mask = model._prepend_exact_zeva_behavior_slot(
-        context, context_mask, memory, memory_mask, task_tokens=task
+    behavior = model._build_exact_zeva_behavior_token(memory, memory_mask, task)
+    expected = model.zeva_behavior_prefix_adapter.behavior_prefix_slot(
+        task, memory, memory_mask
     )
-    assert augmented.shape == (1, 4, 4)
-    assert augmented_mask.tolist() == [[True, True, True, False]]
-    torch.testing.assert_close(augmented[:, 1:], context)
-    torch.testing.assert_close(augmented_mask[:, 1:], context_mask)
+    torch.testing.assert_close(behavior, expected)
 
-    # Legacy adapters keep their old action-hidden path and do not acquire a
-    # context slot implicitly.
-    model.zeva_injection_mode = "memory_residual"
-    same_context, same_mask = model._prepend_exact_zeva_behavior_slot(
-        context, context_mask, memory, memory_mask, task
+    video = torch.randn(1, 2, 8)
+    t_mod = torch.randn(1, 2, 6, 8)
+    freqs = torch.randn(2, 1)
+    video_context_mask = torch.ones(1, 2, 3, dtype=torch.bool)
+    stream, stream_t, stream_f, stream_ctx, prefix_len = (
+        model._prepend_exact_zeva_behavior_token_to_video_stream(
+            behavior, video, t_mod, freqs, video_context_mask
+        )
     )
-    assert same_context is context
-    assert same_mask is context_mask
+    assert prefix_len == 1
+    torch.testing.assert_close(stream[:, :1], behavior)
+    torch.testing.assert_close(stream[:, 1:], video)
+    assert torch.count_nonzero(stream_t[:, :1]) == 0
+    assert torch.equal(stream_f[:1], torch.ones_like(stream_f[:1]))
+    assert not stream_ctx[:, :1].any()
+
+
+def test_exact_zeva_attention_mask_exposes_prefix_to_video_and_action():
+    model = _model()
+    model.video_expert = _InferenceVideoExpert()
+    mask = model._build_mot_attention_mask(
+        video_seq_len=3,
+        action_seq_len=2,
+        video_tokens_per_frame=2,
+        device=torch.device("cpu"),
+        behavior_prefix_len=1,
+    )
+    assert mask[0].tolist() == [True, False, False, False, False]
+    assert mask[1, 0] and mask[2, 0]
+    assert mask[3].tolist() == [True, True, True, True, True]
+    assert mask[4].tolist() == [True, True, True, True, True]
 
 
 def test_conditioned_action_path_reports_residual_debug_metrics():

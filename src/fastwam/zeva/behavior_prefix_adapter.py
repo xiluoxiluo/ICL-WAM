@@ -1,4 +1,4 @@
-"""Map causal memory tokens to FastWAM action hidden-space residuals."""
+"""Zeva behavior-prefix and action-prior adapters for FastWAM."""
 
 from __future__ import annotations
 
@@ -361,14 +361,11 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         *,
         enable_pim: bool = True,
     ) -> tuple[Tensor, Tensor]:
-        """Prepend one independent Causal-Prompt slot to FastWAM context.
+        """Legacy compatibility helper for the former context-token path.
 
-        Zeva reserves a learned behavior slot before the language prefix in its
-        packed sequence.  FastWAM has separate video/action experts whose
-        conditioning enters through cross-attention, so the equivalent slot is
-        a dedicated context token before the original text tokens.  The slot
-        contains the task base prefix plus the gated Causal Prompt residual;
-        the original text tensor and mask are copied unchanged after it.
+        This helper is intentionally NOT used by ``exact_zeva`` anymore.
+        Exact Zeva consumes :meth:`behavior_prefix_slot` as a main MoT prefix
+        token and leaves instruction context unchanged.
         """
         if context.ndim != 3 or context_mask.shape != context.shape[:2]:
             raise ValueError("context/context_mask shapes do not match")

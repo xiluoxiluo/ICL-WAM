@@ -139,14 +139,74 @@ class MoT(nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
     ) -> torch.Tensor:
-        x = block.gate(residual_x, gate_msa, block.self_attn.o(mixed_attn_out))
-        x = x + block.cross_attn(
-            block.norm3(x),
-            context,
-            ctx_mask=context_mask.unsqueeze(1),
+        x = block.gate(
+            residual_x,
+            gate_msa,
+            block.self_attn.o(mixed_attn_out),
         )
-        mlp_input = modulate(block.norm2(x), shift_mlp, scale_mlp)
-        return block.gate(x, gate_mlp, block.ffn(mlp_input))
+
+        # Some main-stream tokens intentionally do not read text context.
+        # In exact-Zeva this is the Behavior Prefix token.
+        #
+        # Do not feed an all-False query row directly into CUDA SDPA:
+        # depending on backend / dtype this can generate non-finite values.
+        #
+        # For such rows we temporarily expose one key only to keep SDPA
+        # numerically well-defined, then explicitly zero the cross-attention
+        # result.  Semantically the token still receives NO text information.
+        if context_mask.ndim != 3:
+            raise ValueError(
+                "tensor MoT context_mask must be [B,S,L], "
+                f"got {tuple(context_mask.shape)}"
+            )
+
+        if context_mask.shape[-1] < 1:
+            raise ValueError("cross-attention context must contain at least one token")
+
+        query_has_context = context_mask.any(dim=-1)  # [B,S]
+
+        if bool(query_has_context.all()):
+            cross = block.cross_attn(
+                block.norm3(x),
+                context,
+                ctx_mask=context_mask.unsqueeze(1),
+            )
+        else:
+            safe_mask = context_mask.clone()
+
+            missing_b, missing_s = (~query_has_context).nonzero(
+                as_tuple=True
+            )
+
+            # Give SDPA one numerically valid key for otherwise empty rows.
+            safe_mask[missing_b, missing_s, 0] = True
+
+            cross = block.cross_attn(
+                block.norm3(x),
+                context,
+                ctx_mask=safe_mask.unsqueeze(1),
+            )
+
+            # Restore the intended semantics:
+            # all-masked queries receive exactly zero cross-attention update.
+            cross = torch.where(
+                query_has_context.unsqueeze(-1),
+                cross,
+                torch.zeros_like(cross),
+            )
+
+        x = x + cross
+
+        mlp_input = modulate(
+            block.norm2(x),
+            shift_mlp,
+            scale_mlp,
+        )
+        return block.gate(
+            x,
+            gate_mlp,
+            block.ffn(mlp_input),
+        )
 
     def _build_expert_attention_io(
         self,
