@@ -85,7 +85,8 @@ python -m py_compile \
     "$ROOT/src/fastwam/trainer.py" \
     "$ROOT/src/fastwam/models/wan22/fastwam.py" \
     "$ROOT/src/fastwam/models/wan22/mot.py" \
-    "$ROOT/src/fastwam/zeva/behavior_prefix_adapter.py"
+    "$ROOT/src/fastwam/zeva/behavior_prefix_adapter.py" \
+    "$ROOT/experiments/robotwin/fastwam_policy/deploy_policy.py"
 
 if ! grep -q "_prepend_exact_zeva_behavior_token_to_video_stream" "$ROOT/src/fastwam/models/wan22/fastwam.py"; then
     echo "[ERROR] exact-ZeVA main-stream Behavior Prefix patch is missing." >&2
