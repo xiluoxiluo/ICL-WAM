@@ -39,6 +39,7 @@ from fastwam.zeva import (
     TaskContextBank,
     retrieve_task_context,
 )
+from fastwam.zeva.attempt_protocol import inference_seed
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.static_task_context import (
     StaticTaskContextRetriever, StaticTaskContextSession, task_context_identity,
@@ -436,6 +437,9 @@ class WorldActionRobotWinPolicy:
         self.num_inference_steps = int(num_inference_steps)
         self.sigma_shift = sigma_shift
         self.seed = seed
+        self._attempt_id = 0
+        self._replan_index = 0
+        self._last_inference_seed = seed
         self.text_cfg_scale = float(text_cfg_scale)
         self.negative_prompt = str(negative_prompt)
         self.rand_device = str(rand_device)
@@ -483,9 +487,6 @@ class WorldActionRobotWinPolicy:
             raise ValueError("Expected exactly one merged state key in shape_meta['state'].")
         state_key = state_meta[0]["key"]
         action = action.to(dtype=torch.float32, device="cpu")
-        # Reconstruct the processor's complete inverse (merger, normalizer,
-        # and optional task-specific transforms), keeping action normalization
-        # identical to the dataset and online CTE input path.
         dummy_state = torch.zeros(
             (action.shape[0], 1, state_meta[0]["shape"]), dtype=action.dtype
         )
@@ -512,9 +513,6 @@ class WorldActionRobotWinPolicy:
         value = torch.as_tensor(action, dtype=torch.float32).reshape(1, -1)
         if value.shape[-1] != action_meta[0]["raw_shape"]:
             raise ValueError(f"Expected raw action dim {action_meta[0]['raw_shape']}, got {value.shape[-1]}")
-        # Use the exact processor transform/normalizer path used by training.
-        # The merger requires a state field, so provide a throwaway zero state;
-        # action transforms are allowed to inspect it but no state is retained.
         state_value = torch.zeros((1, state_meta[0]["raw_shape"]), dtype=value.dtype) if state is None else torch.as_tensor(state, dtype=value.dtype).reshape(1, -1)
         if state_value.shape[-1] != state_meta[0]["raw_shape"]:
             raise ValueError(f"Expected raw state dim {state_meta[0]['raw_shape']}, got {state_value.shape[-1]}")
@@ -536,9 +534,6 @@ class WorldActionRobotWinPolicy:
             rgb = np.asarray(obs_data[key]["rgb"])
             if rgb.ndim != 3 or rgb.shape[-1] != 3:
                 raise ValueError(f"{key}.rgb must be an HxWx3 array, got {rgb.shape}")
-        # The training path first applies the per-camera processor resize to
-        # [240,320], then builds the fixed RoboTwin mosaic.  Repeating both
-        # stages online prevents a silent train/deploy RGB distribution shift.
         head_raw = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 240))
         left_raw = _resize_rgb(obs_data["left_camera"]["rgb"], (320, 240))
         right_raw = _resize_rgb(obs_data["right_camera"]["rgb"], (320, 240))
@@ -546,7 +541,7 @@ class WorldActionRobotWinPolicy:
         left = _resize_rgb(left_raw, (160, 128))
         right = _resize_rgb(right_raw, (160, 128))
         bottom = np.concatenate([left, right], axis=1)
-        image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
+        image = np.concatenate([head, bottom], axis=0)
 
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
             device=self.model.device,
@@ -576,8 +571,6 @@ class WorldActionRobotWinPolicy:
                 context, _context_mask = self.model.encode_prompt(prompt)
                 task_dim = int(self.model.zeva_prompt_encoder.config.global_dim)
                 if self.zeva_mode == "pim_shadow":
-                    # Shadow mode exercises CTE/BIT/PIM retrieval but must not
-                    # depend on task-context artifacts or an addon checkpoint.
                     task_tokens = torch.zeros(
                         (1, task_dim), device=self.model.device, dtype=self.model.torch_dtype
                     )
@@ -641,6 +634,7 @@ class WorldActionRobotWinPolicy:
                     zeva_action_residual = adapter.action_prior_residual(
                         prior_mean, training=False
                     )
+            request_seed = inference_seed(self.seed, self._attempt_id, self._replan_index)
             infer_kwargs = {
                 "prompt": None,
                 "context": context,
@@ -659,7 +653,7 @@ class WorldActionRobotWinPolicy:
                 "text_cfg_scale": self.text_cfg_scale,
                 "num_inference_steps": self.num_inference_steps,
                 "sigma_shift": self.sigma_shift,
-                "seed": self.seed,
+                "seed": request_seed,
                 "rand_device": self.rand_device,
                 "tiled": self.tiled,
             }
@@ -668,6 +662,18 @@ class WorldActionRobotWinPolicy:
                 pred = self.model.infer_action_zeva(**infer_kwargs)
             if self.timing_enabled:
                 self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+            self._last_inference_seed = request_seed
+            gate = float(torch.tanh(self.model.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
+            logger.info(
+                "Zeva request | attempt=%d replan=%d seed=%s pim_count=%d gate=%.6f mode=%s",
+                self._attempt_id,
+                self._replan_index,
+                str(request_seed),
+                int(pim_mask.sum().item()),
+                gate,
+                self.zeva_mode,
+            )
+            self._replan_index += 1
             return self._denormalize_action(pred["action"])[0]
         infer_kwargs = {
             "prompt": prompt,
@@ -690,8 +696,8 @@ class WorldActionRobotWinPolicy:
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
 
-        action_tensor = pred["action"]  # [T, D]
-        action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
+        action_tensor = pred["action"]
+        action_chunk = self._denormalize_action(action_tensor)[0]
         return action_chunk
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
@@ -705,10 +711,6 @@ class WorldActionRobotWinPolicy:
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
         if self.zeva_mode != "base" and observation is not None and self._cte_history is not None:
-            # The observation is the after-frame for the oldest complete group
-            # of four actions.  RoboTwin supplies one observation per low-level
-            # action; consume at most one group so an observation is never
-            # incorrectly reused for a later group.
             next_image = self._build_robotwin_image_tensor(observation)[0].float()
             if len(self._transition_actions) >= self.cte.cfg.transition_steps:
                 action_group = torch.stack(self._transition_actions[: self.cte.cfg.transition_steps]).to(self.model.device)
@@ -771,24 +773,26 @@ class WorldActionRobotWinPolicy:
         self._observed_effect_count = 0
         self._transition_actions.clear()
         self._attempt_finalized = False
+        self._attempt_id = 0
+        self._replan_index = 0
+        self._last_inference_seed = self.seed
         if self.zeva_mode != "base":
-            # The evaluator calls reset for both new episodes and retries.  A
-            # retry explicitly follows with begin_attempt(), which preserves
-            # the current episode's PIM; otherwise the next inference starts a
-            # fresh episode and clears PIM.
             self._needs_episode_reset = True
 
     def begin_attempt(self, attempt_id: int) -> None:
-        """Reset transient CTE/BIT state while retaining episode-scoped PIM."""
+        """Reset transient CTE/BIT while preserving episode PIM and seed schedule."""
         if getattr(self, "_static_task_context_session", None) is not None:
             self._static_task_context_session.reset()
         self._last_task_context_retrieval = None
+        attempt_id = int(attempt_id)
+        if attempt_id < 0:
+            raise ValueError("attempt_id must be non-negative")
+        self._attempt_id = attempt_id
+        self._replan_index = 0
+        self._last_inference_seed = inference_seed(self.seed, attempt_id, 0)
         if self.lifecycle is None:
             return
-        attempt_id = int(attempt_id)
         if attempt_id == 0:
-            # Attempt zero always starts a new fixed episode.  The lifecycle is
-            # initialized lazily once the first observation/instruction arrives.
             self._cte_history = None
             self._observed_effect_count = 0
             self._transition_actions.clear()
@@ -804,18 +808,10 @@ class WorldActionRobotWinPolicy:
         self._needs_episode_reset = self.lifecycle.pim.task_cluster is None
 
     def finalize_attempt(self, task_env, success: bool = False) -> None:
-        """Finalize one normally completed attempt, including failures.
-
-        RoboTwin performs the terminal ``get_obs()`` inside ``take_action``
-        before setting ``eval_success``; the evaluator exits its control loop
-        immediately afterwards, so the normal next-step update would otherwise
-        never see this final after-frame.
-        """
+        """Finalize one normally completed attempt, including failures."""
         if self._attempt_finalized:
             return
 
-        # Base mode has no lifecycle state, but still clear transient actions
-        # so a policy object can be safely reused by the evaluator.
         if self.zeva_mode == "base" or self.cte is None or self.lifecycle is None:
             self._transition_actions.clear()
             self._attempt_finalized = True
@@ -826,9 +822,6 @@ class WorldActionRobotWinPolicy:
             has_terminal_obs = isinstance(terminal_obs, dict) and "observation" in terminal_obs
             has_complete_tail = len(self._transition_actions) == self.cte.cfg.transition_steps
 
-            # Only a complete four-action group paired with a trustworthy
-            # after-frame may be appended.  Incomplete tails are discarded,
-            # never padded or otherwise fabricated.
             if has_terminal_obs and has_complete_tail and self._cte_history is not None:
                 next_image = self._build_robotwin_image_tensor(terminal_obs)[0].float()
                 action_group = torch.stack(self._transition_actions).to(self.model.device)
@@ -852,15 +845,10 @@ class WorldActionRobotWinPolicy:
                     self._observed_effect_count += 1
 
             self._transition_actions.clear()
-            # Commit effects observed earlier in this attempt even when the
-            # terminal tail was incomplete or no reliable terminal frame was
-            # available.
             if self.lifecycle.pim.task_cluster is not None:
                 self.lifecycle.end_attempt()
             self._attempt_finalized = True
         except Exception:
-            # Keep the guard unset so callers may retry after an operational
-            # failure; do not claim the attempt was finalized prematurely.
             raise
 
 
@@ -890,9 +878,6 @@ def get_model(usr_args: Dict[str, Any]):
     mixed_precision = str(usr_args.get("mixed_precision") or cfg.get("mixed_precision", "bf16"))
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     if device == "cpu" and model_dtype in {torch.float16, torch.bfloat16}:
-        # Several Wan/attention kernels are not implemented for reduced
-        # precision CPU execution.  Keep the explicit CPU fallback usable for
-        # smoke tests; production RoboTwin runs should use CUDA.
         logger.warning("Using float32 for CPU evaluation because mixed precision=%s is CUDA-oriented.", mixed_precision)
         model_dtype = torch.float32
 

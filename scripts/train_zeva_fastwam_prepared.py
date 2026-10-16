@@ -3,13 +3,16 @@
 This entrypoint preserves the model/trainer semantics of train_zeva_fastwam.py
 but replaces expensive per-sample Python PIM retrieval and per-startup static
 retrieval with immutable, identity-checked prepared artifacts.
+
+For ``pim_adapter`` training the prepared tensors are wrapped with Zeva's
+context/support dropout.  Keeping this here, at the formal training entrypoint,
+prevents the YAML knobs from becoming dead configuration again.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 import os
-import json
 
 import hydra
 import torch
@@ -19,6 +22,11 @@ from omegaconf import DictConfig
 from fastwam.runtime import _mixed_precision_to_model_dtype
 from fastwam.trainer import Wan22Trainer
 from fastwam.zeva.checkpoint import checkpoint_sha256
+from fastwam.zeva.pim_training import (
+    PIMTrainingDropoutConfig,
+    PIMTrainingDropoutDataset,
+    apply_pim_training_dropout,
+)
 from fastwam.zeva.prepared_stage2 import (
     PreparedPIMCache,
     PreparedZevaStage2Dataset,
@@ -50,6 +58,51 @@ def _resolve_process_device() -> torch.device:
     return torch.device(f"cuda:{local_rank}")
 
 
+def _dropout_config(cfg: DictConfig) -> PIMTrainingDropoutConfig:
+    prompt = cfg.model.zeva.prompt
+    return PIMTrainingDropoutConfig(
+        context_dropout=float(prompt.get("pim_context_dropout", 0.2)),
+        support_dropout=float(prompt.get("pim_support_dropout", 0.2)),
+        seed=int(cfg.seed),
+    )
+
+
+def _print_pim_dropout_probe(
+    pim_cache: PreparedPIMCache,
+    config: PIMTrainingDropoutConfig,
+    *,
+    count: int = 256,
+) -> None:
+    """Verify empty/sparse/full occupancy without decoding any training video."""
+    probe = min(int(count), len(pim_cache))
+    if probe <= 0:
+        raise ValueError("Stage-2B prepared PIM cache is empty")
+    histogram: dict[int, int] = {}
+    context_drops = 0
+    for index in range(probe):
+        prepared = pim_cache.get(index)
+        result = apply_pim_training_dropout(
+            phases=prepared["pim_phases"],
+            effects=prepared["pim_effects"],
+            valid=prepared["pim_mask"],
+            scores=prepared["pim_scores"],
+            sample_index=index,
+            config=config,
+        )
+        after = int(result["count_after"].item())
+        histogram[after] = histogram.get(after, 0) + 1
+        context_drops += int(bool(result["context_dropped"].item()))
+    print(
+        f"PIM dropout probe ({probe} prepared queries): "
+        f"counts={dict(sorted(histogram.items()))} context_drops={context_drops}"
+    )
+    if len(histogram) < 2:
+        raise RuntimeError(
+            "PIM dropout preflight produced only one occupancy value. "
+            "Stage2B would not see the empty/sparse/full memory distribution required by Zeva."
+        )
+
+
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     if not torch.cuda.is_available():
@@ -63,6 +116,9 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("Stage-2 requires action_video_freq_ratio=4")
 
     zeva = cfg.model.zeva
+    training_stage = str(zeva.training_stage)
+    if training_stage not in {"policy_injection", "pim_adapter"}:
+        raise ValueError(f"unsupported Zeva Stage-2 training_stage={training_stage!r}")
     if str(zeva.task_context.mode) != "static":
         raise ValueError("formal prepared Stage-2 requires task_context.mode=static")
     if str(zeva.memory.pim_retrieval_mode) != "phase":
@@ -169,6 +225,18 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("Stage-2 dataset semantic identity mismatch")
     dataset = PreparedZevaStage2Dataset(base, pim, static_context)
 
+    dropout = None
+    if training_stage == "pim_adapter":
+        dropout = _dropout_config(cfg)
+        if dropout.context_dropout <= 0.0 and dropout.support_dropout <= 0.0:
+            raise ValueError(
+                "pim_adapter training requires non-zero PIM context/support dropout; "
+                "otherwise every sample sees the same dense top-k memory."
+            )
+        if int(os.environ.get("RANK", "0")) == 0:
+            _print_pim_dropout_probe(pim, dropout)
+        dataset = PIMTrainingDropoutDataset(dataset, dropout)
+
     model = instantiate(
         cfg.model,
         model_dtype=_mixed_precision_to_model_dtype(str(cfg.mixed_precision)),
@@ -183,10 +251,16 @@ def main(cfg: DictConfig) -> None:
     )
 
     print("========== prepared Stage-2 ==========")
-    print(f"training_stage: {zeva.training_stage}")
+    print(f"training_stage: {training_stage}")
     print(f"dataset queries: {len(dataset):,}")
     print(f"prepared PIM: {pim_root}")
     print(f"static context: {static_path}")
+    if dropout is not None:
+        print(
+            "PIM training dropout: "
+            f"context={dropout.context_dropout:.3f} "
+            f"support={dropout.support_dropout:.3f} seed={dropout.seed}"
+        )
     print(f"base sha256: {base_sha}")
     print(f"CTE sha256: {cte_sha}")
     print(f"semantic map sha256: {semantic_sha}")
