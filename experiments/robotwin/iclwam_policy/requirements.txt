@@ -1,0 +1,2 @@
+Flask>=2.3
+json-numpy>=2.1
