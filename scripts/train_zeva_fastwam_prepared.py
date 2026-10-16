@@ -22,7 +22,11 @@ from omegaconf import DictConfig
 from fastwam.runtime import _mixed_precision_to_model_dtype
 from fastwam.trainer import Wan22Trainer
 from fastwam.zeva.checkpoint import checkpoint_sha256
-from fastwam.zeva.pim_training import PIMTrainingDropoutConfig, PIMTrainingDropoutDataset
+from fastwam.zeva.pim_training import (
+    PIMTrainingDropoutConfig,
+    PIMTrainingDropoutDataset,
+    apply_pim_training_dropout,
+)
 from fastwam.zeva.prepared_stage2 import (
     PreparedPIMCache,
     PreparedZevaStage2Dataset,
@@ -63,19 +67,35 @@ def _dropout_config(cfg: DictConfig) -> PIMTrainingDropoutConfig:
     )
 
 
-def _print_pim_dropout_probe(dataset, *, count: int = 128) -> None:
-    """Fail fast if Stage2B silently returns a permanently full top-k PIM."""
-    probe = min(int(count), len(dataset))
+def _print_pim_dropout_probe(
+    pim_cache: PreparedPIMCache,
+    config: PIMTrainingDropoutConfig,
+    *,
+    count: int = 256,
+) -> None:
+    """Verify empty/sparse/full occupancy without decoding any training video."""
+    probe = min(int(count), len(pim_cache))
     if probe <= 0:
-        raise ValueError("Stage-2B dataset is empty")
+        raise ValueError("Stage-2B prepared PIM cache is empty")
     histogram: dict[int, int] = {}
     context_drops = 0
     for index in range(probe):
-        sample = dataset[index]
-        after = int(torch.as_tensor(sample["pim_count_after"]).item())
+        prepared = pim_cache.get(index)
+        result = apply_pim_training_dropout(
+            phases=prepared["pim_phases"],
+            effects=prepared["pim_effects"],
+            valid=prepared["pim_mask"],
+            scores=prepared["pim_scores"],
+            sample_index=index,
+            config=config,
+        )
+        after = int(result["count_after"].item())
         histogram[after] = histogram.get(after, 0) + 1
-        context_drops += int(bool(torch.as_tensor(sample["pim_context_dropped"]).item()))
-    print(f"PIM dropout probe ({probe} samples): counts={dict(sorted(histogram.items()))} context_drops={context_drops}")
+        context_drops += int(bool(result["context_dropped"].item()))
+    print(
+        f"PIM dropout probe ({probe} prepared queries): "
+        f"counts={dict(sorted(histogram.items()))} context_drops={context_drops}"
+    )
     if len(histogram) < 2:
         raise RuntimeError(
             "PIM dropout preflight produced only one occupancy value. "
@@ -213,11 +233,9 @@ def main(cfg: DictConfig) -> None:
                 "pim_adapter training requires non-zero PIM context/support dropout; "
                 "otherwise every sample sees the same dense top-k memory."
             )
-        dataset = PIMTrainingDropoutDataset(dataset, dropout)
-        # Run only on rank 0; this probes the exact formal dataset path before
-        # the multi-billion-parameter model is instantiated.
         if int(os.environ.get("RANK", "0")) == 0:
-            _print_pim_dropout_probe(dataset)
+            _print_pim_dropout_probe(pim, dropout)
+        dataset = PIMTrainingDropoutDataset(dataset, dropout)
 
     model = instantiate(
         cfg.model,
