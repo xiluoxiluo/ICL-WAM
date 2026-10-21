@@ -1,6 +1,6 @@
 import math
 from copy import deepcopy
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -123,7 +123,7 @@ def _model():
     return model
 
 
-def _inference_model():
+def _inference_model(pim_variant="legacy"):
     model = FastWAM.__new__(FastWAM)
     nn.Module.__init__(model)
     model.device = torch.device("cpu")
@@ -144,6 +144,7 @@ def _inference_model():
             persistent_length=2,
             hidden_dim=8,
             num_heads=2,
+            pim_variant=pim_variant,
         )
     )
     model.zeva_behavior_prefix_adapter = ExactZevaPolicyInjectionAdapter(
@@ -160,6 +161,7 @@ def _inference_model():
             prior_num_heads=2,
             action_hidden_dim=8,
             prior_dropout_rate=0.0,
+            pim_variant=pim_variant,
         )
     )
     model.zeva_injection_mode = "exact_zeva"
@@ -705,3 +707,82 @@ def test_policy_injection_step_does_not_modify_fastwam():
     assert before.keys() == after.keys()
     for name in before:
         torch.testing.assert_close(before[name], after[name], rtol=0.0, atol=0.0)
+
+
+def test_cross_attempt_stage2b_forward_trains_both_paths_and_freezes_parent():
+    from fastwam.models.wan22.schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
+
+    torch.manual_seed(59)
+    model = _inference_model("cross_attempt")
+    model.zeva_task_context_mode = "static"
+    model.vae = SimpleNamespace(
+        model=SimpleNamespace(encode=lambda video, scale: video.new_zeros((video.shape[0], 4, 1, 1, 1))),
+        scale=None,
+    )
+    model.train_action_scheduler = WanContinuousFlowMatchScheduler()
+    model.configure_zeva_trainable_state()
+    model.zeva_parameter_report()
+    parent_before = {
+        name: p.detach().clone() for name, p in model.named_parameters() if not p.requires_grad
+    }
+    sample = {
+        "_training_mode": "zeva_stage2",
+        "video": torch.zeros(2, 3, 1, 16, 16),
+        "action": torch.randn(2, 32, 14),
+        "action_valid": torch.ones(2, 32, dtype=torch.bool),
+        "context": torch.zeros(2, 3, 4),
+        "context_mask": torch.ones(2, 3, dtype=torch.bool),
+        "task_context": torch.randn(2, 8),
+        "phase": torch.randn(2, 4),
+        "bit_effects": torch.randn(2, 2, 4),
+        "bit_mask": torch.ones(2, 2, dtype=torch.bool),
+        "pim_phases": torch.randn(2, 2, 4),
+        "pim_effects": torch.randn(2, 2, 4),
+        "pim_mask": torch.ones(2, 2, dtype=torch.bool),
+    }
+    optimizer = torch.optim.AdamW(model.zeva_trainable_parameters(), lr=5e-5)
+    loss, metrics = model(sample)
+    assert loss.item() == pytest.approx(
+        metrics["loss_flow"] + 0.01 * metrics["behavior_prior_nll"], rel=1e-6,
+    )
+    assert metrics["memory/prefix_delta_norm"] > 0
+    assert metrics["memory/prior_mean_delta_rms"] == 0.0
+    assert metrics["memory/scalar_gate_active"] == 0.0
+    loss.backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in model.zeva_prompt_encoder.parameters())
+    assert model.zeva_behavior_prefix_adapter.pim_to_global.weight.grad.abs().sum() > 0
+    optimizer.step()
+    for name, original in parent_before.items():
+        torch.testing.assert_close(model.get_parameter(name), original, rtol=0, atol=0)
+
+
+def test_cross_attempt_same_noise_on_off_recomputes_prefix_and_prior():
+    torch.manual_seed(61)
+    model = _inference_model("cross_attempt")
+    adapter = model.zeva_behavior_prefix_adapter
+    with torch.no_grad():
+        adapter.pim_to_global.weight.normal_(std=0.2)
+        adapter.action_prior_adapter.weight.normal_(std=0.1)
+    task = torch.randn(1, 8)
+    prompt = torch.randn(1, 8)
+    phase = torch.randn(1, 4)
+    bit = torch.randn(1, 2, 4)
+    bit_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    def infer(*, enabled, empty=False):
+        mask = torch.full((1, 2), enabled and not empty, dtype=torch.bool)
+        mean, _ = adapter.prior_for_prompt(task, phase, bit, bit_mask, prompt, mask, enable_pim=enabled)
+        return model.infer_action(
+            prompt=None, input_image=torch.zeros(1, 3, 16, 16),
+            context=torch.zeros(1, 2, 4), context_mask=torch.ones(1, 2, dtype=torch.bool),
+            action_horizon=32, num_inference_steps=1, seed=17,
+            causal_prompt=prompt, pim_mask=mask, zeva_task_tokens=task,
+            zeva_action_residual=adapter.action_prior_residual(mean, training=False),
+            zeva_mode="pim_on",
+        )["action"]
+
+    off = infer(enabled=False)
+    empty = infer(enabled=True, empty=True)
+    on = infer(enabled=True)
+    torch.testing.assert_close(empty, off, rtol=0, atol=0)
+    assert not torch.allclose(on[:24], off[:24])

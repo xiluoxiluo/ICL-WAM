@@ -64,7 +64,9 @@ def _resolve_dataset_stats_path(cfg: DictConfig, ckpt_path: Path) -> Path:
     explicit = _resolve_optional_path(cfg.EVALUATION.dataset_stats_path, base=PROJECT_ROOT)
     candidates: list[Path] = []
     if explicit is not None:
-        candidates.append(explicit)
+        if not explicit.is_file():
+            raise FileNotFoundError(f"Explicit dataset_stats_path does not exist: {explicit}")
+        return explicit
 
     for parent in list(ckpt_path.parents)[:4]:
         candidates.append((parent / "dataset_stats.json").resolve())
@@ -146,6 +148,30 @@ def _append_override(overrides: list[str], key: str, value: Any, *, skip_none: b
     overrides.extend([f"--{key}", _format_override_value(value)])
 
 
+def _write_runtime_policy_config(cfg: DictConfig, path: Path) -> None:
+    """Freeze the resolved constructor inputs before entering RoboTwin's cwd.
+
+    Re-composing only the task name in the child discards legitimate model and
+    processor overrides. Resolve each relevant subtree against the original
+    Hydra config, including its interpolation context, and send that exact
+    configuration to the policy loader.
+    """
+    runtime = {
+        "runtime_schema": "iclwam-robotwin-runtime-v1",
+        "model": OmegaConf.to_container(cfg.model, resolve=True),
+        "data": {"train": {
+            "processor": OmegaConf.to_container(cfg.data.train.processor, resolve=True),
+            "num_frames": int(cfg.data.train.num_frames),
+            "action_video_freq_ratio": int(cfg.data.train.action_video_freq_ratio),
+            "video_size": [int(value) for value in cfg.data.train.video_size],
+        }},
+        "EVALUATION": OmegaConf.to_container(cfg.EVALUATION, resolve=True),
+        "mixed_precision": str(cfg.mixed_precision),
+        "eval_num_inference_steps": int(cfg.eval_num_inference_steps),
+    }
+    OmegaConf.save(config=OmegaConf.create(runtime), f=str(path))
+
+
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_robotwin.yaml")
 def main(cfg: DictConfig):
     if cfg.ckpt is None:
@@ -179,18 +205,14 @@ def main(cfg: DictConfig):
         / ckpt_tag
         / run_ts
     )
+    explicit_results = _resolve_optional_path(cfg.EVALUATION.get("results_dir"), base=PROJECT_ROOT)
+    if explicit_results is not None:
+        run_output_dir = explicit_results
     run_output_dir.mkdir(parents=True, exist_ok=True)
     log_file = run_output_dir / (
         f"eval_{str(cfg.EVALUATION.task_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     )
-    robotwin_eval_base = (
-        PROJECT_ROOT
-        / "evaluate_results"
-        / "robotwin"
-        / ckpt_tag
-        / run_ts
-        / str(cfg.EVALUATION.task_name)
-    )
+    robotwin_eval_base = run_output_dir / str(cfg.EVALUATION.task_name)
 
     zeva_enabled = bool(cfg.model.get("zeva", {}).get("enabled", False))
     sim_cfg_name = "sim_robotwin_zeva.yaml" if zeva_enabled else "sim_robotwin.yaml"
@@ -198,6 +220,8 @@ def main(cfg: DictConfig):
     sim_task = HydraConfig.get().runtime.choices.get("task")
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg, ckpt_path)
+    runtime_config_path = run_output_dir / f"runtime_policy_{str(cfg.EVALUATION.task_name)}.yaml"
+    _write_runtime_policy_config(cfg, runtime_config_path)
 
     overrides: list[str] = []
     _append_override(overrides, "task_name", cfg.EVALUATION.task_name)
@@ -215,6 +239,7 @@ def main(cfg: DictConfig):
 
     _append_override(overrides, "sim_cfg_path", str(sim_cfg_path))
     _append_override(overrides, "sim_task", sim_task)
+    _append_override(overrides, "runtime_config_path", str(runtime_config_path))
     _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
@@ -241,6 +266,22 @@ def main(cfg: DictConfig):
             if key in {"cte_checkpoint", "addon_checkpoint"}:
                 value = _resolve_optional_path(value, base=PROJECT_ROOT)
             _append_override(overrides, key, value)
+    for key in (
+        "model_seed", "cross_memory_enabled", "pim_diagnostic_interval",
+        "episode_manifest", "fixed_instruction", "attempt_log_path", "condition", "run_id",
+    ):
+        value = cfg.EVALUATION.get(key)
+        if key in {"episode_manifest", "attempt_log_path"}:
+            value = _resolve_optional_path(value, base=PROJECT_ROOT)
+        _append_override(overrides, key, value)
+    task_context = cfg.model.get("zeva", {}).get("task_context", {})
+    for key, config_key in (
+        ("task_context_bank", "bank_path"),
+        ("task_context_retrieval_checkpoint", "retrieval_checkpoint"),
+        ("task_context_top_k", "top_k"),
+        ("task_context_mode", "mode"),
+    ):
+        _append_override(overrides, key, task_context.get(config_key))
     if fixed_seed is not None:
         _append_override(overrides, "fixed_seed", fixed_seed)
 

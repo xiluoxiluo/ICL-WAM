@@ -24,6 +24,9 @@ OBS_IMAGES = "observation.images"
 ACTION = "action"
 REWARD = "next.reward"
 
+# Shared by training and serving without importing the video dataset stack.
+DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
+
 ROBOTS = "robots"
 ROBOT_TYPE = "robot_type"
 TELEOPERATORS = "teleoperators"

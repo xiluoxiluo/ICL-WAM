@@ -1,19 +1,48 @@
-"""Repeated-attempt protocol shared by RoboTwin Zeva evaluation.
+"""Model sampling streams independent of RoboTwin scene/reset randomness.
 
-Zeva keeps the environment instance fixed across attempts but changes the
-policy sampling seed deterministically for every attempt/replan pair.  Reusing
-one diffusion seed across all retries can cause a frozen policy with a weak PIM
-residual to repeat essentially the same failure indefinitely.
+The FastWAM API accepts a seed per inference request. ``ModelSeedStream`` is
+therefore an adapted request-seed stream, not an exact reproduction of Zeva's
+continuously consumed torch generator. All policy conditions use the same
+stream rule, and it is never reset at an attempt or episode boundary.
 """
 
 from __future__ import annotations
+
+import hashlib
+import json
+import random
 
 
 ATTEMPT_SEED_STRIDE = 1_000
 
 
+class ModelSeedStream:
+    """A local RNG whose consumption is unaffected by environment resets."""
+
+    def __init__(self, seed: int | None) -> None:
+        if seed is not None and (isinstance(seed, bool) or int(seed) < 0):
+            raise ValueError("model seed must be non-negative")
+        self.seed = None if seed is None else int(seed)
+        self._rng = random.Random(self.seed)
+        self.draws = 0
+
+    def next_seed(self) -> int:
+        value = self._rng.randrange(2**32)
+        self.draws += 1
+        return value
+
+    def snapshot(self) -> dict[str, object]:
+        state = json.dumps(self._rng.getstate(), separators=(",", ":"))
+        return {
+            "protocol": "request_seed_stream_v1",
+            "seed": self.seed,
+            "draws": self.draws,
+            "state_sha256": hashlib.sha256(state.encode()).hexdigest(),
+        }
+
+
 def inference_seed(base_seed: int | None, attempt_id: int, replan_index: int) -> int | None:
-    """Return Zeva-compatible deterministic seed for one policy request."""
+    """Legacy deterministic schedule, retained for old experiment replay."""
     if base_seed is None:
         return None
     base_seed = int(base_seed)

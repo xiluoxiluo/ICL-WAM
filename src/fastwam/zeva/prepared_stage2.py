@@ -32,6 +32,7 @@ from torch.utils.data import Dataset
 
 from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset
 from fastwam.zeva.checkpoint import checkpoint_sha256
+from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMAT, CrossAttemptPIMCache
 
 
 PIM_CACHE_FORMAT = "zeva_stage2_prepared_pim_v1"
@@ -72,6 +73,12 @@ class PreparedPIMCache:
         if not manifest_path.is_file():
             raise FileNotFoundError(f"prepared PIM manifest not found: {manifest_path}")
         self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self._cross_attempt = None
+        if self.manifest.get("format") == CROSS_ATTEMPT_CACHE_FORMAT:
+            self._cross_attempt = CrossAttemptPIMCache(self.root, expected=expected)
+            for name in ("phase_dim", "effect_dim", "top_k", "bit_size", "num_queries", "retrieval_mode", "episode_ids", "task_ids"):
+                setattr(self, name, getattr(self._cross_attempt, name))
+            return
         if self.manifest.get("format") != PIM_CACHE_FORMAT:
             raise ValueError(f"unsupported prepared PIM format: {self.manifest.get('format')!r}")
         for key, value in dict(expected or {}).items():
@@ -193,6 +200,8 @@ class PreparedPIMCache:
         return tensor.bool() if bool_value else tensor
 
     def get(self, index: int) -> dict[str, Any]:
+        if self._cross_attempt is not None:
+            return self._cross_attempt.get(index)
         shard_index, local = self._locate(index)
         a = self._open_shard(shard_index)
         episode_index = int(a["episode_index"][local])
@@ -322,6 +331,9 @@ class PreparedZevaStage2Dataset(Dataset):
                 "task_context": self.static_context.get(prepared["episode_id"]),
             }
         )
+        for name in ("pim_history_kind", "pim_history_count"):
+            if name in prepared:
+                sample[name] = prepared[name]
         sample.pop("episode", None)
         sample.pop("behavior_memory", None)
         sample.pop("behavior_memory_mask", None)

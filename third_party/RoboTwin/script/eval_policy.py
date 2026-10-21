@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+import time
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -134,9 +135,33 @@ def main(usr_args):
     video_size = None
 
     get_model = eval_function_decorator(policy_name, "get_model")
+    # Import after the policy establishes the project root on sys.path. The
+    # helpers themselves are stdlib-only and can be used without the simulator.
+    from experiments.robotwin.multiattempt import load_manifest
+    manifest_episodes = None
+    manifest_sha256 = None
+    manifest_path = usr_args.get("episode_manifest")
+    if manifest_path:
+        if fixed_seed is not None:
+            raise ValueError("episode_manifest and fixed_seed are mutually exclusive")
+        manifest, manifest_sha256 = load_manifest(manifest_path)
+        for name, value in (("task_config", task_config), ("instruction_type", instruction_type)):
+            if manifest[name] != value:
+                raise ValueError(f"Manifest {name} differs from evaluation configuration")
+        for name in ("action_horizon", "replan_steps", "max_attempts"):
+            if int(usr_args.get(name, manifest[name])) != manifest[name]:
+                raise ValueError(f"Manifest {name} differs from policy execution contract")
+        manifest_episodes = [row for row in manifest["episodes"] if row["task"] == task_name]
+        if not manifest_episodes:
+            raise ValueError(f"Task {task_name} is not in the frozen manifest")
+        eval_num_episodes = len(manifest_episodes)
+        max_attempts = manifest["max_attempts"]
 
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
+    if manifest_episodes is not None:
+        # The formal protocol requires one auditable recording per attempt.
+        args["eval_video_log"] = True
 
     args['task_name'] = task_name
     args["task_config"] = task_config
@@ -235,7 +260,17 @@ def main(usr_args):
                                    instruction_type=instruction_type,
                                    skip_get_obs_within_replan=skip_get_obs_within_replan,
                                    fixed_seed=fixed_seed,
-                                   max_attempts=max_attempts)
+                                   max_attempts=max_attempts,
+                                   manifest_episodes=manifest_episodes,
+                                   fixed_instruction=usr_args.get("fixed_instruction"),
+                                   attempt_log_path=usr_args.get("attempt_log_path") or str(save_dir / "attempts.jsonl"),
+                                   record_context={
+                                       "manifest_sha256": manifest_sha256,
+                                       "run_id": usr_args.get("run_id") or eval_ts,
+                                       "condition": usr_args.get("condition") or zeva_mode,
+                                       "task_config": task_config,
+                                       "instruction_type": instruction_type,
+                                   })
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -262,7 +297,16 @@ def eval_policy(task_name,
                 instruction_type=None,
                 skip_get_obs_within_replan=False,
                 fixed_seed=None,
-                max_attempts=1):
+                max_attempts=1,
+                manifest_episodes=None,
+                fixed_instruction=None,
+                attempt_log_path=None,
+                record_context=None):
+    from experiments.robotwin.multiattempt import ATTEMPT_SCHEMA, append_attempt
+    if manifest_episodes is not None and len(manifest_episodes) != test_num:
+        raise ValueError("Manifest task size differs from test_num")
+    if manifest_episodes is not None and fixed_seed is not None:
+        raise ValueError("Manifest and fixed_seed cannot both select a scene")
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
@@ -283,8 +327,12 @@ def eval_policy(task_name,
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
+    strict_seed = fixed_seed is not None or manifest_episodes is not None
 
     while succ_seed < test_num:
+        episode_spec = manifest_episodes[succ_seed] if manifest_episodes is not None else None
+        if episode_spec is not None:
+            now_seed = episode_spec["seed"]
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
@@ -303,9 +351,9 @@ def eval_policy(task_name,
                 # print("Error: ", e)
                 # print(" -------------")
                 TASK_ENV.close_env()
-                if fixed_seed is not None:
+                if strict_seed:
                     raise RuntimeError(
-                        f"fixed_seed={fixed_seed} expert setup failed; refusing to change the seed"
+                        f"fixed_seed={fixed_seed} expert setup failed; refusing to change the seed (selected={now_seed})"
                     ) from e
                 now_seed += 1
                 args["render_freq"] = render_freq
@@ -316,9 +364,9 @@ def eval_policy(task_name,
                 print("Stack Trace: ", traceback.format_exc())
                 print(" -------------")
                 TASK_ENV.close_env()
-                if fixed_seed is not None:
+                if strict_seed:
                     raise RuntimeError(
-                        f"fixed_seed={fixed_seed} expert check failed; refusing to change the seed"
+                        f"fixed_seed={fixed_seed} expert check failed; refusing to change the seed (selected={now_seed})"
                     ) from e
                 now_seed += 1
                 args["render_freq"] = render_freq
@@ -329,6 +377,10 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
+            if strict_seed:
+                raise RuntimeError(
+                    f"Selected scene seed={now_seed} failed expert validation; refusing to substitute a seed"
+                )
             now_seed += 1
             args["render_freq"] = render_freq
             continue
@@ -344,9 +396,9 @@ def eval_policy(task_name,
             if len(suc_test_seed_list) > 0 and suc_test_seed_list[-1] == now_seed:
                 suc_test_seed_list.pop()
             TASK_ENV.close_env()
-            if fixed_seed is not None:
+            if strict_seed:
                 raise RuntimeError(
-                    f"fixed_seed={fixed_seed} rollout setup failed; refusing to change the seed"
+                    f"fixed_seed={fixed_seed} rollout setup failed; refusing to change the seed (selected={now_seed})"
                 ) from e
             now_seed += 1
             continue
@@ -359,16 +411,21 @@ def eval_policy(task_name,
             print("Stack Trace: ", traceback.format_exc())
             print(" -------------")
             TASK_ENV.close_env()
-            if fixed_seed is not None:
+            if strict_seed:
                 raise RuntimeError(
-                    f"fixed_seed={fixed_seed} rollout setup failed; refusing to change the seed"
+                    f"fixed_seed={fixed_seed} rollout setup failed; refusing to change the seed (selected={now_seed})"
                 ) from e
             now_seed += 1
             print("error occurs !")
             continue
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        if episode_spec is not None:
+            instruction = episode_spec["instruction"]
+        elif fixed_instruction is not None:
+            instruction = str(fixed_instruction)
+        else:
+            episode_info_list = [episode_info["info"]]
+            results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+            instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         current_video_path = None
@@ -413,6 +470,7 @@ def eval_policy(task_name,
                 TASK_ENV._del_eval_video_ffmpeg()
 
         succ = False
+        reset_func(model)  # Episode reset exactly once; retries preserve PIM.
         for attempt_id in range(max_attempts):
             if attempt_id > 0:
                 # Recreate the same fixed-seed episode for a genuine retry.
@@ -421,26 +479,57 @@ def eval_policy(task_name,
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 TASK_ENV.set_instruction(instruction=instruction)
             current_video_path = start_attempt_video(attempt_id)
-            reset_func(model)
             if hasattr(model, "begin_attempt"):
                 model.begin_attempt(attempt_id)
-            while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
-                need_obs = True
-                if skip_get_obs_within_replan and hasattr(model, "should_request_observation"):
-                    need_obs = bool(model.should_request_observation())
+            elif attempt_id:
+                reset_func(model)
+            before = model.evaluation_metadata() if hasattr(model, "evaluation_metadata") else {}
+            started = time.perf_counter()
+            status, error = "timeout", None
+            try:
+                while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
+                    need_obs = True
+                    if skip_get_obs_within_replan and hasattr(model, "should_request_observation"):
+                        need_obs = bool(model.should_request_observation())
 
-                observation = None
-                if need_obs:
-                    observation = TASK_ENV.get_obs()
-                eval_func(TASK_ENV, model, observation)
-                if TASK_ENV.eval_success:
-                    succ = True
-                    break
-            # A failed/timeout attempt can still contain a complete terminal
-            # transition.  Finalize every normally completed attempt so its
-            # after-frame is not silently dropped from CTE/PIM history.
-            if hasattr(model, "finalize_attempt"):
-                model.finalize_attempt(TASK_ENV, success=succ)
+                    observation = None
+                    if need_obs:
+                        observation = TASK_ENV.get_obs()
+                    eval_func(TASK_ENV, model, observation)
+                    if TASK_ENV.eval_success:
+                        succ = True
+                        status = "success"
+                        break
+                if hasattr(model, "finalize_attempt"):
+                    model.finalize_attempt(TASK_ENV, success=succ)
+            except Exception as exc:
+                status, error = "error", repr(exc)
+                raise
+            finally:
+                after = model.evaluation_metadata() if hasattr(model, "evaluation_metadata") else {}
+                if attempt_log_path:
+                    record = dict(record_context or {})
+                    record.update(after)
+                    record.update({
+                        "schema": ATTEMPT_SCHEMA,
+                        "task": task_name,
+                        "episode_id": episode_spec["episode_id"] if episode_spec else f"{task_name}:{now_seed}",
+                        "scene_seed": int(now_seed),
+                        "instruction": str(instruction),
+                        "attempt": attempt_id + 1,
+                        "max_attempts": max_attempts,
+                        "success": bool(succ) if status != "error" else False,
+                        "status": status,
+                        "error": error,
+                        "step_count": int(getattr(model, "step_count", TASK_ENV.take_action_cnt)),
+                        "step_limit": int(TASK_ENV.step_lim),
+                        "wall_time_seconds": time.perf_counter() - started,
+                        "pim_entries_before": int(before.get("pim_entries", 0)),
+                        "pim_entries_after": int(after.get("pim_entries", 0)),
+                        "seed_stream_before": before.get("seed_stream"),
+                        "video_path": str(current_video_path) if current_video_path else None,
+                    })
+                    append_attempt(attempt_log_path, record)
             if succ:
                 break
         # task_total_reward += TASK_ENV.episode_score
@@ -448,12 +537,7 @@ def eval_policy(task_name,
             stop_attempt_video()
             if current_video_path is None or not current_video_path.exists():
                 raise FileNotFoundError(f"Expected eval video file not found: {current_video_path}")
-            is_randomized = "randomized" in str(args["task_config"]).lower()
-            renamed_video_path = (
-                Path(TASK_ENV.eval_video_path)
-                / f"episode{episode_idx}_randomized-{str(is_randomized).lower()}_success-{str(succ).lower()}.mp4"
-            )
-            current_video_path.rename(renamed_video_path)
+            # Keep immutable per-attempt paths referenced by structured logs.
 
         if succ:
             TASK_ENV.suc += 1
@@ -474,7 +558,7 @@ def eval_policy(task_name,
             f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
         # TASK_ENV._take_picture()
-        if fixed_seed is None:
+        if not strict_seed:
             now_seed += 1
 
     return now_seed, TASK_ENV.suc

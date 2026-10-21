@@ -109,6 +109,12 @@ def save_addon_checkpoint(
             "causal_prompt_encoder": causal_prompt_encoder.state_dict(),
             "behavior_prefix_adapter": behavior_prefix_adapter.state_dict(),
             "pim_gate": behavior_prefix_adapter.pim_gate.detach().cpu(),
+            "pim_variant": getattr(getattr(behavior_prefix_adapter, "config", None), "pim_variant", "legacy"),
+            "addon_schema": (
+                "cross_attempt_v1"
+                if getattr(getattr(behavior_prefix_adapter, "config", None), "pim_variant", "legacy") == "cross_attempt"
+                else "legacy"
+            ),
             "training_stage": str(training_stage),
             "step": int(step),
             "config": config,
@@ -137,6 +143,15 @@ def load_addon_checkpoint(
         if expected is not None and payload.get(name) != expected:
             raise ValueError(f"addon checkpoint {name} mismatch")
     if load_scope == "all":
+        expected_variant = getattr(getattr(behavior_prefix_adapter, "config", None), "pim_variant", "legacy")
+        checkpoint_variant = payload.get("pim_variant", "legacy")
+        if checkpoint_variant != expected_variant:
+            raise ValueError(
+                f"addon checkpoint pim_variant mismatch: {checkpoint_variant} vs {expected_variant}; "
+                "initialize the new variant with load_scope='policy_injection' from a Stage2A checkpoint"
+            )
+        if expected_variant == "cross_attempt" and payload.get("addon_schema") != "cross_attempt_v1":
+            raise ValueError("cross_attempt checkpoint is missing its cross_attempt_v1 schema marker")
         causal_prompt_encoder.load_state_dict(
             payload["causal_prompt_encoder"], strict=True
         )
@@ -144,6 +159,8 @@ def load_addon_checkpoint(
             payload["behavior_prefix_adapter"], strict=True
         )
     elif load_scope == "policy_injection":
+        if payload.get("training_stage") != "policy_injection":
+            raise ValueError("policy_injection initialization requires a Stage2A policy_injection checkpoint")
         adapter_state = payload["behavior_prefix_adapter"]
         keep_prefixes = (
             "prior.",
@@ -155,6 +172,15 @@ def load_addon_checkpoint(
             for key, value in adapter_state.items()
             if key.startswith(keep_prefixes)
         }
+        expected_policy_keys = {
+            key for key in behavior_prefix_adapter.state_dict() if key.startswith(keep_prefixes)
+        }
+        if set(policy_state) != expected_policy_keys:
+            raise ValueError(
+                "incomplete policy-injection checkpoint: "
+                f"missing={sorted(expected_policy_keys - set(policy_state))}, "
+                f"unexpected={sorted(set(policy_state) - expected_policy_keys)}"
+            )
         _missing, unexpected = behavior_prefix_adapter.load_state_dict(
             policy_state, strict=False
         )

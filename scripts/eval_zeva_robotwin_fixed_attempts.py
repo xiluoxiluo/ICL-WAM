@@ -18,6 +18,12 @@ def main() -> None:
     parser.add_argument("--task-context-retrieval-checkpoint")
     parser.add_argument("--task-context-top-k", type=int)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--model-seed", type=int, default=0)
+    parser.add_argument("--instruction", help="Exact instruction retained for every attempt")
+    parser.add_argument("--sim-task", default="robotwin_zeva_fastwam_pim_3cam_384")
+    parser.add_argument("--dataset-stats")
+    parser.add_argument("--cross-memory-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pim-diagnostic-interval", type=int, default=0)
     parser.add_argument(
         "--mode",
         choices=("base", "zeva_stage2", "pim_shadow", "pim_on"),
@@ -35,6 +41,18 @@ def main() -> None:
            f"EVALUATION.task_name={args.task}", f"EVALUATION.fixed_seed={args.seed}",
            f"EVALUATION.max_attempts={args.max_attempts}", f"EVALUATION.zeva_mode={args.mode}",
            f"EVALUATION.cte_checkpoint={args.cte_checkpoint}"]
+    cmd.extend([
+        f"task={args.sim_task}", f"EVALUATION.model_seed={args.model_seed}",
+        f"EVALUATION.cross_memory_enabled={str(args.cross_memory_enabled).lower()}",
+        f"EVALUATION.pim_diagnostic_interval={args.pim_diagnostic_interval}",
+    ])
+    if "cross_attempt" in args.sim_task:
+        cmd.append("EVALUATION.pim_top_k=192")
+    if args.dataset_stats:
+        cmd.append(f"EVALUATION.dataset_stats_path={args.dataset_stats}")
+    if args.instruction:
+        import json
+        cmd.append(f"EVALUATION.fixed_instruction={json.dumps(args.instruction)}")
     if args.mode in {"zeva_stage2", "pim_on"}:
         cmd.append(f"EVALUATION.addon_checkpoint={args.addon_checkpoint}")
     if args.task_context_bank:

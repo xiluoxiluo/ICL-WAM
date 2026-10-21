@@ -103,17 +103,26 @@ class Wan22Trainer:
             elif self.zeva_training_stage == "pim_adapter":
                 adapter = self.model.zeva_behavior_prefix_adapter
                 prompt_params = list(self.model.zeva_prompt_encoder.parameters())
-                projector_params = list(adapter.prefix_project.parameters())
-                gate_params = [adapter.pim_gate]
-                trainable_params = prompt_params + projector_params + gate_params
-                optimizer_params = [
-                    {"params": prompt_params, "lr": self.learning_rate * 5.0},
-                    {"params": projector_params, "lr": self.learning_rate * 5.0},
-                    {"params": gate_params, "lr": self.learning_rate},
-                ]
-                logger.info(
-                    "PIM LR multipliers: prompt_encoder=5.0 prefix_project=5.0 pim_gate=1.0"
-                )
+                if getattr(adapter.config, "pim_variant", "legacy") == "cross_attempt":
+                    adapter_params = list(adapter.pim_adapter_parameters())
+                    trainable_params = prompt_params + adapter_params
+                    optimizer_params = [
+                        {"params": prompt_params, "lr": self.learning_rate, "name": "pim_readout"},
+                        {"params": adapter_params, "lr": self.learning_rate, "name": "pim_injection"},
+                    ]
+                    logger.info("Cross-attempt PIM learning rates: readout=%g injection=%g", self.learning_rate, self.learning_rate)
+                else:
+                    projector_params = list(adapter.prefix_project.parameters())
+                    gate_params = [adapter.pim_gate]
+                    trainable_params = prompt_params + projector_params + gate_params
+                    optimizer_params = [
+                        {"params": prompt_params, "lr": self.learning_rate * 5.0},
+                        {"params": projector_params, "lr": self.learning_rate * 5.0},
+                        {"params": gate_params, "lr": self.learning_rate},
+                    ]
+                    logger.info(
+                        "PIM LR multipliers: prompt_encoder=5.0 prefix_project=5.0 pim_gate=1.0"
+                    )
             else:
                 raise RuntimeError(f"unsupported Zeva training stage: {self.zeva_training_stage}")
             if not trainable_params:
@@ -586,9 +595,88 @@ class Wan22Trainer:
         }
 
     @torch.no_grad()
+    def _evaluate_zeva(self):
+        """Held-out action loss with paired PIM-on/off random draws.
+
+        Prepared Zeva samples contain one image plus causal memory. They must
+        not enter the generic video rollout evaluator, which drops that state.
+        This is an offline validation metric, not RoboTwin success rate.
+        """
+        model = self.accelerator.unwrap_model(self.model)
+        per_rank = int(self.cfg.get("eval_num_samples", 16))
+        dataset_size = len(self.val_dataset)
+        if per_rank < 1 or dataset_size < 1:
+            raise ValueError("Zeva validation requires a nonempty dataset and eval_num_samples >= 1")
+        world_size = self.accelerator.num_processes
+        total_samples = min(dataset_size, per_rank * world_size)
+        count = (total_samples + world_size - 1) // world_size
+        module_modes = {module: module.training for module in model.modules()}
+        model.eval()
+        device = torch.device(self.accelerator.device)
+        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+        rows = []
+        try:
+            for offset in range(count):
+                position = self.accelerator.process_index + offset * world_size
+                valid = position < total_samples
+                # Spread the fixed validation budget across the entire cache,
+                # whose rows are grouped by episode. Rank-striding only the
+                # first rows repeatedly evaluates one episode. Pad the final
+                # distributed batch but exclude padding from the metric mean.
+                position = min(position, total_samples - 1)
+                index = (
+                    position * (dataset_size - 1) // (total_samples - 1)
+                    if total_samples > 1 else dataset_size // 2
+                )
+                # Keep validation out of the training RNG stream and reuse
+                # precisely the same noise/timesteps for the paired call. The
+                # dataset read is included in case transforms consume RNG.
+                with torch.random.fork_rng(devices=cuda_devices):
+                    source = self.val_dataset[index]
+                    unbatched = source["video"].ndim == 4
+                    if source["video"].ndim not in (4, 5):
+                        raise ValueError("Zeva validation video must be [3,T,H,W] or [B,3,T,H,W]")
+                    sample = {
+                        key: value.unsqueeze(0) if unbatched and isinstance(value, torch.Tensor) else value
+                        for key, value in source.items()
+                    }
+                    sample["_training_mode"] = "zeva_stage2"
+                    memory_off = dict(sample)
+                    for key in ("pim_phases", "pim_effects", "pim_mask"):
+                        if key in memory_off:
+                            memory_off[key] = torch.zeros_like(memory_off[key])
+                    cpu_state = torch.get_rng_state()
+                    cuda_state = torch.cuda.get_rng_state(device) if cuda_devices else None
+                    with self.accelerator.autocast():
+                        on_loss, on_metrics = model(sample)
+                    torch.set_rng_state(cpu_state)
+                    if cuda_state is not None:
+                        torch.cuda.set_rng_state(cuda_state, device)
+                    with self.accelerator.autocast():
+                        off_loss, _ = model(memory_off)
+                values = [
+                    float(on_loss), float(off_loss), float(off_loss - on_loss),
+                    float(on_metrics.get("loss_flow", on_loss)),
+                    float(on_metrics.get("behavior_prior_nll", 0.0)),
+                ]
+                rows.append([value if valid else 0.0 for value in values] + [float(valid)])
+            gathered = self.accelerator.gather_for_metrics(torch.tensor(rows, device=device, dtype=torch.float32))
+            mean = (gathered[:, :5].sum(dim=0) / gathered[:, 5].sum()).cpu().tolist()
+            return dict(zip(
+                ("val_loss", "val_loss_memory_off", "val_memory_gain", "val_loss_flow", "val_prior_nll"), mean,
+            ))
+        finally:
+            # Stage2B intentionally has model.training=False while only the
+            # addons train. Restore every module, not just model.dit.training.
+            for module, training in module_modes.items():
+                module.training = training
+
+    @torch.no_grad()
     def evaluate(self):
         if self.val_dataset is None:
             return None
+        if self.zeva_training:
+            return self._evaluate_zeva()
 
         model = self.accelerator.unwrap_model(self.model)
         was_dit_training = model.dit.training
@@ -1029,30 +1117,22 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
+                            description = "[eval] step=%d val_loss=%.4f" % (
                                 self.global_step,
                                 metrics["val_loss"],
-                                metrics["psnr_rd"],
-                                metrics["ssim_rd"],
                             )
+                            if "val_loss_memory_off" in metrics:
+                                description += " memory_off_loss=%.4f memory_gain=%.4f" % (
+                                    metrics["val_loss_memory_off"], metrics["val_memory_gain"],
+                                )
+                            if "psnr_rd" in metrics:
+                                description += " infer_psnr=%.4f infer_ssim=%.4f" % (metrics["psnr_rd"], metrics["ssim_rd"])
                             if "action_l2" in metrics:
                                 description += " action_l2=%.4f" % metrics["action_l2"]
                             if "action_l1" in metrics:
                                 description += " action_l1=%.4f" % metrics["action_l1"]
                             logger.info(description)
-                            eval_payload = {
-                                "eval/val_loss": float(metrics["val_loss"]),
-                                "eval/psnr_rg": float(metrics["psnr_rg"]),
-                                "eval/ssim_rg": float(metrics["ssim_rg"]),
-                                "eval/psnr_rd": float(metrics["psnr_rd"]),
-                                "eval/ssim_rd": float(metrics["ssim_rd"]),
-                                "eval/psnr_dg": float(metrics["psnr_dg"]),
-                                "eval/ssim_dg": float(metrics["ssim_dg"]),
-                            }
-                            if "action_l2" in metrics:
-                                eval_payload["eval/action_l2"] = float(metrics["action_l2"])
-                            if "action_l1" in metrics:
-                                eval_payload["eval/action_l1"] = float(metrics["action_l1"])
+                            eval_payload = {f"eval/{key}": float(value) for key, value in metrics.items() if isinstance(value, (int, float))}
                             self._wandb_log(eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:

@@ -11,6 +11,7 @@ eval_num_episodes: 100
 sim_cfg_path: null
 sim_task: null
 sim_cfg_name: sim_robotwin.yaml
+runtime_config_path: null
 mixed_precision: bf16
 device: cuda
 dataset_stats_path: null
@@ -30,3 +31,11 @@ addon_checkpoint: null
 pim_top_k: 4
 max_attempts: 1
 fixed_seed: null
+model_seed: 0
+cross_memory_enabled: true
+pim_diagnostic_interval: 0
+episode_manifest: null
+fixed_instruction: null
+attempt_log_path: null
+condition: null
+run_id: null

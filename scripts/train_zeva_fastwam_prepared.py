@@ -35,6 +35,7 @@ from fastwam.zeva.prepared_stage2 import (
 )
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.static_task_context import task_context_identity
+from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMAT, HISTORY_KINDS
 
 
 def _require_file(value, name: str) -> Path:
@@ -103,6 +104,24 @@ def _print_pim_dropout_probe(
         )
 
 
+def _print_cross_attempt_probe(pim_cache: PreparedPIMCache, *, seed: int, count: int = 256) -> None:
+    """Report actual mixture/capacity without changing training RNG state."""
+    kinds = {kind: 0 for kind in HISTORY_KINDS}
+    history_counts: dict[int, int] = {}
+    valid_counts: dict[int, int] = {}
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        for index in range(min(count, len(pim_cache))):
+            row = pim_cache.get(index)
+            kinds[HISTORY_KINDS[int(row["pim_history_kind"])]] += 1
+            histories, entries = int(row["pim_history_count"]), int(row["pim_mask"].sum())
+            history_counts[histories] = history_counts.get(histories, 0) + 1
+            valid_counts[entries] = valid_counts.get(entries, 0) + 1
+            if pim_cache.manifest["split"] == "train" and entries == 0:
+                raise ValueError("cross-attempt frozen-parent training produced an empty-history sample")
+    print(f"Cross-attempt probe: kind_counts={kinds} history_counts={history_counts} valid_entry_counts={valid_counts}")
+
+
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     if not torch.cuda.is_available():
@@ -116,13 +135,19 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("Stage-2 requires action_video_freq_ratio=4")
 
     zeva = cfg.model.zeva
+    cross_attempt = str(zeva.prompt.get("pim_variant", "legacy")) == "cross_attempt"
+    if cross_attempt != (str(zeva.adapter.get("pim_variant", "legacy")) == "cross_attempt"):
+        raise ValueError("prompt and adapter PIM variants must agree")
     training_stage = str(zeva.training_stage)
     if training_stage not in {"policy_injection", "pim_adapter"}:
         raise ValueError(f"unsupported Zeva Stage-2 training_stage={training_stage!r}")
     if str(zeva.task_context.mode) != "static":
         raise ValueError("formal prepared Stage-2 requires task_context.mode=static")
-    if str(zeva.memory.pim_retrieval_mode) != "phase":
-        raise ValueError("formal prepared Stage-2 requires Zeva default pim_retrieval_mode=phase")
+    retrieval_mode = "cross_attempt" if cross_attempt else "phase"
+    if str(zeva.memory.pim_retrieval_mode) != retrieval_mode:
+        raise ValueError(f"prepared Stage-2 variant requires pim_retrieval_mode={retrieval_mode}")
+    if cross_attempt and training_stage != "pim_adapter":
+        raise ValueError("cross-attempt variant is initialized from an existing Stage2A parent")
 
     base_ckpt = _require_file(cfg.get("ckpt"), "ckpt")
     cte_ckpt = _require_file(zeva.cte.checkpoint, "model.zeva.cte.checkpoint")
@@ -173,10 +198,8 @@ def main(cfg: DictConfig) -> None:
     if tuple(cte_payload.get("camera_keys", ())) != ("cam_high", "cam_left_wrist", "cam_right_wrist"):
         raise ValueError("Stage-2 camera order differs from CTE checkpoint")
 
-    pim = PreparedPIMCache(
-        pim_root,
-        expected={
-            "retrieval_mode": "phase",
+    pim_expected = {
+            "retrieval_mode": retrieval_mode,
             "history_semantics": "full_episode_prefix",
             "query_step_unit": "raw_action_step",
             "phase_dim": int(zeva.prompt.phase_dim),
@@ -190,8 +213,19 @@ def main(cfg: DictConfig) -> None:
             "phase_cache_manifest_sha256": sha256_file(phase_manifest_path),
             "phase_cache_index_sha256": sha256_file(phase_index_path),
             "feature_dtype": "float32",
-        },
-    )
+        }
+    if cross_attempt:
+        if not bool(zeva.memory.get("cross_attempt_only", False)) or int(zeva.memory.pim_max_entries) != top_k:
+            raise ValueError("cross-attempt training/serving memory capacity must agree")
+        pim_expected.update({
+            "format": CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
+            "source_subset": "train-only", "split": "train",
+            "max_past_attempts": int(zeva.memory.max_past_attempts),
+            "max_entries_per_attempt": int(zeva.memory.max_entries_per_attempt),
+            "history_source_semantics": "other_train_episode",
+            "candidate_semantics": "complete_episode_uniform",
+        })
+    pim = PreparedPIMCache(pim_root, expected=pim_expected)
     static_context = StaticEpisodeContextCache(static_path)
     validate_static_artifact_hashes(
         static_context,
@@ -224,18 +258,42 @@ def main(cfg: DictConfig) -> None:
     if str(base.semantic_task_identity.get("sha256")) != semantic_sha:
         raise ValueError("Stage-2 dataset semantic identity mismatch")
     dataset = PreparedZevaStage2Dataset(base, pim, static_context)
+    validation_dataset = None
+    validation_path = zeva.prepared_stage2.get("validation_pim_cache_path")
+    if validation_path not in (None, "", "None", "null"):
+        if not cross_attempt:
+            raise ValueError("explicit prepared validation split requires the cross-attempt schema")
+        validation_pim = PreparedPIMCache(str(validation_path), expected={**pim_expected, "split": "validation"})
+        split_hash = pim.manifest["metadata_sha256"]["episode_splits.json"]
+        if validation_pim.manifest["metadata_sha256"]["episode_splits.json"] != split_hash:
+            raise ValueError("train and validation prepared caches use different episode splits")
+        for key in ("use_conditions", "conditions_sha256"):
+            if validation_pim.manifest[key] != pim.manifest[key]:
+                raise ValueError(f"train and validation history conditions differ: {key}")
+        if set(pim.episode_ids) & set(validation_pim.episode_ids):
+            raise ValueError("train and validation prepared episodes overlap")
+        validation_dataset = PreparedZevaStage2Dataset(base, validation_pim, static_context)
 
     dropout = None
     if training_stage == "pim_adapter":
         dropout = _dropout_config(cfg)
-        if dropout.context_dropout <= 0.0 and dropout.support_dropout <= 0.0:
+        if cross_attempt:
+            if dropout.context_dropout != 0.0 or dropout.support_dropout != 0.0:
+                raise ValueError("cross-attempt cache owns history sampling; disable stacked prompt/context/support dropout")
+            if pim.manifest["history_weights"].get("empty", 0.0) != 0.0:
+                raise ValueError("frozen-parent training requires nonempty histories")
+            if int(os.environ.get("RANK", "0")) == 0:
+                _print_cross_attempt_probe(pim, seed=int(cfg.seed))
+            dropout = None
+        elif dropout.context_dropout <= 0.0 and dropout.support_dropout <= 0.0:
             raise ValueError(
                 "pim_adapter training requires non-zero PIM context/support dropout; "
                 "otherwise every sample sees the same dense top-k memory."
             )
-        if int(os.environ.get("RANK", "0")) == 0:
-            _print_pim_dropout_probe(pim, dropout)
-        dataset = PIMTrainingDropoutDataset(dataset, dropout)
+        if dropout is not None:
+            if int(os.environ.get("RANK", "0")) == 0:
+                _print_pim_dropout_probe(pim, dropout)
+            dataset = PIMTrainingDropoutDataset(dataset, dropout)
 
     model = instantiate(
         cfg.model,
@@ -254,6 +312,7 @@ def main(cfg: DictConfig) -> None:
     print(f"training_stage: {training_stage}")
     print(f"dataset queries: {len(dataset):,}")
     print(f"prepared PIM: {pim_root}")
+    print(f"prepared validation queries: {len(validation_dataset) if validation_dataset is not None else 0}")
     print(f"static context: {static_path}")
     if dropout is not None:
         print(
@@ -266,7 +325,7 @@ def main(cfg: DictConfig) -> None:
     print(f"semantic map sha256: {semantic_sha}")
     print("PREPARED STAGE-2 PREFLIGHT: PASSED")
 
-    trainer = Wan22Trainer(cfg=cfg, model=model, train_dataset=dataset, val_dataset=None)
+    trainer = Wan22Trainer(cfg=cfg, model=model, train_dataset=dataset, val_dataset=validation_dataset)
     trainer.train()
     print(f"Stage-2 complete; addon checkpoints are under {Path(str(cfg.output_dir)) / 'checkpoints'}")
 

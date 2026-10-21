@@ -1,5 +1,11 @@
 # ICLWAM：把 Zeva 因果记忆接到 FastWAM
 
+## Zeva-Ego cross-attempt 更新
+
+新增显式 `pim_variant=cross_attempt` 分支，参考 Zeva `feature/zeva_ego` 的 RoboTwin PIM 设计：只读取已经结束的尝试、最多 3 次历史 × 64 条完整 effect、同时条件化 behavior prefix 和冻结的 action prior，并用同一个新 checkpoint 做 memory-on/off 对照。
+
+**新训练、缓存迁移和 10 × 20 场景评测请使用 [cross-attempt 运行指南](docs/zeva_ego_cross_attempt.md)。** 新分支需要从已有 Stage2A addon 重新训练 Stage2B；旧的 top-4 Stage2B checkpoint 不能直接当作新分支使用。下面原有流程继续对应 legacy 配置，便于复现旧基线。
+
 ICLWAM 在 FastWAM 的 RoboTwin action path 上加入 Zeva 的因果记忆模块。FastWAM 仍然负责根据图像、语言和本体状态生成动作；Zeva 负责从历史交互中提取当前 phase、短期 BIT 和跨尝试保留的 PIM，再把这些信息转换成 FastWAM action hidden space 中的条件。
 
 一次推理可以简单理解为：

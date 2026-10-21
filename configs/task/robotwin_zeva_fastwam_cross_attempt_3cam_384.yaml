@@ -1,0 +1,44 @@
+# @package _global_
+
+# Opt-in Zeva-Ego-inspired Stage2B. Existing legacy task configs/checkpoints
+# retain their original gated top-k behavior.
+defaults:
+  - robotwin_zeva_fastwam_stage2_3cam_384
+  - _self_
+
+ckpt: null  # REQUIRED: pretrained FastWAM base, separate from Stage2A addon.
+learning_rate: 5.0e-5
+max_steps: 2000
+max_grad_norm: 1.0
+save_every: 500
+eval_every: 250
+eval_num_samples: 16  # Per rank, spread deterministically across the validation cache.
+
+model:
+  zeva:
+    pim_variant: cross_attempt
+    training_stage: pim_adapter
+    policy_checkpoint: null  # REQUIRED: validated legacy Stage2A addon.
+    freeze_fastwam: true
+    freeze_cte_stage2: true
+    prompt:
+      pim_variant: cross_attempt
+      persistent_length: 192
+      # History mixture/count sampling lives in the compact prepared cache.
+      # Frozen-parent empty fallback is tested separately; empty-only batches
+      # carry no learning signal for the new PIM modules.
+      pim_context_dropout: 0.0
+      pim_support_dropout: 0.0
+    adapter:
+      pim_variant: cross_attempt
+      prior_loss_weight: 0.01
+    memory:
+      pim_retrieval_mode: cross_attempt
+      pim_top_k: 192  # Legacy field name; new mode exposes all candidate slots.
+      pim_max_entries: 192
+      cross_attempt_only: true
+      max_past_attempts: 3
+      max_entries_per_attempt: 64
+    prepared_stage2:
+      pim_cache_path: null  # build_zeva_cross_attempt_cache.py --split train
+      validation_pim_cache_path: null  # same split manifest, --split validation

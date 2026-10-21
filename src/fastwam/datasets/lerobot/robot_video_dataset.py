@@ -12,6 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from hydra.utils import instantiate
 from .base_lerobot_dataset import BaseLerobotDataset
+from .constants import DEFAULT_PROMPT
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from fastwam.utils.logging_config import get_logger
@@ -20,9 +21,6 @@ from fastwam.zeva.semantic_tasks import SemanticTaskMap
 from accelerate import PartialState
 
 logger = get_logger(__name__)
-
-
-DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
 
 class RobotVideoDataset(torch.utils.data.Dataset):

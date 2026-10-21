@@ -200,10 +200,12 @@ class CausalMemoryLifecycle:
         self.bit.reset()
         self._attempt_id = 0
         self._effect_index = 0
+        self.last_retrieval_sources = []
 
     def end_attempt(self) -> None:
         if self.pim.task_cluster is None:
             raise RuntimeError("reset_episode() is required before end_attempt()")
+        self.pim.commit_attempt()
         # BIT is scoped to the just-finished attempt.  Clear it immediately,
         # including when there will be no retry, so stale short-term evidence
         # cannot be observed after the lifecycle boundary.
@@ -219,6 +221,7 @@ class CausalMemoryLifecycle:
         self._attempt_id = attempt_id
         self._effect_index = 0
         self.bit.reset()
+        self.last_retrieval_sources = []
 
     def set_effect_dim(self, effect_dim: int) -> None:
         if effect_dim < 1:
@@ -245,10 +248,8 @@ class CausalMemoryLifecycle:
         if phase_at_window_start.shape != (self.pim.config.phase_dim,) or effect_post.shape != (self._effect_dim,):
             raise ValueError("online phase/effect shape mismatch")
         effect_index = self._effect_index
-        self.bit.append(effect_post, effect_index)
-        # A completed effect is immediately persistent. This is the causal
-        # boundary: later queries in the same attempt may retrieve it, while
-        # incomplete/future effects are never passed to this method.
+        # Validate/publish to PIM before mutating BIT. Cross-attempt mode keeps
+        # this effect private until end_attempt(); legacy mode exposes it now.
         self.pim.append_completed(
             task_cluster=self.pim.task_cluster,
             phase=phase_at_window_start.detach(),
@@ -257,6 +258,7 @@ class CausalMemoryLifecycle:
             transition_index=effect_index * self.config.effect_window_transitions,
             metadata={**dict(metadata or {}), "effect_index": effect_index},
         )
+        self.bit.append(effect_post, effect_index)
         self._effect_index += 1
 
     def observe_completed_transition(
@@ -273,8 +275,8 @@ class CausalMemoryLifecycle:
         phases, effects, valid, _scores, sources = self.pim.query_tensors(
             phase_query.detach().float().cpu(),
             top_k=self.pim.config.top_k,
-            # Completed interactions are causally visible immediately,
-            # including those produced earlier in the current attempt.
+            # Cross-attempt memory keeps current effects in a separate buffer;
+            # filtering after a merge would lose valid older provenance.
             exclude_attempt_id=None,
         )
         self.last_retrieval_sources = sources

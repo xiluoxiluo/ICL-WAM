@@ -1,0 +1,1218 @@
+{
+  "schema": "iclwam-robotwin-multiattempt-v1",
+  "source": {
+    "repository": "air-embodied-brain/Zeva",
+    "ref": "bae85ad753d3afe4f2e56762373d48ac0267e101",
+    "path": "configs/robotwin_multiattempt_original10x20.json"
+  },
+  "environment_validation": "required_at_runtime; invalid scenes abort, never substitute seeds",
+  "adaptation": "Fixed Zeva scenes/instructions with FastWAM joint14, horizon32, execute24; not a numerical reproduction of the pi0.5 action contract.",
+  "task_config": "demo_randomized",
+  "instruction_type": "seen",
+  "max_attempts": 4,
+  "action_dim": 14,
+  "action_horizon": 32,
+  "replan_steps": 24,
+  "episodes": [
+    {
+      "episode_id": "beat_block_hammer:1000",
+      "task": "beat_block_hammer",
+      "seed": 1000,
+      "instruction": "Pick up the yellow and black hammer grip and use it on the block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1008",
+      "task": "beat_block_hammer",
+      "seed": 1008,
+      "instruction": "Grab the black and yellow hammer grip to beat the block."
+    },
+    {
+      "episode_id": "beat_block_hammer:1009",
+      "task": "beat_block_hammer",
+      "seed": 1009,
+      "instruction": "Take the plastic handle metal hammer and beat the block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1011",
+      "task": "beat_block_hammer",
+      "seed": 1011,
+      "instruction": "Take the grippy handle hammer and strike the block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1013",
+      "task": "beat_block_hammer",
+      "seed": 1013,
+      "instruction": "Take the medium-sized metal hammer and strike the block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1015",
+      "task": "beat_block_hammer",
+      "seed": 1015,
+      "instruction": "Grab the silver curved hammer head using the right arm then pound block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1016",
+      "task": "beat_block_hammer",
+      "seed": 1016,
+      "instruction": "Grab the black and yellow hammer grip using the right arm and strike the block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1017",
+      "task": "beat_block_hammer",
+      "seed": 1017,
+      "instruction": "Take the hammer with claw-shaped end and beat the block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1018",
+      "task": "beat_block_hammer",
+      "seed": 1018,
+      "instruction": "With the right arm, grab the medium-sized metal hammer and hammer the block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1019",
+      "task": "beat_block_hammer",
+      "seed": 1019,
+      "instruction": "Use the hammer with claw-shaped end to hammer the block."
+    },
+    {
+      "episode_id": "beat_block_hammer:1021",
+      "task": "beat_block_hammer",
+      "seed": 1021,
+      "instruction": "Grab the silver curved hammer head with the right arm and hit block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1024",
+      "task": "beat_block_hammer",
+      "seed": 1024,
+      "instruction": "Hold the nail-driving hammer and pound the block."
+    },
+    {
+      "episode_id": "beat_block_hammer:1025",
+      "task": "beat_block_hammer",
+      "seed": 1025,
+      "instruction": "With the right arm, grab the silver curved hammer head and beat the block."
+    },
+    {
+      "episode_id": "beat_block_hammer:1026",
+      "task": "beat_block_hammer",
+      "seed": 1026,
+      "instruction": "Pick up the grippy handle hammer using the right arm then beat"
+    },
+    {
+      "episode_id": "beat_block_hammer:1027",
+      "task": "beat_block_hammer",
+      "seed": 1027,
+      "instruction": "Pick the medium-sized metal hammer from the table and strike"
+    },
+    {
+      "episode_id": "beat_block_hammer:1028",
+      "task": "beat_block_hammer",
+      "seed": 1028,
+      "instruction": "Take the nail-driving hammer using the left arm, hit the block."
+    },
+    {
+      "episode_id": "beat_block_hammer:1030",
+      "task": "beat_block_hammer",
+      "seed": 1030,
+      "instruction": "Pick the hammer with claw-shaped end and strike the block."
+    },
+    {
+      "episode_id": "beat_block_hammer:1032",
+      "task": "beat_block_hammer",
+      "seed": 1032,
+      "instruction": "Employ the left arm to grab the silver curved hammer head and hit."
+    },
+    {
+      "episode_id": "beat_block_hammer:1033",
+      "task": "beat_block_hammer",
+      "seed": 1033,
+      "instruction": "Grab the black and yellow hammer grip using the left arm then pound block"
+    },
+    {
+      "episode_id": "beat_block_hammer:1035",
+      "task": "beat_block_hammer",
+      "seed": 1035,
+      "instruction": "Catch the medium-sized metal hammer and use it on the block."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1000",
+      "task": "blocks_ranking_rgb",
+      "seed": 1000,
+      "instruction": "Grab red block, position it on the left. Next, grab green block to place beside red block, then grab blue block and set it to the right of green block."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1001",
+      "task": "blocks_ranking_rgb",
+      "seed": 1001,
+      "instruction": "Start with red block on the left, add green block next to it, and then place blue block on the right."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1003",
+      "task": "blocks_ranking_rgb",
+      "seed": 1003,
+      "instruction": "First, use the left arm to grab red block and place it on the left. Then grab green block with the left arm and position it next to red block, followed by grabbing blue block with the right arm and placing it next to green block."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1007",
+      "task": "blocks_ranking_rgb",
+      "seed": 1007,
+      "instruction": "Use the right arm for red block, then the right arm for green block, and the right arm for blue block, arranging them left to right."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1008",
+      "task": "blocks_ranking_rgb",
+      "seed": 1008,
+      "instruction": "Using the left arm, the left arm, and the right arm, align red block, green block, and blue block in a row from left to right."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1010",
+      "task": "blocks_ranking_rgb",
+      "seed": 1010,
+      "instruction": "Position red block, green block, and blue block from left to right in the specified sequence."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1011",
+      "task": "blocks_ranking_rgb",
+      "seed": 1011,
+      "instruction": "With the left arm, the right arm, and the right arm, place red block, green block, and blue block sequentially from left to right as red, green, blue."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1012",
+      "task": "blocks_ranking_rgb",
+      "seed": 1012,
+      "instruction": "Start by grabbing red block, place it on the leftmost side. Next, position green block beside red block, and finally set blue block to the right of green block."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1013",
+      "task": "blocks_ranking_rgb",
+      "seed": 1013,
+      "instruction": "Using the left arm, the right arm, and the left arm, set red block, green block, and blue block from left to right in the sequence red, green, blue."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1014",
+      "task": "blocks_ranking_rgb",
+      "seed": 1014,
+      "instruction": "Pick red block using the right arm, place it far left. Then grab green block with the left arm, position next to red block. Lastly, grab blue block using the left arm and set right of green block."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1015",
+      "task": "blocks_ranking_rgb",
+      "seed": 1015,
+      "instruction": "Place red block first, set green block beside it, and complete the row by positioning blue block."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1016",
+      "task": "blocks_ranking_rgb",
+      "seed": 1016,
+      "instruction": "Grab and place red block first, followed by green block, and finish with blue block in a row."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1017",
+      "task": "blocks_ranking_rgb",
+      "seed": 1017,
+      "instruction": "Use the right arm for red block to set it leftmost, continue with the left arm to position green block next to red block, and finish by placing blue block using the left arm to the right of green block."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1019",
+      "task": "blocks_ranking_rgb",
+      "seed": 1019,
+      "instruction": "Pick up red block, green block, and blue block in sequence and position them in a left-to-right row."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1020",
+      "task": "blocks_ranking_rgb",
+      "seed": 1020,
+      "instruction": "Arrange red block, green block, and blue block in a row using the right arm, the right arm, and the left arm, keeping the left-to-right order."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1021",
+      "task": "blocks_ranking_rgb",
+      "seed": 1021,
+      "instruction": "red block, then green block, and finally blue block should be placed in a row from left to right."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1022",
+      "task": "blocks_ranking_rgb",
+      "seed": 1022,
+      "instruction": "Position red block, green block, and blue block on a surface from left to right in the order red, green, blue."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1023",
+      "task": "blocks_ranking_rgb",
+      "seed": 1023,
+      "instruction": "Use the right arm to place red block on the left, then use the left arm for green block beside red block, and finally the right arm for blue block next to green block."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1024",
+      "task": "blocks_ranking_rgb",
+      "seed": 1024,
+      "instruction": "Using the right arm, the left arm, and the right arm, set red block, green block, and blue block from left to right in the sequence red, green, blue."
+    },
+    {
+      "episode_id": "blocks_ranking_rgb:1025",
+      "task": "blocks_ranking_rgb",
+      "seed": 1025,
+      "instruction": "Position red block first, followed by green block, and end with blue block in a row from left to right."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1002",
+      "task": "blocks_ranking_size",
+      "seed": 1002,
+      "instruction": "Take large block with the left arm, medium block with the right arm, and small block with the left arm to the middle."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1003",
+      "task": "blocks_ranking_size",
+      "seed": 1003,
+      "instruction": "Align large block, medium block, and small block by size from left to right at the center."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1004",
+      "task": "blocks_ranking_size",
+      "seed": 1004,
+      "instruction": "Grab large block, medium block, and small block, set them centrally, ordered by size."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1005",
+      "task": "blocks_ranking_size",
+      "seed": 1005,
+      "instruction": "Bring large block, medium block, and small block to the center, sorting largest to smallest."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1007",
+      "task": "blocks_ranking_size",
+      "seed": 1007,
+      "instruction": "Set large block, medium block, and small block in the center area, arranging from largest to smallest."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1008",
+      "task": "blocks_ranking_size",
+      "seed": 1008,
+      "instruction": "Align large block, medium block, and small block in the center by size, using the right arm, the left arm, and the left arm."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1009",
+      "task": "blocks_ranking_size",
+      "seed": 1009,
+      "instruction": "Arrange blocks large block, medium block, and small block in decreasing size order."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1010",
+      "task": "blocks_ranking_size",
+      "seed": 1010,
+      "instruction": "Arrange large block, medium block, small block in size order, largest on the left."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1011",
+      "task": "blocks_ranking_size",
+      "seed": 1011,
+      "instruction": "Grab large block, medium block, and small block, set them centrally, ordered by size."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1013",
+      "task": "blocks_ranking_size",
+      "seed": 1013,
+      "instruction": "Move large block with the right arm, medium block with the left arm, and small block with the left arm to arrange them."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1014",
+      "task": "blocks_ranking_size",
+      "seed": 1014,
+      "instruction": "Grab large block, medium block, small block, and arrange them in size order at the center."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1015",
+      "task": "blocks_ranking_size",
+      "seed": 1015,
+      "instruction": "Use the right arm, the left arm, and the left arm to arrange large block, medium block, and small block centrally by size."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1016",
+      "task": "blocks_ranking_size",
+      "seed": 1016,
+      "instruction": "Grab large block, place it, then medium block and small block, arranging by size centrally."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1017",
+      "task": "blocks_ranking_size",
+      "seed": 1017,
+      "instruction": "Use the left arm, the right arm, and the left arm to center large block, medium block, and small block in order."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1018",
+      "task": "blocks_ranking_size",
+      "seed": 1018,
+      "instruction": "Use the right arm, the left arm, the left arm to place large block, medium block, and small block by size at the center."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1019",
+      "task": "blocks_ranking_size",
+      "seed": 1019,
+      "instruction": "Using your tools, align large block, medium block, small block by size in the center."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1020",
+      "task": "blocks_ranking_size",
+      "seed": 1020,
+      "instruction": "Move large block, medium block, and small block to the center and align."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1021",
+      "task": "blocks_ranking_size",
+      "seed": 1021,
+      "instruction": "Put large block, medium block, and small block in the center by size."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1022",
+      "task": "blocks_ranking_size",
+      "seed": 1022,
+      "instruction": "Use the right arm, the left arm, and the right arm to arrange large block, medium block, and small block centrally by size."
+    },
+    {
+      "episode_id": "blocks_ranking_size:1023",
+      "task": "blocks_ranking_size",
+      "seed": 1023,
+      "instruction": "Move large block with the right arm, medium block with the left arm, and small block with the right arm to arrange them."
+    },
+    {
+      "episode_id": "handover_block:1001",
+      "task": "handover_block",
+      "seed": 1001,
+      "instruction": "Place the red block onto the blue pad using the right arm."
+    },
+    {
+      "episode_id": "handover_block:1002",
+      "task": "handover_block",
+      "seed": 1002,
+      "instruction": "With the left arm, grab the red block, pass it to the right, and set it on the blue pad."
+    },
+    {
+      "episode_id": "handover_block:1003",
+      "task": "handover_block",
+      "seed": 1003,
+      "instruction": "Lift the red block, hand it over, and place it properly."
+    },
+    {
+      "episode_id": "handover_block:1004",
+      "task": "handover_block",
+      "seed": 1004,
+      "instruction": "With the left arm grab the red block, hand it to the right arm, then position it onto the blue pad."
+    },
+    {
+      "episode_id": "handover_block:1005",
+      "task": "handover_block",
+      "seed": 1005,
+      "instruction": "Use your arms to shift the red block."
+    },
+    {
+      "episode_id": "handover_block:1006",
+      "task": "handover_block",
+      "seed": 1006,
+      "instruction": "Grab the red block, transfer it, and set it on blue."
+    },
+    {
+      "episode_id": "handover_block:1008",
+      "task": "handover_block",
+      "seed": 1008,
+      "instruction": "Grab the red block, transfer it, and set it on blue."
+    },
+    {
+      "episode_id": "handover_block:1009",
+      "task": "handover_block",
+      "seed": 1009,
+      "instruction": "Hold the red block with the left arm and place it on the pad."
+    },
+    {
+      "episode_id": "handover_block:1012",
+      "task": "handover_block",
+      "seed": 1012,
+      "instruction": "Grab the red block with the left arm, pass it to the right hand, and drop it on the blue pad."
+    },
+    {
+      "episode_id": "handover_block:1013",
+      "task": "handover_block",
+      "seed": 1013,
+      "instruction": "Grab the red block with the left arm, pass it to the right hand, and drop it on the blue pad."
+    },
+    {
+      "episode_id": "handover_block:1014",
+      "task": "handover_block",
+      "seed": 1014,
+      "instruction": "Place the red block on the blue pad."
+    },
+    {
+      "episode_id": "handover_block:1015",
+      "task": "handover_block",
+      "seed": 1015,
+      "instruction": "Lift the block with the left arm, pass it to the right arm."
+    },
+    {
+      "episode_id": "handover_block:1016",
+      "task": "handover_block",
+      "seed": 1016,
+      "instruction": "Lift the red block with the left arm, pass it to the right arm, and place it on the blue pad."
+    },
+    {
+      "episode_id": "handover_block:1017",
+      "task": "handover_block",
+      "seed": 1017,
+      "instruction": "Move the red block from the left hand to the pad."
+    },
+    {
+      "episode_id": "handover_block:1018",
+      "task": "handover_block",
+      "seed": 1018,
+      "instruction": "With the left arm grab the red block, hand it to the right arm, then position it onto the blue pad."
+    },
+    {
+      "episode_id": "handover_block:1019",
+      "task": "handover_block",
+      "seed": 1019,
+      "instruction": "Hold the red block with the left arm and place it on the pad."
+    },
+    {
+      "episode_id": "handover_block:1020",
+      "task": "handover_block",
+      "seed": 1020,
+      "instruction": "Place the red block onto the blue pad using the right arm."
+    },
+    {
+      "episode_id": "handover_block:1021",
+      "task": "handover_block",
+      "seed": 1021,
+      "instruction": "Move the red block using the left arm."
+    },
+    {
+      "episode_id": "handover_block:1022",
+      "task": "handover_block",
+      "seed": 1022,
+      "instruction": "Lift the red block with your left arm."
+    },
+    {
+      "episode_id": "handover_block:1023",
+      "task": "handover_block",
+      "seed": 1023,
+      "instruction": "Pick the red block from the table, switch it from the left arm to the right, and place it down on the blue pad."
+    },
+    {
+      "episode_id": "hanging_mug:1001",
+      "task": "hanging_mug",
+      "seed": 1001,
+      "instruction": "Take the glossy black mug medium-sized for drinking, rotate it, place it in the center, then hang it on the angular rack with slanted support rod."
+    },
+    {
+      "episode_id": "hanging_mug:1003",
+      "task": "hanging_mug",
+      "seed": 1003,
+      "instruction": "Pick the blue mug with solid texture, turn it, put it in the center, and transfer it to the dark gray angled rack."
+    },
+    {
+      "episode_id": "hanging_mug:1006",
+      "task": "hanging_mug",
+      "seed": 1006,
+      "instruction": "Lift the medium mug fits in hand from the table, turn it, put it down in the middle, then hang it onto the angled rack with long and short rods."
+    },
+    {
+      "episode_id": "hanging_mug:1007",
+      "task": "hanging_mug",
+      "seed": 1007,
+      "instruction": "Take the white ceramic mug with handle from the table, spin it, place it in the center, then hang it on the angular rack with slanted support rod."
+    },
+    {
+      "episode_id": "hanging_mug:1008",
+      "task": "hanging_mug",
+      "seed": 1008,
+      "instruction": "Take the mug with cartoon design with one arm, rotate it, and hang it onto the metallic angular rack with rod pair."
+    },
+    {
+      "episode_id": "hanging_mug:1012",
+      "task": "hanging_mug",
+      "seed": 1012,
+      "instruction": "Pick up the beige mug polished ceramic build, turn it, place it centrally, then hang the beige mug polished ceramic build onto the metal rack."
+    },
+    {
+      "episode_id": "hanging_mug:1015",
+      "task": "hanging_mug",
+      "seed": 1015,
+      "instruction": "Use your left arm to grab the brown mug for drinking, rotate it, set it down, then hang on the medium rack with protruding rods."
+    },
+    {
+      "episode_id": "hanging_mug:1019",
+      "task": "hanging_mug",
+      "seed": 1019,
+      "instruction": "Use the left arm to grab the palm-sized mug glossy black body, rotate it, place it down, and hang it onto the angled rack with long and short rods with the right arm."
+    },
+    {
+      "episode_id": "hanging_mug:1020",
+      "task": "hanging_mug",
+      "seed": 1020,
+      "instruction": "With the left arm, grab the mug with blue print, spin it, place it down, then use the right arm to hang it on the metal rack."
+    },
+    {
+      "episode_id": "hanging_mug:1021",
+      "task": "hanging_mug",
+      "seed": 1021,
+      "instruction": "Grab the ceramic mug with printed logo, rotate it, place it in the middle, and hang it on the smooth rack."
+    },
+    {
+      "episode_id": "hanging_mug:1022",
+      "task": "hanging_mug",
+      "seed": 1022,
+      "instruction": "With the left arm, grab the black ceramic mug, spin it, place it down, then use the right arm to hang it on the smooth dark gray rack."
+    },
+    {
+      "episode_id": "hanging_mug:1023",
+      "task": "hanging_mug",
+      "seed": 1023,
+      "instruction": "Take the mug with side handle, rotate it, set it in the middle, then hang it on the rack with two rods sticking out."
+    },
+    {
+      "episode_id": "hanging_mug:1024",
+      "task": "hanging_mug",
+      "seed": 1024,
+      "instruction": "Use the right arm to lift the mug with rounded handle, rotate it, and attach it to the smooth dark gray rack after setting it down."
+    },
+    {
+      "episode_id": "hanging_mug:1026",
+      "task": "hanging_mug",
+      "seed": 1026,
+      "instruction": "Using your left arm, lift the ceramic mug with printed logo, rotate it, place it down, then your right arm to hang it onto the medium rack with protruding rods."
+    },
+    {
+      "episode_id": "hanging_mug:1029",
+      "task": "hanging_mug",
+      "seed": 1029,
+      "instruction": "Pick the colorful cartoon mug from the table using one hand, rotate, and hang it on the metallic angular rack with rod pair."
+    },
+    {
+      "episode_id": "hanging_mug:1031",
+      "task": "hanging_mug",
+      "seed": 1031,
+      "instruction": "Use the right arm to lift the black mug with handle, rotate it, and attach it to the metallic rack with smooth finish after setting it down."
+    },
+    {
+      "episode_id": "hanging_mug:1036",
+      "task": "hanging_mug",
+      "seed": 1036,
+      "instruction": "Use the left arm to grab the handle-mounted blue drinking mug, flip it, set it down, and then attach it to the dark gray rack."
+    },
+    {
+      "episode_id": "hanging_mug:1039",
+      "task": "hanging_mug",
+      "seed": 1039,
+      "instruction": "Take the beige mug with one arm, rotate it, and hang it onto the dark gray rack."
+    },
+    {
+      "episode_id": "hanging_mug:1042",
+      "task": "hanging_mug",
+      "seed": 1042,
+      "instruction": "Take the medium beige mug from the table, spin it, place it in the center, then hang it on the metallic angular rack with rod pair."
+    },
+    {
+      "episode_id": "hanging_mug:1047",
+      "task": "hanging_mug",
+      "seed": 1047,
+      "instruction": "Use the left arm to grab the mug with glossy texture, rotate it, place it down, and hang it onto the angular rack with slanted support rod with the right arm."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1000",
+      "task": "pick_dual_bottles",
+      "seed": 1000,
+      "instruction": "Lift the red-capped bottle in one hand and the bottle with rounded neck in the other."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1001",
+      "task": "pick_dual_bottles",
+      "seed": 1001,
+      "instruction": "Hold the plastic drink bottle and the medium-sized green bottle separately."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1002",
+      "task": "pick_dual_bottles",
+      "seed": 1002,
+      "instruction": "Grab the red-capped bottle first, then grab the smooth green bottle second."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1003",
+      "task": "pick_dual_bottles",
+      "seed": 1003,
+      "instruction": "Catch the dark drink bottle with logo first, then catch the bottle with narrow top."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1004",
+      "task": "pick_dual_bottles",
+      "seed": 1004,
+      "instruction": "Catch the plastic drink bottle with one hand, catch the smooth green plastic bottle with the other."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1005",
+      "task": "pick_dual_bottles",
+      "seed": 1005,
+      "instruction": "Lift bottle the narrow-necked bottle, then bottle the medium green bottle."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1009",
+      "task": "pick_dual_bottles",
+      "seed": 1009,
+      "instruction": "Pick the bottle with ridges on bottom with one hand, the medium-sized green bottle with another."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1010",
+      "task": "pick_dual_bottles",
+      "seed": 1010,
+      "instruction": "Catch the dark drink bottle with logo in one hand and the smooth green bottle too."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1011",
+      "task": "pick_dual_bottles",
+      "seed": 1011,
+      "instruction": "Catch the hand-sized soda bottle with one arm, then grab the bottle with narrow top."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1012",
+      "task": "pick_dual_bottles",
+      "seed": 1012,
+      "instruction": "Reach for the bottle with ridges on bottom, then grab the bottle with rounded neck."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1013",
+      "task": "pick_dual_bottles",
+      "seed": 1013,
+      "instruction": "Grab the bottles the bottle with white neck and red top and the medium green bottle with capped neck."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1015",
+      "task": "pick_dual_bottles",
+      "seed": 1015,
+      "instruction": "Take the brown bottle with red label with one arm, hold the plastic bottle too."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1016",
+      "task": "pick_dual_bottles",
+      "seed": 1016,
+      "instruction": "Hold the red-capped bottle in one hand and the bottle with white printed label in another."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1017",
+      "task": "pick_dual_bottles",
+      "seed": 1017,
+      "instruction": "Secure the red-capped bottle and the handheld green bottle using separate hands."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1018",
+      "task": "pick_dual_bottles",
+      "seed": 1018,
+      "instruction": "Lift both the smooth bottle with red lid and the green bottle with indented base bottles."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1019",
+      "task": "pick_dual_bottles",
+      "seed": 1019,
+      "instruction": "Grab and lift the red-capped bottle, then lift the handheld green bottle next."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1020",
+      "task": "pick_dual_bottles",
+      "seed": 1020,
+      "instruction": "Reach for the brown bottle with red label, then grab the bottle with rounded neck."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1021",
+      "task": "pick_dual_bottles",
+      "seed": 1021,
+      "instruction": "Grasp the Coca-Cola bottle and the smooth green plastic bottle with both arms."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1023",
+      "task": "pick_dual_bottles",
+      "seed": 1023,
+      "instruction": "Lift the narrow-necked bottle and the green bottle with indented base simultaneously with both arms."
+    },
+    {
+      "episode_id": "pick_dual_bottles:1025",
+      "task": "pick_dual_bottles",
+      "seed": 1025,
+      "instruction": "Lift the hand-sized soda bottle with one arm and the bottle with white printed label with the other."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1003",
+      "task": "put_bottles_dustbin",
+      "seed": 1003,
+      "instruction": "Using arms, pick up the bottle with green cap, the transparent bottle, and the drink bottle with slim neck, dropping each into the trash bin."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1004",
+      "task": "put_bottles_dustbin",
+      "seed": 1004,
+      "instruction": "Put the smooth yellow bottle with ridged cap into the smooth black dustbin, followed by the medium-sized water bottle and the rounded bottle with a white neck."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1005",
+      "task": "put_bottles_dustbin",
+      "seed": 1005,
+      "instruction": "Use arms to move the bottle made of smooth plastic, the water bottle with textured body, and the bottle with curved body shape into the black bin with white liner."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1007",
+      "task": "put_bottles_dustbin",
+      "seed": 1007,
+      "instruction": "Put the bottle made of smooth plastic into the rectangular black trash holder, followed by the bottle with narrow neck and the black soda bottle with white top."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1008",
+      "task": "put_bottles_dustbin",
+      "seed": 1008,
+      "instruction": "Move the bottle with green cap, the transparent bottle, and the red-labeled soda bottle into the dustbin with white inner bag one by one."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1009",
+      "task": "put_bottles_dustbin",
+      "seed": 1009,
+      "instruction": "Use arms to pick the medium yellow cylindrical bottle, drop it in the smooth black dustbin, repeat for the medium-sized water bottle and the drink bottle with slim neck."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1011",
+      "task": "put_bottles_dustbin",
+      "seed": 1011,
+      "instruction": "Carry the bottle with small ridged green cap first, drop it into the black bin with white liner, repeat with the medium-sized water bottle and the black bottle with red label."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1013",
+      "task": "put_bottles_dustbin",
+      "seed": 1013,
+      "instruction": "Transfer the bottle with green cap, the medium-sized water bottle, and the drink bottle with slim neck into the black dustbin using your arms, one by one."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1018",
+      "task": "put_bottles_dustbin",
+      "seed": 1018,
+      "instruction": "Use the arms to move the bottle made of smooth plastic into the black garbage bin, then repeat for the cylindrical bottle and the drink bottle with slim neck."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1024",
+      "task": "put_bottles_dustbin",
+      "seed": 1024,
+      "instruction": "Using arms, grab the medium yellow cylindrical bottle and put it in the plastic dustbin, repeat for the water bottle with textured body and the smooth plastic bottle."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1025",
+      "task": "put_bottles_dustbin",
+      "seed": 1025,
+      "instruction": "Place the yellow liquid container with green top, the bottle with turquoise cap, and the drink bottle with slim neck in the black garbage bin using the arms."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1026",
+      "task": "put_bottles_dustbin",
+      "seed": 1026,
+      "instruction": "Use arms to pick the medium plastic bottle with tapered neck, drop it in the rectangular black trash holder, repeat for the bottle with narrow neck and the hand-sized drinking bottle."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1027",
+      "task": "put_bottles_dustbin",
+      "seed": 1027,
+      "instruction": "Grab the bottle with small ridged green cap, put it in the dustbin with white inner bag, follow by moving the blue-accented cylindrical bottle and the smooth plastic bottle there too."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1028",
+      "task": "put_bottles_dustbin",
+      "seed": 1028,
+      "instruction": "Move the cylindrical yellow bottle for holding liquids to the dustbin with lid and bag, then the blue-accented cylindrical bottle, and finally the bottle with curved body shape."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1029",
+      "task": "put_bottles_dustbin",
+      "seed": 1029,
+      "instruction": "Use arms to pick the medium plastic bottle with tapered neck, the smooth transparent plastic bottle, and the red bottle, dropping them into the trash bin."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1032",
+      "task": "put_bottles_dustbin",
+      "seed": 1032,
+      "instruction": "Use arms to pick the smooth yellow bottle with ridged cap, the bottle with narrow neck, the red-labeled soda bottle, and place them one by one in the black and white trash holder."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1033",
+      "task": "put_bottles_dustbin",
+      "seed": 1033,
+      "instruction": "Carefully grab the yellow liquid container with green top, the medium-sized water bottle, and the red and black beverage bottle and position them in the black dustbin."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1035",
+      "task": "put_bottles_dustbin",
+      "seed": 1035,
+      "instruction": "Take the smooth yellow bottle with ridged cap, drop it in the plastic dustbin, then move the transparent bottle and the red and black beverage bottle to the plastic dustbin."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1039",
+      "task": "put_bottles_dustbin",
+      "seed": 1039,
+      "instruction": "Using arms, grab the medium yellow cylindrical bottle and put it in the medium black garbage container, repeat for the bottle for holding liquids and the red bottle."
+    },
+    {
+      "episode_id": "put_bottles_dustbin:1042",
+      "task": "put_bottles_dustbin",
+      "seed": 1042,
+      "instruction": "Use arms to move the bottle made of smooth plastic, the clear bottle with blue sections, and the plastic bottle with red cap into the medium black garbage container."
+    },
+    {
+      "episode_id": "scan_object:1000",
+      "task": "scan_object",
+      "seed": 1000,
+      "instruction": "Take the black plastic scanner with blue trim in the left arm, pick the square-shaped tea-box in the right arm, and scan the square-shaped tea-box using the black plastic scanner with blue trim."
+    },
+    {
+      "episode_id": "scan_object:1001",
+      "task": "scan_object",
+      "seed": 1001,
+      "instruction": "Using the left arm, pick the lightweight handheld barcode scanner, then use the right arm to grab the tea-box with curved edges and scan it."
+    },
+    {
+      "episode_id": "scan_object:1002",
+      "task": "scan_object",
+      "seed": 1002,
+      "instruction": "First grab the scanner with trigger on handle, then the square-shaped tea box, and use the scanner with trigger on handle to scan the square-shaped tea box."
+    },
+    {
+      "episode_id": "scan_object:1004",
+      "task": "scan_object",
+      "seed": 1004,
+      "instruction": "Hold the scanner with rectangular black end in one arm and the tea-box with rectangular edges in the other, then scan the tea-box with rectangular edges with the scanner with rectangular black end."
+    },
+    {
+      "episode_id": "scan_object:1005",
+      "task": "scan_object",
+      "seed": 1005,
+      "instruction": "Grab the handheld scanner in one hand, pick the rectangular box for tea in the other hand, then scan the rectangular box for tea with the handheld scanner"
+    },
+    {
+      "episode_id": "scan_object:1008",
+      "task": "scan_object",
+      "seed": 1008,
+      "instruction": "Grab the gun-shaped scanner in one hand, pick the green tea box in the other hand, then scan the green tea box with the gun-shaped scanner"
+    },
+    {
+      "episode_id": "scan_object:1014",
+      "task": "scan_object",
+      "seed": 1014,
+      "instruction": "Grab the black scanner with gray handle using one arm, pick the tea-box with curved edges using the other arm, then scan the tea-box with curved edges with the black scanner with gray handle"
+    },
+    {
+      "episode_id": "scan_object:1021",
+      "task": "scan_object",
+      "seed": 1021,
+      "instruction": "Grab the hand scanner with blue lens area in one hand, pick the leaf-patterned green tea storage in the other hand, then scan the leaf-patterned green tea storage with the hand scanner with blue lens area"
+    },
+    {
+      "episode_id": "scan_object:1024",
+      "task": "scan_object",
+      "seed": 1024,
+      "instruction": "Use the right arm to pick the scanner with blue scanning area, use the left arm to grab the rectangular box for tea, and scan the rectangular box for tea with the scanner with blue scanning area."
+    },
+    {
+      "episode_id": "scan_object:1026",
+      "task": "scan_object",
+      "seed": 1026,
+      "instruction": "Pick the barcode scanner with yellow body, grab the tea-box with floral design, then scan the tea-box with floral design using the barcode scanner with yellow body."
+    },
+    {
+      "episode_id": "scan_object:1032",
+      "task": "scan_object",
+      "seed": 1032,
+      "instruction": "Handle the curved black scanner with trigger and the compact rectangular tea-box separately, ensuring the curved black scanner with trigger scans the compact rectangular tea-box."
+    },
+    {
+      "episode_id": "scan_object:1033",
+      "task": "scan_object",
+      "seed": 1033,
+      "instruction": "Use one arm for the barcode scanner and the other for the hard plastic tea-box, then scan the hard plastic tea-box with the barcode scanner"
+    },
+    {
+      "episode_id": "scan_object:1044",
+      "task": "scan_object",
+      "seed": 1044,
+      "instruction": "the left arm picks up the smooth plastic barcode scanner, the right arm holds the gold-decorated beige tea box, and you scan the gold-decorated beige tea box with the smooth plastic barcode scanner."
+    },
+    {
+      "episode_id": "scan_object:1052",
+      "task": "scan_object",
+      "seed": 1052,
+      "instruction": "the left arm grabs the black scanner, the right arm picks the printed tea-box, and the black scanner scans the printed tea-box."
+    },
+    {
+      "episode_id": "scan_object:1059",
+      "task": "scan_object",
+      "seed": 1059,
+      "instruction": "Grab the scanner with curved grip, pick the green tea box, and perform a scan on the green tea box with the scanner with curved grip."
+    },
+    {
+      "episode_id": "scan_object:1060",
+      "task": "scan_object",
+      "seed": 1060,
+      "instruction": "Use one arm to grab the scanner for reading barcodes, the other to hold the leaf-patterned green tea storage, and scan it."
+    },
+    {
+      "episode_id": "scan_object:1064",
+      "task": "scan_object",
+      "seed": 1064,
+      "instruction": "With the right arm, pick the smooth plastic barcode scanner, then grab the beige tea-box with handle with the left arm, and scan the beige tea-box with handle."
+    },
+    {
+      "episode_id": "scan_object:1065",
+      "task": "scan_object",
+      "seed": 1065,
+      "instruction": "Using one hand for the barcode scanner and the other for the cardboard tea-box, complete the scan."
+    },
+    {
+      "episode_id": "scan_object:1070",
+      "task": "scan_object",
+      "seed": 1070,
+      "instruction": "Grab the tea-box with bold white writing, pick the small black handheld scanner, and use the small black handheld scanner to scan the tea-box with bold white writing."
+    },
+    {
+      "episode_id": "scan_object:1075",
+      "task": "scan_object",
+      "seed": 1075,
+      "instruction": "Grab the black scanner using one arm, pick the cube tea box with gold designs using the other arm, then scan the cube tea box with gold designs with the black scanner"
+    },
+    {
+      "episode_id": "stack_bowls_three:1000",
+      "task": "stack_bowls_three",
+      "seed": 1000,
+      "instruction": "Stack all three the bowl with shiny texture by placing one on top of another."
+    },
+    {
+      "episode_id": "stack_bowls_three:1002",
+      "task": "stack_bowls_three",
+      "seed": 1002,
+      "instruction": "Arrange all three the bowl with shiny texture into a vertical stack."
+    },
+    {
+      "episode_id": "stack_bowls_three:1004",
+      "task": "stack_bowls_three",
+      "seed": 1004,
+      "instruction": "Start with the bottom the blue bowl and finish stacking."
+    },
+    {
+      "episode_id": "stack_bowls_three:1005",
+      "task": "stack_bowls_three",
+      "seed": 1005,
+      "instruction": "Align bowls the ceramic bowl in descending size, forming a stack."
+    },
+    {
+      "episode_id": "stack_bowls_three:1007",
+      "task": "stack_bowls_three",
+      "seed": 1007,
+      "instruction": "Organize bowls the medium-sized bowl for holding food by stacking them in size order."
+    },
+    {
+      "episode_id": "stack_bowls_three:1010",
+      "task": "stack_bowls_three",
+      "seed": 1010,
+      "instruction": "Arrange the medium-sized bowl for holding food one on top of another."
+    },
+    {
+      "episode_id": "stack_bowls_three:1012",
+      "task": "stack_bowls_three",
+      "seed": 1012,
+      "instruction": "Grab the glazed bowl with curved sides, stack from largest at the base to the smallest."
+    },
+    {
+      "episode_id": "stack_bowls_three:1013",
+      "task": "stack_bowls_three",
+      "seed": 1013,
+      "instruction": "Position the second the rounded bowl with light blue color over the first, then the third on top."
+    },
+    {
+      "episode_id": "stack_bowls_three:1015",
+      "task": "stack_bowls_three",
+      "seed": 1015,
+      "instruction": "Lift each the ceramic bowl and stack it over the previous one."
+    },
+    {
+      "episode_id": "stack_bowls_three:1016",
+      "task": "stack_bowls_three",
+      "seed": 1016,
+      "instruction": "Stack all three the small bowl with brown edge by placing one on top of another."
+    },
+    {
+      "episode_id": "stack_bowls_three:1017",
+      "task": "stack_bowls_three",
+      "seed": 1017,
+      "instruction": "Arrange the blue bowl one on top of another."
+    },
+    {
+      "episode_id": "stack_bowls_three:1018",
+      "task": "stack_bowls_three",
+      "seed": 1018,
+      "instruction": "Start with the first the curved bowl light blue shade, adding the next two in sequence."
+    },
+    {
+      "episode_id": "stack_bowls_three:1022",
+      "task": "stack_bowls_three",
+      "seed": 1022,
+      "instruction": "Pick each the curved bowl light blue shade and stack them in order one on top of another."
+    },
+    {
+      "episode_id": "stack_bowls_three:1023",
+      "task": "stack_bowls_three",
+      "seed": 1023,
+      "instruction": "Use arms to place each the rounded bowl with light blue color atop the previous one."
+    },
+    {
+      "episode_id": "stack_bowls_three:1024",
+      "task": "stack_bowls_three",
+      "seed": 1024,
+      "instruction": "Grab a the blue bowl, set it down, and stack the rest on it."
+    },
+    {
+      "episode_id": "stack_bowls_three:1025",
+      "task": "stack_bowls_three",
+      "seed": 1025,
+      "instruction": "Take each the curved bowl light blue shade and place them one by one on top."
+    },
+    {
+      "episode_id": "stack_bowls_three:1029",
+      "task": "stack_bowls_three",
+      "seed": 1029,
+      "instruction": "Arrange all three the blue bowl with slightly rounded base into a vertical stack."
+    },
+    {
+      "episode_id": "stack_bowls_three:1030",
+      "task": "stack_bowls_three",
+      "seed": 1030,
+      "instruction": "Take each the medium-sized bowl for holding food and place them one by one on top."
+    },
+    {
+      "episode_id": "stack_bowls_three:1035",
+      "task": "stack_bowls_three",
+      "seed": 1035,
+      "instruction": "Grab the curved bowl light blue shade, stack from largest at the base to the smallest."
+    },
+    {
+      "episode_id": "stack_bowls_three:1040",
+      "task": "stack_bowls_three",
+      "seed": 1040,
+      "instruction": "Align and stack the the small bowl with brown edge step by step using arms."
+    },
+    {
+      "episode_id": "stamp_seal:1000",
+      "task": "stamp_seal",
+      "seed": 1000,
+      "instruction": "Position the yellow stamping tool on Olive, apply pressure"
+    },
+    {
+      "episode_id": "stamp_seal:1001",
+      "task": "stamp_seal",
+      "seed": 1001,
+      "instruction": "Lift the plastic seal with handle and press onto Lime"
+    },
+    {
+      "episode_id": "stamp_seal:1005",
+      "task": "stamp_seal",
+      "seed": 1005,
+      "instruction": "With the right arm, secure the palm-sized stamping seal and mark Tan."
+    },
+    {
+      "episode_id": "stamp_seal:1006",
+      "task": "stamp_seal",
+      "seed": 1006,
+      "instruction": "Grab the yellow seal with ridged grip and press Lime"
+    },
+    {
+      "episode_id": "stamp_seal:1008",
+      "task": "stamp_seal",
+      "seed": 1008,
+      "instruction": "Press the seal for imprinting onto Red"
+    },
+    {
+      "episode_id": "stamp_seal:1009",
+      "task": "stamp_seal",
+      "seed": 1009,
+      "instruction": "With the right arm, secure the seal with raised rounded edges and mark Orange."
+    },
+    {
+      "episode_id": "stamp_seal:1012",
+      "task": "stamp_seal",
+      "seed": 1012,
+      "instruction": "Set the small seal with round base on Indigo"
+    },
+    {
+      "episode_id": "stamp_seal:1013",
+      "task": "stamp_seal",
+      "seed": 1013,
+      "instruction": "Stamp Orange after grabbing the seal with smooth handle"
+    },
+    {
+      "episode_id": "stamp_seal:1014",
+      "task": "stamp_seal",
+      "seed": 1014,
+      "instruction": "the right arm holds the yellow stamping tool, presses Black"
+    },
+    {
+      "episode_id": "stamp_seal:1023",
+      "task": "stamp_seal",
+      "seed": 1023,
+      "instruction": "Place the hand-sized rectangular brown seal onto Brown after grabbing."
+    },
+    {
+      "episode_id": "stamp_seal:1024",
+      "task": "stamp_seal",
+      "seed": 1024,
+      "instruction": "Position the yellow stamping tool over Gray and stamp"
+    },
+    {
+      "episode_id": "stamp_seal:1026",
+      "task": "stamp_seal",
+      "seed": 1026,
+      "instruction": "Press the plastic seal with handle firmly onto Black"
+    },
+    {
+      "episode_id": "stamp_seal:1029",
+      "task": "stamp_seal",
+      "seed": 1029,
+      "instruction": "Lift the reddish seal with light markings and press onto Tan"
+    },
+    {
+      "episode_id": "stamp_seal:1031",
+      "task": "stamp_seal",
+      "seed": 1031,
+      "instruction": "Take the red seal for stamping and stamp it on Green."
+    },
+    {
+      "episode_id": "stamp_seal:1033",
+      "task": "stamp_seal",
+      "seed": 1033,
+      "instruction": "Grab the hand-sized red and black seal, align it with Cyan"
+    },
+    {
+      "episode_id": "stamp_seal:1034",
+      "task": "stamp_seal",
+      "seed": 1034,
+      "instruction": "Pick the yellow seal and press on Navy"
+    },
+    {
+      "episode_id": "stamp_seal:1035",
+      "task": "stamp_seal",
+      "seed": 1035,
+      "instruction": "the right arm picks the round yellow seal base, stamps Indigo"
+    },
+    {
+      "episode_id": "stamp_seal:1037",
+      "task": "stamp_seal",
+      "seed": 1037,
+      "instruction": "Position the seal with white engraving on Black, apply pressure"
+    },
+    {
+      "episode_id": "stamp_seal:1039",
+      "task": "stamp_seal",
+      "seed": 1039,
+      "instruction": "the left arm holds the yellow seal, presses Orange"
+    },
+    {
+      "episode_id": "stamp_seal:1040",
+      "task": "stamp_seal",
+      "seed": 1040,
+      "instruction": "Use the right arm to lift the yellow seal, then stamp Cyan."
+    }
+  ]
+}

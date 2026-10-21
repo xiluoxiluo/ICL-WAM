@@ -173,11 +173,20 @@ def create_fastwam(
 
         prompt_cfg = dict(zeva.get("prompt", {}))
         adapter_cfg = dict(zeva.get("adapter", {}))
-        prompt_keys = {
-            "global_dim", "phase_dim", "effect_dim", "brief_length",
-            "persistent_length", "hidden_dim", "num_heads",
-            "pim_context_dropout", "pim_support_dropout",
-        }
+        # Keep the readout and injection on the same explicit checkpoint
+        # variant. Old configurations retain their original gated path.
+        variant = zeva.get("pim_variant")
+        prompt_variant = str(prompt_cfg.get("pim_variant", variant or "legacy"))
+        adapter_variant = str(adapter_cfg.get("pim_variant", variant or "legacy"))
+        if prompt_variant != adapter_variant or (
+            variant is not None and str(variant) != prompt_variant
+        ):
+            raise ValueError("zeva.pim_variant, prompt.pim_variant and adapter.pim_variant must agree")
+        if prompt_variant not in {"legacy", "cross_attempt"}:
+            raise ValueError("zeva.pim_variant must be legacy or cross_attempt")
+        prompt_cfg["pim_variant"] = prompt_variant
+        adapter_cfg["pim_variant"] = adapter_variant
+        prompt_keys = set(CausalPromptConfig.__dataclass_fields__)
         adapter_keys = {"memory_dim", "action_horizon", "action_hidden_dim", "num_heads", "mlp_ratio", "gate_init"}
         adapter_mode = str(adapter_cfg.get("mode", "exact_zeva"))
         if adapter_mode == "exact_zeva":
@@ -198,6 +207,8 @@ def create_fastwam(
                 ExactZevaPolicyInjectionConfig(**exact_cfg)
             )
         elif adapter_mode == "memory_residual":
+            if prompt_variant != "legacy":
+                raise ValueError("cross_attempt PIM requires zeva.adapter.mode=exact_zeva")
             policy_adapter = BehaviorPrefixAdapter(
                 BehaviorPrefixAdapterConfig(**{k: v for k, v in adapter_cfg.items() if k in adapter_keys})
             )

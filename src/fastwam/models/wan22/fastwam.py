@@ -951,6 +951,8 @@ class FastWAM(torch.nn.Module):
         if injection_mode == "exact_zeva":
             prompt_cfg = causal_prompt_encoder.config
             adapter_cfg = behavior_prefix_adapter.config
+            if prompt_cfg.pim_variant != adapter_cfg.pim_variant:
+                raise ValueError("prompt and adapter pim_variant must match")
             dimension_pairs = (
                 ("global_dim", adapter_cfg.global_dim, prompt_cfg.global_dim),
                 ("phase_dim", adapter_cfg.phase_dim, prompt_cfg.phase_dim),
@@ -979,6 +981,8 @@ class FastWAM(torch.nn.Module):
         self.zeva_behavior_prefix_adapter = behavior_prefix_adapter.to(device=self.device, dtype=self.torch_dtype)
         self.zeva_prompt_encoder.requires_grad_(True)
         self.zeva_behavior_prefix_adapter.requires_grad_(True)
+        if getattr(behavior_prefix_adapter.config, "pim_variant", "legacy") == "cross_attempt":
+            self.zeva_behavior_prefix_adapter.pim_gate.requires_grad_(False)
         self.zeva_injection_mode = injection_mode
         self.zeva_enabled = True
         self.zeva_mode = "pim_on"
@@ -1027,8 +1031,10 @@ class FastWAM(torch.nn.Module):
             self.zeva_prompt_encoder.train()
             self.zeva_prompt_encoder.requires_grad_(True)
             adapter.prefix_project.train()
-            adapter.prefix_project.requires_grad_(True)
-            adapter.pim_gate.requires_grad_(True)
+            for parameter in adapter.pim_adapter_parameters():
+                parameter.requires_grad_(True)
+            if getattr(adapter.config, "pim_variant", "legacy") == "cross_attempt":
+                adapter.pim_to_global.train()
             return
         raise RuntimeError(f"unsupported Zeva training stage: {stage}")
 
@@ -1305,17 +1311,29 @@ class FastWAM(torch.nn.Module):
             device=loss_per_sample.device, dtype=loss_per_sample.dtype
         )
         loss = (loss_per_sample * action_weight).mean()
-        if (
-            getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
-            and self.zeva_training_stage == "policy_injection"
-        ):
+        flow_loss = loss
+        cross_attempt = (
+            getattr(self.zeva_behavior_prefix_adapter.config, "pim_variant", "legacy")
+            == "cross_attempt"
+        )
+        if exact_zeva and (self.zeva_training_stage == "policy_injection" or cross_attempt):
             if zeva_prior_mean is None or zeva_prior_std is None:
                 raise ValueError("exact Zeva training requires action-prior outputs")
             prior_loss = gaussian_prior_nll(
                 clean_action.float(), zeva_prior_mean.float(), zeva_prior_std.float(), action_valid
             )
             loss = loss + prior_loss * float(self.zeva_behavior_prefix_adapter.config.prior_loss_weight)
-            prior_metrics = {"behavior_prior_nll": float(prior_loss.detach().cpu())}
+            prior_error = (clean_action.float() - zeva_prior_mean.float()).square().mean(dim=-1)
+            if action_valid is not None:
+                prior_valid = action_valid.to(device=prior_error.device, dtype=prior_error.dtype)
+                prior_mse = (prior_error * prior_valid).sum() / prior_valid.sum().clamp_min(1)
+            else:
+                prior_mse = prior_error.mean()
+            prior_metrics = {
+                "behavior_prior_nll": float(prior_loss.detach().cpu()),
+                "action_prior/mean_mse": float(prior_mse.detach().cpu()),
+                "action_prior/std_mean": float(zeva_prior_std.detach().float().mean().cpu()),
+            }
             residual = zeva_action_residual
             gate = float(torch.tanh(self.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
         else:
@@ -1332,6 +1350,7 @@ class FastWAM(torch.nn.Module):
         residual_norm = float(residual.detach().float().norm(dim=-1).mean().cpu())
         metrics = {
             "loss_action": float(loss.detach()),
+            "loss_flow": float(flow_loss.detach()),
             "gate": gate,
             "behavior_residual_norm": residual_norm,
         }
@@ -1347,6 +1366,35 @@ class FastWAM(torch.nn.Module):
             "memory/conditioned_action_hidden_norm": metrics.get("conditioned_action_hidden_norm", 0.0),
             "memory/memory_residual_ratio": metrics.get("memory_residual_ratio", 0.0),
         })
+        if exact_zeva:
+            # The denoiser's hidden residual is the action prior, not a PIM
+            # prefix. Retain legacy aliases but expose unambiguous metrics.
+            metrics["action_prior/hidden_residual_norm"] = residual_norm
+            with torch.no_grad():
+                adapter = self.zeva_behavior_prefix_adapter
+                parent_prefix = adapter.behavior_prefix_slot(
+                    zeva_task_tokens, causal_prompt, pim_mask, enable_pim=False,
+                )
+                actual_prefix = behavior_token.to(parent_prefix)
+                prefix_delta = actual_prefix - parent_prefix
+                base_norm = parent_prefix.float().norm(dim=-1).mean()
+                delta_norm = prefix_delta.float().norm(dim=-1).mean()
+                metrics["memory/prefix_delta_norm"] = float(delta_norm.cpu())
+                metrics["memory/prefix_delta_ratio"] = float((delta_norm / base_norm.clamp_min(1e-8)).cpu())
+                metrics["memory/nonempty_fraction"] = float(pim_mask.any(dim=-1).float().mean().cpu())
+            if cross_attempt:
+                # There is no learned scalar gain in this variant. Omit the
+                # compatibility parameter instead of presenting it as usage.
+                metrics.pop("gate", None)
+                metrics.pop("memory/gate", None)
+                metrics["memory/scalar_gate_active"] = 0.0
+                metrics["action_prior/hidden_residual_ratio"] = metrics.get("memory_residual_ratio", 0.0)
+                for misleading_name in (
+                    "behavior_residual_norm", "memory_delta_hidden_norm", "memory_residual_ratio",
+                    "memory/base_action_hidden_norm", "memory/memory_delta_hidden_norm",
+                    "memory/conditioned_action_hidden_norm", "memory/memory_residual_ratio",
+                ):
+                    metrics.pop(misleading_name, None)
         return loss, metrics
 
     @torch.no_grad()
@@ -1926,6 +1974,12 @@ class FastWAM(torch.nn.Module):
             "causal_prompt_encoder": self.zeva_prompt_encoder.state_dict(),
             "behavior_prefix_adapter": self.zeva_behavior_prefix_adapter.state_dict(),
             "pim_gate": self.zeva_behavior_prefix_adapter.pim_gate.detach().cpu(),
+            "pim_variant": getattr(self.zeva_behavior_prefix_adapter.config, "pim_variant", "legacy"),
+            "addon_schema": (
+                "cross_attempt_v1"
+                if getattr(self.zeva_behavior_prefix_adapter.config, "pim_variant", "legacy") == "cross_attempt"
+                else "legacy"
+            ),
             "training_stage": self.zeva_training_stage,
             "step": int(step), "config": config or {},
             "base_checkpoint_sha256": base_checkpoint_sha256,
@@ -1961,8 +2015,11 @@ class FastWAM(torch.nn.Module):
             allowed = (
                 "zeva_prompt_encoder.",
                 "zeva_behavior_prefix_adapter.prefix_project.",
-                "zeva_behavior_prefix_adapter.pim_gate",
             )
+            if getattr(self.zeva_behavior_prefix_adapter.config, "pim_variant", "legacy") == "cross_attempt":
+                allowed += ("zeva_behavior_prefix_adapter.pim_to_global.",)
+            else:
+                allowed += ("zeva_behavior_prefix_adapter.pim_gate",)
         else:
             raise RuntimeError(f"unsupported Zeva training stage: {stage}")
         invalid = [
@@ -2086,14 +2143,18 @@ class FastWAM(torch.nn.Module):
         zeva_prior_std = None
         if getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva":
             adapter = self.zeva_behavior_prefix_adapter
-            zeva_prior_mean, zeva_prior_std = adapter.prior(
+            zeva_prior_mean, zeva_prior_std = adapter.prior_for_prompt(
                 task_tokens,
                 sample["phase"].to(self.device),
                 sample["bit_effects"].to(self.device),
                 sample["bit_mask"].to(self.device),
+                causal_prompt,
+                pim_mask_for_policy,
+                enable_pim=(stage == "pim_adapter"),
             )
             zeva_action_residual = adapter.action_prior_residual(
-                zeva_prior_mean, training=True
+                zeva_prior_mean,
+                training=bool(adapter.prior.training or self.zeva_prompt_encoder.training),
             )
         loss, metrics = self.forward_zeva_action_train(
             input_image=video[:, :, 0],
@@ -2125,4 +2186,22 @@ class FastWAM(torch.nn.Module):
                 ),
             }
         )
+        if stage == "pim_adapter" and getattr(self.zeva_prompt_encoder.config, "pim_variant", "legacy") == "cross_attempt":
+            if "pim_history_kind" in sample:
+                kinds = torch.as_tensor(sample["pim_history_kind"])
+                for index, name in enumerate(("matched", "same_condition_far", "cross_condition", "empty")):
+                    metrics[f"memory/history_fraction_{name}"] = float((kinds == index).float().mean().cpu())
+            if "pim_history_count" in sample:
+                metrics["memory/history_count"] = float(torch.as_tensor(sample["pim_history_count"]).float().mean().cpu())
+            for name, value in self.zeva_prompt_encoder.last_retrieval_metrics.items():
+                metrics[f"memory/{name}"] = float(value.detach().cpu())
+            with torch.no_grad():
+                parent_mean, _ = adapter.prior_for_prompt(
+                    task_tokens, sample["phase"].to(self.device),
+                    sample["bit_effects"].to(self.device), sample["bit_mask"].to(self.device),
+                    causal_prompt, pim_mask_for_policy, enable_pim=False,
+                )
+                metrics["memory/prior_mean_delta_rms"] = float(
+                    (zeva_prior_mean.detach().float() - parent_mean.float()).square().mean().sqrt().cpu()
+                )
         return loss, metrics

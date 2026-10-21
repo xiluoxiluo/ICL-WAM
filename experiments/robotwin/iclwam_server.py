@@ -90,6 +90,12 @@ class _RemoteEnvironment:
     def get_instruction(self):
         return self.instruction
 
+    def get_obs(self):
+        """The /finalize request carries the actual post-action observation."""
+        if self.now_obs is None:
+            raise ProtocolError("/finalize requires the terminal observation")
+        return self.now_obs
+
     def take_action(self, action, action_type="qpos"):
         if action_type != "qpos" or self.action is not None:
             raise RuntimeError("Expected exactly one qpos action per policy step")
@@ -161,7 +167,7 @@ class ICLWAMServer:
             "step_id": step,
             "instruction": self.instruction,
             "mode": self.policy.zeva_mode,
-            "pim_path_enabled": self.policy.zeva_mode == "pim_on",
+            "pim_path_enabled": self.policy.zeva_mode == "pim_on" and self.policy.cross_memory_enabled,
             "pim_entry_count": len(self.policy.lifecycle.pim),
             "query_phase": snapshot["query_phase"].tolist(),
             "matches": matches,
@@ -184,7 +190,8 @@ class ICLWAMServer:
             if (not self.session_id or data.get("session_id") != self.session_id
                     or not self.finalized or attempt != self.attempt_id + 1):
                 raise StateConflict("Retry requires the finalized session_id and consecutive attempt_id")
-        self.policy.reset()
+        if attempt == 0:
+            self.policy.reset()
         self.policy.begin_attempt(attempt)
         self.session_id = uuid.uuid4().hex
         self.attempt_id = attempt
@@ -270,6 +277,7 @@ class ICLWAMServer:
             "status": "error" if self.faulted else "ok",
             "model_loaded": self.policy.model is not None,
             "zeva_mode": self.policy.zeva_mode,
+            "cross_memory_enabled": self.policy.cross_memory_enabled,
             "vae_device_mode": self.vae_device_mode,
             "action_horizon": self.policy.action_horizon,
             "replan_steps": self.policy.replan_steps,
@@ -359,6 +367,8 @@ def build_parser():
     parser.add_argument("--max_attempts", "--max-attempts", type=int, default=4)
     parser.add_argument("--pim-trace", help="Append PIM retrievals at each replan to this JSONL file")
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--cross-memory-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pim-diagnostic-interval", type=int, default=0)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     return parser
@@ -421,7 +431,9 @@ def load_policy(args):
         num_video_frames=(cfg.data.train.num_frames - 1) // cfg.data.train.action_video_freq_ratio + 1,
         video_size=cfg.data.train.video_size, zeva_mode=args.mode,
         cte_checkpoint=args.cte_checkpoint, addon_checkpoint=args.addon_checkpoint,
-        pim_top_k=evaluation.pim_top_k, max_attempts=args.max_attempts,
+        pim_top_k=int(cfg.model.zeva.memory.get("pim_top_k", evaluation.pim_top_k)), max_attempts=args.max_attempts,
+        cross_memory_enabled=args.cross_memory_enabled,
+        pim_diagnostic_interval=args.pim_diagnostic_interval,
     )
     configure_vae(policy.model, args.vae_device_mode)
     return policy

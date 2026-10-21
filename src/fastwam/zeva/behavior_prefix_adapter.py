@@ -85,6 +85,9 @@ class ExactZevaPolicyInjectionConfig:
     prior_inference_guidance_scale: float = 0.5
     prompt_gate_init: float = 0.0
     min_std: float = 1.0e-3
+    # Opt in explicitly: existing checkpoints retain their original topology.
+    pim_variant: str = "legacy"
+    pim_prefix_init_std: float = 0.002
 
     def __post_init__(self) -> None:
         values = (
@@ -103,6 +106,10 @@ class ExactZevaPolicyInjectionConfig:
             raise ValueError("invalid Zeva prior loss/dropout configuration")
         if self.min_std <= 0:
             raise ValueError("min_std must be positive")
+        if self.pim_variant not in {"legacy", "cross_attempt"}:
+            raise ValueError("pim_variant must be legacy or cross_attempt")
+        if self.pim_prefix_init_std <= 0:
+            raise ValueError("pim_prefix_init_std must be positive")
 
 
 class FastWAMPolicyInjectionPrior(nn.Module):
@@ -236,12 +243,19 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         self.behavior_global_projector = nn.Linear(cfg.global_dim, cfg.context_dim)
         self.prefix_project = nn.Linear(cfg.memory_dim, cfg.context_dim)
         self.pim_gate = nn.Parameter(torch.tensor(float(cfg.prompt_gate_init)))
+        if cfg.pim_variant == "cross_attempt":
+            self.pim_to_global = nn.Linear(cfg.memory_dim, cfg.global_dim, bias=False)
+            # Retain the scalar in the state dict for legacy diagnostics, but
+            # the new path neither multiplies by it nor trains it.
+            self.pim_gate.requires_grad_(False)
         nn.init.zeros_(self.action_prior_adapter.weight)
         nn.init.zeros_(self.action_prior_adapter.bias)
         nn.init.xavier_uniform_(self.behavior_global_projector.weight)
         nn.init.zeros_(self.behavior_global_projector.bias)
         nn.init.xavier_uniform_(self.prefix_project.weight)
         nn.init.zeros_(self.prefix_project.bias)
+        if cfg.pim_variant == "cross_attempt":
+            self.reset_pim_parameters()
 
     def policy_injection_parameters(self):
         yield from self.prior.parameters()
@@ -250,13 +264,75 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
 
     def pim_adapter_parameters(self):
         yield from self.prefix_project.parameters()
-        yield self.pim_gate
+        if self.config.pim_variant == "cross_attempt":
+            yield from self.pim_to_global.parameters()
+        else:
+            yield self.pim_gate
 
     @torch.no_grad()
     def reset_pim_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.prefix_project.weight)
+        if self.config.pim_variant == "cross_attempt":
+            nn.init.normal_(self.prefix_project.weight, std=self.config.pim_prefix_init_std)
+            nn.init.zeros_(self.pim_to_global.weight)
+        else:
+            nn.init.xavier_uniform_(self.prefix_project.weight)
         nn.init.zeros_(self.prefix_project.bias)
         self.pim_gate.fill_(float(self.config.prompt_gate_init))
+
+    def condition_task_tokens(
+        self,
+        task_tokens: Tensor,
+        causal_prompt: Tensor,
+        pim_mask: Tensor,
+        *,
+        enable_pim: bool = True,
+    ) -> Tensor:
+        """Condition the original global token on completed-attempt memory.
+
+        Callers must pass the original task token to both this prior path and
+        ``behavior_prefix_slot``; the latter applies the same conditioning
+        internally. Empty/disabled memory exactly preserves the parent token.
+        """
+        if task_tokens.ndim != 2 or task_tokens.shape[-1] != self.config.global_dim:
+            raise ValueError("task_tokens must be [B,global_dim]")
+        if causal_prompt.shape != (task_tokens.shape[0], self.config.memory_dim):
+            raise ValueError("causal_prompt must be [B,memory_dim]")
+        if pim_mask.ndim != 2 or pim_mask.shape[0] != task_tokens.shape[0]:
+            raise ValueError("pim_mask must be [B,N]")
+        if self.config.pim_variant != "cross_attempt" or not enable_pim:
+            return task_tokens
+        parameter = self.pim_to_global.weight
+        original = task_tokens.to(device=parameter.device, dtype=parameter.dtype)
+        delta = self.pim_to_global(causal_prompt.to(parameter))
+        valid = pim_mask.to(device=delta.device, dtype=torch.bool).any(dim=-1, keepdim=True)
+        return original + torch.where(valid, delta, torch.zeros_like(delta))
+
+    def prior_for_prompt(
+        self,
+        task_tokens: Tensor,
+        phase: Tensor,
+        bit_effects: Tensor,
+        bit_mask: Tensor,
+        causal_prompt: Tensor,
+        pim_mask: Tensor,
+        *,
+        enable_pim: bool = True,
+    ) -> tuple[Tensor, Tensor]:
+        """Shared train/deploy entry for the PIM-conditioned frozen prior.
+
+        Freezing prior parameters must not introduce ``no_grad`` here: Stage2B
+        gradients need to reach ``pim_to_global`` through the parent prior.
+        """
+        conditioned = self.condition_task_tokens(
+            task_tokens, causal_prompt, pim_mask, enable_pim=enable_pim,
+        )
+        parameter = next(self.prior.parameters())
+        return self.prior(
+            conditioned.to(parameter),
+            phase.to(parameter),
+            bit_effects.to(parameter),
+            bit_mask.to(device=parameter.device, dtype=torch.bool),
+        )
 
     def causal_prompt_prefix(
         self,
@@ -286,6 +362,8 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             .to(device=prompt.device, dtype=prompt.dtype)
             .unsqueeze(-1)
         )
+        if self.config.pim_variant == "cross_attempt":
+            return torch.where(has_pim.bool(), prompt, torch.zeros_like(prompt))
         return torch.tanh(self.pim_gate).to(prompt.dtype) * prompt * has_pim
 
     def behavior_prefix_slot(
@@ -304,8 +382,11 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             )
         if task_tokens.shape[0] != causal_prompt.shape[0]:
             raise ValueError("task_tokens and causal_prompt must have the same batch size")
+        conditioned_task = self.condition_task_tokens(
+            task_tokens, causal_prompt, pim_mask, enable_pim=enable_pim,
+        )
         base_prefix = self.behavior_global_projector(
-            task_tokens.to(
+            conditioned_task.to(
                 device=self.behavior_global_projector.weight.device,
                 dtype=self.behavior_global_projector.weight.dtype,
             )

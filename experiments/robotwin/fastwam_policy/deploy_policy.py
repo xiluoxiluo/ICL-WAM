@@ -23,7 +23,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.datasets.lerobot.constants import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.zeva import (
     CausalCTEHistory,
@@ -39,7 +39,7 @@ from fastwam.zeva import (
     TaskContextBank,
     retrieve_task_context,
 )
-from fastwam.zeva.attempt_protocol import inference_seed
+from fastwam.zeva.attempt_protocol import ModelSeedStream
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.static_task_context import (
     StaticTaskContextRetriever, StaticTaskContextSession, task_context_identity,
@@ -196,6 +196,8 @@ class WorldActionRobotWinPolicy:
         addon_checkpoint: Optional[str] = None,
         pim_top_k: int = 4,
         max_attempts: int = 1,
+        cross_memory_enabled: bool = True,
+        pim_diagnostic_interval: int = 0,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -272,6 +274,19 @@ class WorldActionRobotWinPolicy:
             raise ValueError("zeva.task_context.mode must be pooling, bank, or static")
 
         self.zeva_mode = requested_zeva_mode
+        self.cross_memory_enabled = bool(cross_memory_enabled)
+        self.pim_diagnostic_interval = int(pim_diagnostic_interval)
+        if self.pim_diagnostic_interval < 0:
+            raise ValueError("pim_diagnostic_interval must be non-negative")
+        self._last_pim_diagnostics = {}
+        self._terminal_observation_step = None
+        self.checkpoint_identity = {
+            "base_sha256": checkpoint_sha256(checkpoint_path),
+            "stats_sha256": checkpoint_sha256(dataset_stats_path),
+            "cte_sha256": checkpoint_sha256(cte_checkpoint) if cte_checkpoint else None,
+            "addon_sha256": checkpoint_sha256(addon_checkpoint) if addon_checkpoint else None,
+            "task_context": getattr(self.model, "zeva_task_context_identity", None),
+        }
         self.cte = None
         self.lifecycle = None
         self._cte_history = None
@@ -326,6 +341,9 @@ class WorldActionRobotWinPolicy:
                     f"{self.model.zeva_prompt_encoder.config.effect_dim})"
                 )
             prompt_cfg = self.model.zeva_prompt_encoder.config
+            cross_attempt = getattr(prompt_cfg, "pim_variant", "legacy") == "cross_attempt"
+            if cross_attempt != bool(zeva_memory_cfg.get("cross_attempt_only", False)):
+                raise ValueError("Cross-attempt model and runtime memory configuration disagree")
             if int(prompt_cfg.persistent_length) != int(pim_top_k):
                 raise ValueError(
                     "pim_top_k must match the trained CausalPromptEncoder persistent_length; "
@@ -405,6 +423,9 @@ class WorldActionRobotWinPolicy:
                     merge_threshold=float(zeva_memory_cfg.get("merge_threshold", 0.85)),
                     phase_merge_weight=float(zeva_memory_cfg.get("beta_phase", 0.5)),
                     effect_merge_weight=float(zeva_memory_cfg.get("beta_effect", 0.5)),
+                    cross_attempt_only=bool(zeva_memory_cfg.get("cross_attempt_only", False)),
+                    max_past_attempts=int(zeva_memory_cfg.get("max_past_attempts", 3)),
+                    max_entries_per_attempt=int(zeva_memory_cfg.get("max_entries_per_attempt", 64)),
                 )
             )
             self.lifecycle = CausalMemoryLifecycle(
@@ -437,6 +458,7 @@ class WorldActionRobotWinPolicy:
         self.num_inference_steps = int(num_inference_steps)
         self.sigma_shift = sigma_shift
         self.seed = seed
+        self._model_seed_stream = ModelSeedStream(seed)
         self._attempt_id = 0
         self._replan_index = 0
         self._last_inference_seed = seed
@@ -491,8 +513,9 @@ class WorldActionRobotWinPolicy:
             (action.shape[0], 1, state_meta[0]["shape"]), dtype=action.dtype
         )
         batch = {
-            "action": {action_key: action},
-            "state": {state_key: dummy_state},
+            # ActionStateMerger.backward consumes its concatenated outputs.
+            "action": action,
+            "state": dummy_state,
         }
         batch = self.processor.action_state_merger.backward(batch)
         batch = self.processor.normalizer.backward(batch)
@@ -556,6 +579,8 @@ class WorldActionRobotWinPolicy:
         proprio = self._normalize_state(state_vector)
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
+        request_seed = self._model_seed_stream.next_seed()
+        self._last_inference_seed = request_seed
         if self.zeva_mode != "base":
             if self._cte_history is None and self._needs_episode_reset:
                 self.lifecycle.reset_episode(instruction, episode_id=f"episode-{self.episode_count}")
@@ -599,9 +624,18 @@ class WorldActionRobotWinPolicy:
                         "scores": task_context_result.scores.detach().cpu(),
                         "sources": task_context_result.sources,
                     }
+                task_tokens = task_tokens.to(device=self.model.device, dtype=self.model.torch_dtype)
                 encoded = self._cte_history.forward()
                 phase = encoded["phase"][:, -1]
                 memory = self.lifecycle.memory_inputs(phase, task_tokens)
+                phase = phase.to(device=self.model.device, dtype=self.model.torch_dtype)
+                memory = {
+                    key: value.to(
+                        device=self.model.device,
+                        dtype=self.model.torch_dtype if value.is_floating_point() else value.dtype,
+                    )
+                    for key, value in memory.items()
+                }
                 if self.zeva_mode == "pim_shadow":
                     causal_prompt = torch.zeros(
                         (1, int(self.model.zeva_prompt_encoder.config.hidden_dim)),
@@ -609,7 +643,7 @@ class WorldActionRobotWinPolicy:
                         dtype=self.model.torch_dtype,
                     )
                     pim_mask = memory["pim_mask"]
-                elif self.zeva_mode == "zeva_stage2":
+                elif self.zeva_mode == "zeva_stage2" or not self.cross_memory_enabled:
                     causal_prompt = torch.zeros(
                         (1, int(self.model.zeva_prompt_encoder.config.hidden_dim)),
                         device=self.model.device,
@@ -625,16 +659,18 @@ class WorldActionRobotWinPolicy:
                     and getattr(self.model, "zeva_injection_mode", "memory_residual") == "exact_zeva"
                 ):
                     adapter = self.model.zeva_behavior_prefix_adapter
-                    prior_mean, _prior_std = adapter.prior(
+                    prior_mean, _prior_std = adapter.prior_for_prompt(
                         task_tokens,
                         phase,
                         memory["bit_effects"],
                         memory["bit_mask"],
+                        causal_prompt,
+                        pim_mask,
+                        enable_pim=self.zeva_mode == "pim_on" and self.cross_memory_enabled,
                     )
                     zeva_action_residual = adapter.action_prior_residual(
                         prior_mean, training=False
                     )
-            request_seed = inference_seed(self.seed, self._attempt_id, self._replan_index)
             infer_kwargs = {
                 "prompt": None,
                 "context": context,
@@ -660,18 +696,32 @@ class WorldActionRobotWinPolicy:
             infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
             with torch.no_grad():
                 pred = self.model.infer_action_zeva(**infer_kwargs)
+                if (
+                    self.zeva_mode == "pim_on" and self.cross_memory_enabled
+                    and self.pim_diagnostic_interval
+                    and self._replan_index % self.pim_diagnostic_interval == 0
+                ):
+                    self._measure_pim_effect(
+                        infer_kwargs, pred, task_tokens, phase, memory,
+                        causal_prompt, pim_mask,
+                    )
             if self.timing_enabled:
                 self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
             self._last_inference_seed = request_seed
-            gate = float(torch.tanh(self.model.zeva_behavior_prefix_adapter.pim_gate.detach()).cpu())
+            adapter = self.model.zeva_behavior_prefix_adapter
+            gate = (
+                float(torch.tanh(adapter.pim_gate.detach()).cpu())
+                if getattr(adapter.config, "pim_variant", "legacy") != "cross_attempt" else None
+            )
             logger.info(
-                "Zeva request | attempt=%d replan=%d seed=%s pim_count=%d gate=%.6f mode=%s",
+                "Zeva request | attempt=%d replan=%d seed=%s pim_count=%d gate=%s mode=%s cross_memory=%s",
                 self._attempt_id,
                 self._replan_index,
                 str(request_seed),
                 int(pim_mask.sum().item()),
                 gate,
                 self.zeva_mode,
+                self.cross_memory_enabled,
             )
             self._replan_index += 1
             return self._denormalize_action(pred["action"])[0]
@@ -684,7 +734,7 @@ class WorldActionRobotWinPolicy:
             "text_cfg_scale": self.text_cfg_scale,
             "num_inference_steps": self.num_inference_steps,
             "sigma_shift": self.sigma_shift,
-            "seed": self.seed,
+            "seed": request_seed,
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
@@ -698,7 +748,80 @@ class WorldActionRobotWinPolicy:
 
         action_tensor = pred["action"]
         action_chunk = self._denormalize_action(action_tensor)[0]
+        self._replan_index += 1
         return action_chunk
+
+    @torch.no_grad()
+    def _measure_pim_effect(self, infer_kwargs, pred, task_tokens, phase, memory, causal_prompt, pim_mask):
+        """Same-state, same-noise probe; consumes no model seed stream draws."""
+        adapter = self.model.zeva_behavior_prefix_adapter
+        off_kwargs = dict(infer_kwargs)
+        off_kwargs["causal_prompt"] = torch.zeros_like(causal_prompt)
+        off_kwargs["pim_mask"] = torch.zeros_like(pim_mask)
+        exact = getattr(self.model, "zeva_injection_mode", "memory_residual") == "exact_zeva"
+        if exact:
+            off_mean, _ = adapter.prior_for_prompt(
+                task_tokens, phase, memory["bit_effects"], memory["bit_mask"],
+                off_kwargs["causal_prompt"], off_kwargs["pim_mask"], enable_pim=False,
+            )
+            off_kwargs["zeva_action_residual"] = adapter.action_prior_residual(off_mean, training=False)
+        # Preserve global torch RNG as well as reusing the explicit request
+        # seed, so optional diagnostics cannot change subsequent rollout noise.
+        device = torch.device(self.model.device)
+        devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            pred_off = self.model.infer_action_zeva(**off_kwargs)
+        action_on, action_off = pred["action"].float(), pred_off["action"].float()
+        if action_on.ndim == 2:
+            action_on = action_on.unsqueeze(0)
+        if action_off.ndim == 2:
+            action_off = action_off.unsqueeze(0)
+        if action_on.shape != action_off.shape or action_on.ndim != 3:
+            raise ValueError("PIM action diagnostics require matching [B,T,D] actions")
+        n_exec = min(self.replan_steps, action_on.shape[1])
+        delta = action_on[:, :n_exec] - action_off[:, :n_exec]
+        self._last_pim_diagnostics = {
+            "valid_entries": int(pim_mask.sum()),
+            "executed_action_steps": n_exec,
+            "action_exec_delta_rms": float(delta.square().mean().sqrt()),
+            "action_exec_relative_delta": float(delta.norm() / action_off[:, :n_exec].norm().clamp_min(1e-8)),
+        }
+        if exact:
+            on_prefix = adapter.behavior_prefix_slot(task_tokens, causal_prompt, pim_mask)
+            off_prefix = adapter.behavior_prefix_slot(task_tokens, causal_prompt, pim_mask, enable_pim=False)
+            prefix_delta = on_prefix.float() - off_prefix.float()
+            on_mean, _ = adapter.prior_for_prompt(
+                task_tokens, phase, memory["bit_effects"], memory["bit_mask"], causal_prompt, pim_mask,
+            )
+            self._last_pim_diagnostics.update({
+                "prefix_delta_rms": float(prefix_delta.square().mean().sqrt()),
+                "prefix_relative_delta": float(prefix_delta.norm() / off_prefix.float().norm().clamp_min(1e-8)),
+                "prior_mean_delta_rms": float((on_mean.float() - off_mean.float()).square().mean().sqrt()),
+            })
+        logger.info("PIM same-noise diagnostics: %s", self._last_pim_diagnostics)
+
+    def evaluation_metadata(self) -> dict[str, Any]:
+        pim = self.lifecycle.pim if self.lifecycle is not None else None
+        if self._needs_episode_reset:
+            # reset() defers task identity until the first real observation;
+            # the old episode's store will be cleared before its first read.
+            pim = None
+        return {
+            "model_seed": self.seed,
+            "seed_stream": self._model_seed_stream.snapshot(),
+            "checkpoint_identity": self.checkpoint_identity,
+            "zeva_mode": self.zeva_mode,
+            "cross_memory_enabled": self.cross_memory_enabled,
+            "action_horizon": self.action_horizon,
+            "replan_steps": self.replan_steps,
+            "num_inference_steps": self.num_inference_steps,
+            "pim_entries": len(pim) if pim is not None else 0,
+            "pim_pending_entries": getattr(pim, "pending_count", 0),
+            "pim_source_attempts": sorted({entry.attempt_id for entry in pim.entries}) if pim is not None else [],
+            "replans": self._replan_index,
+            "terminal_observation_step": self._terminal_observation_step,
+            "pim_diagnostics_last": dict(self._last_pim_diagnostics),
+        }
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
@@ -776,6 +899,8 @@ class WorldActionRobotWinPolicy:
         self._attempt_id = 0
         self._replan_index = 0
         self._last_inference_seed = self.seed
+        self._last_pim_diagnostics = {}
+        self._terminal_observation_step = None
         if self.zeva_mode != "base":
             self._needs_episode_reset = True
 
@@ -789,7 +914,13 @@ class WorldActionRobotWinPolicy:
             raise ValueError("attempt_id must be non-negative")
         self._attempt_id = attempt_id
         self._replan_index = 0
-        self._last_inference_seed = inference_seed(self.seed, attempt_id, 0)
+        self._last_inference_seed = None
+        self.pending_actions.clear()
+        self.step_count = 0
+        self.reset_timing_rollout()
+        self._last_pim_diagnostics = {}
+        self._terminal_observation_step = None
+        self._attempt_finalized = False
         if self.lifecycle is None:
             return
         if attempt_id == 0:
@@ -818,8 +949,16 @@ class WorldActionRobotWinPolicy:
             return
 
         try:
-            terminal_obs = getattr(task_env, "now_obs", None)
+            # now_obs can still be the pre-action frame on timeout. Fetch a
+            # fresh observation before the environment/video writer is closed.
+            getter = getattr(task_env, "get_obs", None)
+            if not callable(getter):
+                raise RuntimeError("Attempt finalization requires a fresh terminal get_obs()")
+            terminal_obs = getter()
             has_terminal_obs = isinstance(terminal_obs, dict) and "observation" in terminal_obs
+            if not has_terminal_obs:
+                raise RuntimeError("Missing terminal observation; refusing to commit stale PIM")
+            self._terminal_observation_step = self.step_count
             has_complete_tail = len(self._transition_actions) == self.cte.cfg.transition_steps
 
             if has_terminal_obs and has_complete_tail and self._cte_history is not None:
@@ -838,7 +977,6 @@ class WorldActionRobotWinPolicy:
                             metadata={
                                 "source_step": start * self.cte.cfg.transition_steps,
                                 "terminal_attempt": True,
-                                "attempt_success": bool(success),
                                 "terminal_observation_used": True,
                             },
                         )
@@ -860,11 +998,26 @@ def get_model(usr_args: Dict[str, Any]):
     sim_cfg_path = usr_args.get("sim_cfg_path")
     sim_cfg_name = usr_args.get("sim_cfg_name")
     sim_task = usr_args.get("sim_task")
-    cfg = _compose_sim_cfg(
-        sim_cfg_path=sim_cfg_path,
-        sim_cfg_name=sim_cfg_name,
-        sim_task=sim_task,
-    )
+    runtime_config_path = usr_args.get("runtime_config_path")
+    if not _is_none_like(runtime_config_path):
+        cfg = OmegaConf.load(str(runtime_config_path))
+        if cfg.get("runtime_schema") != "iclwam-robotwin-runtime-v1":
+            raise ValueError("Unsupported resolved RoboTwin runtime configuration")
+    else:
+        # Keep direct plugin/HTTP and old entrypoint calls compatible.
+        cfg = _compose_sim_cfg(
+            sim_cfg_path=sim_cfg_path,
+            sim_cfg_name=sim_cfg_name,
+            sim_task=sim_task,
+        )
+    for key, config_key in (
+        ("task_context_bank", "bank_path"),
+        ("task_context_retrieval_checkpoint", "retrieval_checkpoint"),
+        ("task_context_top_k", "top_k"),
+        ("task_context_mode", "mode"),
+    ):
+        if not _is_none_like(usr_args.get(key)):
+            cfg.model.zeva.task_context[config_key] = usr_args[key]
 
     checkpoint_path = usr_args.get("ckpt_setting")
     if _is_none_like(checkpoint_path):
@@ -904,7 +1057,9 @@ def get_model(usr_args: Dict[str, Any]):
     if sigma_shift is None:
         sigma_shift = _parse_optional_float(cfg.EVALUATION.get("sigma_shift"))
 
-    seed = _parse_optional_int(usr_args.get("seed"))
+    seed = _parse_optional_int(usr_args.get("model_seed"))
+    if seed is None:
+        seed = _parse_optional_int(usr_args.get("seed"))
     text_cfg_scale = float(usr_args.get("text_cfg_scale", cfg.EVALUATION.get("text_cfg_scale", 1.0)))
     negative_prompt = str(usr_args.get("negative_prompt", cfg.EVALUATION.get("negative_prompt", "")))
     rand_device = str(usr_args.get("rand_device", cfg.EVALUATION.get("rand_device", "cpu")))
@@ -947,6 +1102,8 @@ def get_model(usr_args: Dict[str, Any]):
         addon_checkpoint=None if _is_none_like(addon_checkpoint) else str(addon_checkpoint),
         pim_top_k=pim_top_k,
         max_attempts=max_attempts,
+        cross_memory_enabled=_parse_bool(usr_args.get("cross_memory_enabled", cfg.EVALUATION.get("cross_memory_enabled", True))),
+        pim_diagnostic_interval=int(usr_args.get("pim_diagnostic_interval", cfg.EVALUATION.get("pim_diagnostic_interval", 0))),
     )
     return policy
 

@@ -38,6 +38,19 @@ EVALUATION:
   dataset_stats_path: null
   device: cuda
 
+  # Scene seeds are supplied by fixed_seed / episode_manifest. This separate
+  # RNG seeds the policy request stream for EVERY compared model condition.
+  model_seed: 0
+  cross_memory_enabled: true
+  pim_diagnostic_interval: 0
+  episode_manifest: null
+  fixed_instruction: null
+  attempt_log_path: null
+  condition: null
+  run_id: null
+  # Explicit destination for manifest runs; null preserves legacy manager paths.
+  results_dir: null
+
 MULTIRUN:
   enabled: false
   num_gpus: 8

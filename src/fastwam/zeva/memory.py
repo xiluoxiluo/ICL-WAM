@@ -32,6 +32,12 @@ class PersistentInteractionMemoryConfig:
     merge_threshold: float = 0.85
     phase_merge_weight: float = 0.5
     effect_merge_weight: float = 0.5
+    # The legacy mode exposes/merges completed effects immediately.  The new
+    # mode keeps the current attempt private until its boundary and lets the
+    # learned readout see every bounded historical entry.
+    cross_attempt_only: bool = False
+    max_past_attempts: int = 3
+    max_entries_per_attempt: int = 64
 
     def __post_init__(self) -> None:
         if min(self.phase_dim, self.effect_dim, self.capacity, self.top_k) < 1 or self.top_k > self.capacity:
@@ -48,6 +54,24 @@ class PersistentInteractionMemoryConfig:
             raise ValueError("PIM merge weights must be non-negative")
         if self.phase_merge_weight + self.effect_merge_weight <= 0:
             raise ValueError("At least one PIM merge weight must be positive")
+        if min(self.max_past_attempts, self.max_entries_per_attempt) < 1:
+            raise ValueError("PIM attempt limits must be positive")
+        if self.cross_attempt_only:
+            if self.capacity < self.max_past_attempts * self.max_entries_per_attempt:
+                raise ValueError("cross-attempt capacity must hold all bounded past attempts")
+            if self.top_k != self.capacity:
+                raise ValueError("cross-attempt PIM must expose its full capacity, not fixed top-k")
+
+
+def uniform_history_indices(length: int, limit: int) -> list[int]:
+    """Deterministic endpoint-preserving compression shared by train and serve."""
+    if length < 0 or limit < 1:
+        raise ValueError("history length must be non-negative and limit positive")
+    if length <= limit:
+        return list(range(length))
+    if limit == 1:
+        return [0]
+    return [i * (length - 1) // (limit - 1) for i in range(limit)]
 
 
 @dataclass
@@ -98,6 +122,9 @@ class PersistentInteractionMemory:
         self._episode_id: str | None = None
         self._attempt_id: int | None = None
         self._entries: list[PIMMemoryEntry] = []
+        self._pending_entries: list[PIMMemoryEntry] = []
+        self._past_attempts: list[list[PIMMemoryEntry]] = []
+        self._committed_attempt_id: int | None = None
 
     @property
     def entries(self) -> tuple[PIMMemoryEntry, ...]:
@@ -111,6 +138,14 @@ class PersistentInteractionMemory:
     def attempt_id(self) -> int | None:
         return self._attempt_id
 
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending_entries)
+
+    @property
+    def past_attempt_count(self) -> int:
+        return len(self._past_attempts)
+
     def __len__(self) -> int:
         return len(self._entries)
 
@@ -119,6 +154,9 @@ class PersistentInteractionMemory:
             raise ValueError("task_cluster cannot be empty")
         self._task_cluster, self._episode_id, self._attempt_id = str(task_cluster), episode_id, 0
         self._entries.clear()
+        self._pending_entries.clear()
+        self._past_attempts.clear()
+        self._committed_attempt_id = None
 
     def begin_attempt(self, attempt_id: int) -> None:
         if self._task_cluster is None or self._attempt_id is None:
@@ -126,7 +164,25 @@ class PersistentInteractionMemory:
         attempt_id = int(attempt_id)
         if attempt_id not in {self._attempt_id, self._attempt_id + 1}:
             raise ValueError("attempt_id must stay constant or increment by one")
+        if self.config.cross_attempt_only and attempt_id != self._attempt_id:
+            self.commit_attempt()
         self._attempt_id = attempt_id
+
+    def commit_attempt(self) -> None:
+        """Publish a completed attempt once; no current/past prototype merging."""
+        if self._attempt_id is None:
+            raise RuntimeError("reset_episode() is required before commit_attempt()")
+        if not self.config.cross_attempt_only or self._committed_attempt_id == self._attempt_id:
+            return
+        if self._pending_entries:
+            indices = uniform_history_indices(
+                len(self._pending_entries), self.config.max_entries_per_attempt
+            )
+            self._past_attempts.append([self._pending_entries[i] for i in indices])
+            del self._past_attempts[:-self.config.max_past_attempts]
+            self._entries = [entry for attempt in self._past_attempts for entry in attempt]
+        self._pending_entries.clear()
+        self._committed_attempt_id = self._attempt_id
 
     def append_completed(self, *, task_cluster: str, phase: Tensor, effect: Tensor, attempt_id: int, transition_index: int = 0, metadata: dict[str, object] | None = None) -> tuple[int, bool]:
         if self._task_cluster is None:
@@ -137,11 +193,23 @@ class PersistentInteractionMemory:
             raise ValueError("PIM phase/effect shape mismatch")
         if not torch.isfinite(phase).all() or not torch.isfinite(effect).all():
             raise ValueError("PIM refuses non-finite values")
-        phase = F.normalize(phase.detach().float().cpu(), dim=0)
-        effect = F.normalize(effect.detach().float().cpu(), dim=0)
+        phase = phase.detach().float().cpu()
+        effect = effect.detach().float().cpu()
         # Advance the attempt only after the feature payload has passed all
         # validation, so a malformed write cannot mutate lifecycle state.
         self.begin_attempt(attempt_id)
+        if self.config.cross_attempt_only:
+            if self._committed_attempt_id == self._attempt_id:
+                raise RuntimeError("cannot append after commit; begin the next attempt first")
+            if self._pending_entries and transition_index <= self._pending_entries[-1].transition_index:
+                raise ValueError("completed effects must have increasing transition indices")
+            self._pending_entries.append(PIMMemoryEntry(
+                str(task_cluster), phase.clone(), effect.clone(), int(attempt_id),
+                int(transition_index), metadata=dict(metadata or {}),
+            ))
+            return len(self._pending_entries) - 1, False
+        phase = F.normalize(phase, dim=0)
+        effect = F.normalize(effect, dim=0)
         best_index, best_score = -1, -float("inf")
         denom = self.config.phase_merge_weight + self.config.effect_merge_weight
         for index, entry in enumerate(self._entries):
@@ -181,6 +249,8 @@ class PersistentInteractionMemory:
 
     def query_tensors(self, phase: Tensor, *, top_k: int | None = None, exclude_attempt_id: int | None = None) -> tuple[Tensor, Tensor, Tensor, Tensor, list[dict[str, object]]]:
         k = self.config.top_k if top_k is None else int(top_k)
+        if self.config.cross_attempt_only and k != self.config.capacity:
+            raise ValueError("cross-attempt readout requires all historical candidates")
         if k < 1 or k > self.config.capacity:
             raise ValueError("top_k outside configured capacity")
         if phase.shape != (self.config.phase_dim,):
@@ -191,7 +261,11 @@ class PersistentInteractionMemory:
         if candidates:
             query = F.normalize(phase.detach().float().cpu(), dim=0)
             scores_all = torch.tensor([float(F.normalize(e.phase, dim=0) @ query) for _, e in candidates], dtype=torch.float32)
-            order = torch.argsort(scores_all, descending=True, stable=True)[:k]
+            order = (
+                torch.arange(len(candidates))
+                if self.config.cross_attempt_only
+                else torch.argsort(scores_all, descending=True, stable=True)[:k]
+            )
             selected = [candidates[int(i)] for i in order]
             scores = scores_all[order]
         else:
