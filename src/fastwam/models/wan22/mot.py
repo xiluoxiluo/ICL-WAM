@@ -145,8 +145,8 @@ class MoT(nn.Module):
             block.self_attn.o(mixed_attn_out),
         )
 
-        # Some main-stream tokens intentionally do not read text context.
-        # In exact-Zeva this is the Behavior Prefix token.
+        # Some main-stream tokens intentionally do not read text context:
+        # legacy behavior slots and invalid effect/PIM slots in the new layout.
         #
         # Do not feed an all-False query row directly into CUDA SDPA:
         # depending on backend / dtype this can generate non-finite values.

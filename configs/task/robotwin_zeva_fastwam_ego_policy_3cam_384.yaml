@@ -1,0 +1,22 @@
+# @package _global_
+
+# Stage2A for independent global/effect prefixes. Use the original prepared
+# Stage2A cache; PIM is disabled until a new-layout parent is trained.
+defaults:
+  - robotwin_zeva_fastwam_stage2_3cam_384
+  - _self_
+
+ckpt: null  # REQUIRED: the same frozen FastWAM base used to prepare the cache.
+
+model:
+  zeva:
+    training_stage: policy_injection
+    policy_checkpoint: null
+    # Optional: old merged-prefix Stage2A checkpoint. This initializes shared
+    # parent weights only; the new effect projector is trained in this stage.
+    policy_warmstart_checkpoint: null
+    freeze_fastwam: true
+    freeze_cte_stage2: true
+    adapter:
+      prefix_layout: zeva_ego
+      effect_source: latest_completed

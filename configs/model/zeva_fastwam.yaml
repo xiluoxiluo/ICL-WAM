@@ -8,6 +8,9 @@ zeva:
   # Used only to initialize pim_adapter from a Stage-2A checkpoint.
   # Current-stage checkpoint resumption uses `resume` instead.
   policy_checkpoint: null
+  # Optional old Stage2A -> zeva_ego Stage2A initialization. Clear on resume.
+  # This never substitutes for a trained zeva_ego parent in Stage2B.
+  policy_warmstart_checkpoint: null
   action_only: true
   freeze_fastwam: true
   freeze_cte_stage2: true
@@ -76,9 +79,11 @@ zeva:
     pim_context_dropout: 0.2
     pim_support_dropout: 0.2
   adapter:
-    # exact_zeva keeps Causal Prompt prefix injection and action-prior
-    # injection as two separate branches, matching Zeva's policy path.
+    # Legacy checkpoints keep their original merged prefix. New task configs
+    # opt into separate global/effect/PIM tokens with prefix_layout=zeva_ego.
     mode: exact_zeva
+    prefix_layout: legacy_merged
+    effect_source: latest_completed
     memory_dim: 256
     action_horizon: 32
     action_hidden_dim: 1024

@@ -21,6 +21,11 @@ def main() -> None:
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--instruction", help="Exact instruction retained for every attempt")
     parser.add_argument("--sim-task", default="robotwin_zeva_fastwam_pim_3cam_384")
+    parser.add_argument(
+        "--prefix-layout", choices=("legacy_merged", "zeva_ego"),
+        help="Override the task's prefix layout; old merged checkpoints require legacy_merged",
+    )
+    parser.add_argument("--effect-source", choices=("latest_completed",))
     parser.add_argument("--dataset-stats")
     parser.add_argument("--cross-memory-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pim-diagnostic-interval", type=int, default=0)
@@ -46,6 +51,10 @@ def main() -> None:
         f"EVALUATION.cross_memory_enabled={str(args.cross_memory_enabled).lower()}",
         f"EVALUATION.pim_diagnostic_interval={args.pim_diagnostic_interval}",
     ])
+    if args.prefix_layout is not None:
+        cmd.append(f"model.zeva.adapter.prefix_layout={args.prefix_layout}")
+    if args.effect_source is not None:
+        cmd.append(f"model.zeva.adapter.effect_source={args.effect_source}")
     if "cross_attempt" in args.sim_task:
         cmd.append("EVALUATION.pim_top_k=192")
     if args.dataset_stats:

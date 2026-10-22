@@ -21,6 +21,31 @@ from experiments.robotwin.multiattempt import (
 )
 
 
+def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect_source: str) -> dict:
+    """Resolve reader capacity without importing or instantiating the policy."""
+    from hydra import compose, initialize_config_dir
+
+    with initialize_config_dir(version_base="1.3", config_dir=str(ROOT / "configs")):
+        cfg = compose(config_name="sim_robotwin_zeva", overrides=[
+            f"task={task}", *overrides,
+            f"model.zeva.adapter.prefix_layout={prefix_layout}",
+            f"model.zeva.adapter.effect_source={effect_source}",
+        ])
+    zeva = cfg.model.zeva
+    top_k = int(zeva.memory.pim_top_k)
+    if top_k < 1 or top_k != int(zeva.prompt.persistent_length):
+        raise ValueError("Evaluation memory.pim_top_k must match the configured reader persistent_length")
+    variant = str(zeva.prompt.get("pim_variant", "legacy"))
+    if (variant == "cross_attempt") != bool(zeva.memory.get("cross_attempt_only", False)):
+        raise ValueError("Evaluation reader variant and cross_attempt_only configuration disagree")
+    return {
+        "prefix_layout": str(zeva.adapter.prefix_layout),
+        "effect_source": str(zeva.adapter.effect_source) if prefix_layout == "zeva_ego" else None,
+        "pim_variant": variant,
+        "pim_top_k": top_k,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", default=str(ROOT / "configs/robotwin_cross_attempt_10x20.json"))
@@ -43,6 +68,9 @@ def main() -> None:
     parser.add_argument("--robotwin-root", default=str(ROOT / "third_party/RoboTwin"))
     parser.add_argument("--old-task-config", default="robotwin_zeva_fastwam_pim_3cam_384")
     parser.add_argument("--new-task-config", default="robotwin_zeva_fastwam_cross_attempt_3cam_384")
+    parser.add_argument("--old-prefix-layout", choices=("legacy_merged", "zeva_ego"), default="legacy_merged")
+    parser.add_argument("--new-prefix-layout", choices=("legacy_merged", "zeva_ego"), default="zeva_ego")
+    parser.add_argument("--effect-source", choices=("latest_completed",), default="latest_completed")
     parser.add_argument("--override", action="append", default=[], help="Extra non-protocol Hydra overrides, e.g. model.tokenizer_max_len=128; pretrained asset root uses DIFFSYNTH_MODEL_BASE_PATH")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -54,6 +82,8 @@ def main() -> None:
         key = override.split("=", 1)[0].lstrip("+")
         if key.startswith("EVALUATION.") or key in {"task", "ckpt", "gpu_id"}:
             parser.error("--override cannot change the frozen evaluation protocol")
+        if key in {"model.zeva.adapter.prefix_layout", "model.zeva.adapter.effect_source"}:
+            parser.error("Use --old-prefix-layout/--new-prefix-layout and --effect-source for prefix contracts")
     required = ["checkpoint", "dataset_stats"]
     if any(condition != "base" for condition in args.conditions):
         required.append("cte_checkpoint")
@@ -82,6 +112,16 @@ def main() -> None:
         manifest["episodes"] = [row for row in source["episodes"] if row["task"] in args.tasks]
         manifest["parent_manifest_sha256"] = source_sha
         tasks = sorted(args.tasks)
+    contracts = {}
+    for condition in args.conditions:
+        new = condition in {"new_off", "new_on"}
+        try:
+            contracts[condition] = _policy_contract(
+                args.new_task_config if new else args.old_task_config, args.override,
+                args.new_prefix_layout if new else args.old_prefix_layout, args.effect_source,
+            )
+        except ValueError as exc:
+            parser.error(f"Invalid {condition} policy configuration: {exc}")
     output = Path(args.output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     if (output / "COMPLETE").exists():
@@ -100,6 +140,7 @@ def main() -> None:
         new = condition in {"new_off", "new_on"}
         mode = "base" if condition == "base" else "pim_on"
         addon = args.new_addon_checkpoint if new else args.old_addon_checkpoint
+        contract = contracts[condition]
         for task in tasks:
             def setting(key, value):
                 return f"{key}={json.dumps(value, ensure_ascii=True)}"
@@ -122,7 +163,7 @@ def main() -> None:
                 setting("EVALUATION.model_seed", args.model_seed),
                 setting("EVALUATION.zeva_mode", mode),
                 setting("EVALUATION.cross_memory_enabled", condition != "new_off"),
-                setting("EVALUATION.pim_top_k", 192 if new else 4),
+                setting("EVALUATION.pim_top_k", contract["pim_top_k"]),
                 setting("EVALUATION.max_attempts", manifest["max_attempts"]),
                 setting("EVALUATION.action_horizon", manifest["action_horizon"]),
                 setting("EVALUATION.replan_steps", manifest["replan_steps"]),
@@ -142,6 +183,10 @@ def main() -> None:
                 if args.task_context_retrieval_checkpoint:
                     command.append(setting("model.zeva.task_context.retrieval_checkpoint", args.task_context_retrieval_checkpoint))
             command.extend(args.override)
+            command.extend([
+                setting("model.zeva.adapter.prefix_layout", contract["prefix_layout"]),
+                setting("model.zeva.adapter.effect_source", args.effect_source),
+            ])
             commands.append({"condition": condition, "task": task, "command": command})
     plan = {
         "manifest_sha256": manifest_sha,
@@ -149,6 +194,7 @@ def main() -> None:
         "conditions": args.conditions,
         "max_total_attempts": len(manifest["episodes"]) * len(args.conditions) * manifest["max_attempts"],
         "model_rng_protocol": "request_seed_stream_v1; one independent stream per task/condition process",
+        "policy_contracts": contracts,
         "artifact_validation": "skipped_dry_run" if args.dry_run else "paths_exist; runtime verifies checkpoint/cache identities",
         "commands": commands,
     }

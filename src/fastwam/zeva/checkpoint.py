@@ -94,6 +94,54 @@ def load_cte_checkpoint(path: str | Path, model, optimizer=None, scheduler=None,
     return payload
 
 
+def addon_layout_metadata(behavior_prefix_adapter) -> dict[str, str | None]:
+    """Describe the policy-side topology independently of the PIM reader.
+
+    Missing layout metadata in historical checkpoints means ``legacy_merged``.
+    A new effect projector must never be silently attached to those weights at
+    deployment, or frozen as an allegedly trained Stage2A parent.
+    """
+    config = getattr(behavior_prefix_adapter, "config", None)
+    variant = str(getattr(config, "pim_variant", "legacy"))
+    layout = str(getattr(config, "prefix_layout", "legacy_merged"))
+    if variant not in {"legacy", "cross_attempt"}:
+        raise ValueError(f"unsupported addon pim_variant: {variant!r}")
+    if layout not in {"legacy_merged", "zeva_ego"}:
+        raise ValueError(f"unsupported addon prefix_layout: {layout!r}")
+    effect_source = None
+    if layout == "zeva_ego":
+        effect_source = str(getattr(config, "effect_source", "latest_completed"))
+        if effect_source != "latest_completed":
+            raise ValueError("zeva_ego prefix requires effect_source='latest_completed'")
+    return {
+        "pim_variant": variant,
+        "prefix_layout": layout,
+        "effect_source": effect_source,
+        "addon_schema": (
+            "zeva_ego_prefix_v1" if layout == "zeva_ego"
+            else "cross_attempt_v1" if variant == "cross_attempt"
+            else "legacy"
+        ),
+    }
+
+
+def _checkpoint_prefix_layout(payload: dict) -> str:
+    layout = payload.get("prefix_layout", "legacy_merged")
+    if layout not in {"legacy_merged", "zeva_ego"}:
+        raise ValueError(f"unsupported checkpoint prefix_layout: {layout!r}")
+    if layout == "zeva_ego":
+        if payload.get("addon_schema") != "zeva_ego_prefix_v1":
+            raise ValueError("zeva_ego checkpoint is missing its zeva_ego_prefix_v1 schema marker")
+        if payload.get("effect_source") != "latest_completed":
+            raise ValueError("zeva_ego checkpoint effect_source must be 'latest_completed'")
+    elif payload.get("addon_schema") == "zeva_ego_prefix_v1":
+        raise ValueError("zeva_ego_prefix_v1 checkpoint must declare prefix_layout='zeva_ego'")
+    elif payload.get("pim_variant", "legacy") == "cross_attempt":
+        if payload.get("addon_schema") != "cross_attempt_v1":
+            raise ValueError("cross_attempt checkpoint is missing its cross_attempt_v1 schema marker")
+    return layout
+
+
 def save_addon_checkpoint(
     path: str | Path,
     causal_prompt_encoder,
@@ -109,12 +157,7 @@ def save_addon_checkpoint(
             "causal_prompt_encoder": causal_prompt_encoder.state_dict(),
             "behavior_prefix_adapter": behavior_prefix_adapter.state_dict(),
             "pim_gate": behavior_prefix_adapter.pim_gate.detach().cpu(),
-            "pim_variant": getattr(getattr(behavior_prefix_adapter, "config", None), "pim_variant", "legacy"),
-            "addon_schema": (
-                "cross_attempt_v1"
-                if getattr(getattr(behavior_prefix_adapter, "config", None), "pim_variant", "legacy") == "cross_attempt"
-                else "legacy"
-            ),
+            **addon_layout_metadata(behavior_prefix_adapter),
             "training_stage": str(training_stage),
             "step": int(step),
             "config": config,
@@ -135,6 +178,7 @@ def load_addon_checkpoint(
     task_context_identity: dict | None = None,
     map_location: str = "cpu",
     load_scope: str = "all",
+    target_training_stage: str | None = None,
 ) -> dict:
     payload = torch.load(path, map_location=map_location, weights_only=False)
     if payload.get("task_context_identity") != task_context_identity:
@@ -142,6 +186,15 @@ def load_addon_checkpoint(
     for name, expected in (("base_checkpoint_sha256", base_checkpoint_sha256), ("cte_checkpoint_sha256", cte_checkpoint_sha256)):
         if expected is not None and payload.get(name) != expected:
             raise ValueError(f"addon checkpoint {name} mismatch")
+    expected_layout = addon_layout_metadata(behavior_prefix_adapter)
+    checkpoint_layout = _checkpoint_prefix_layout(payload)
+    if load_scope in {"all", "policy_injection"} and checkpoint_layout != expected_layout["prefix_layout"]:
+        raise ValueError(
+            "addon checkpoint prefix_layout mismatch: "
+            f"{checkpoint_layout} vs {expected_layout['prefix_layout']}; "
+            "warmstart a new zeva_ego Stage2A with policy_warmstart and train "
+            "its effect projector before initializing Stage2B"
+        )
     if load_scope == "all":
         expected_variant = getattr(getattr(behavior_prefix_adapter, "config", None), "pim_variant", "legacy")
         checkpoint_variant = payload.get("pim_variant", "legacy")
@@ -150,23 +203,28 @@ def load_addon_checkpoint(
                 f"addon checkpoint pim_variant mismatch: {checkpoint_variant} vs {expected_variant}; "
                 "initialize the new variant with load_scope='policy_injection' from a Stage2A checkpoint"
             )
-        if expected_variant == "cross_attempt" and payload.get("addon_schema") != "cross_attempt_v1":
-            raise ValueError("cross_attempt checkpoint is missing its cross_attempt_v1 schema marker")
         causal_prompt_encoder.load_state_dict(
             payload["causal_prompt_encoder"], strict=True
         )
         behavior_prefix_adapter.load_state_dict(
             payload["behavior_prefix_adapter"], strict=True
         )
-    elif load_scope == "policy_injection":
+    elif load_scope in {"policy_injection", "policy_warmstart"}:
         if payload.get("training_stage") != "policy_injection":
-            raise ValueError("policy_injection initialization requires a Stage2A policy_injection checkpoint")
+            raise ValueError(f"{load_scope} initialization requires a Stage2A policy_injection checkpoint")
+        if load_scope == "policy_warmstart":
+            if target_training_stage != "policy_injection":
+                raise ValueError("policy_warmstart is only valid when training a new Stage2A policy_injection model")
+            if checkpoint_layout != "legacy_merged" or expected_layout["prefix_layout"] != "zeva_ego":
+                raise ValueError("policy_warmstart only supports legacy_merged Stage2A -> zeva_ego Stage2A")
         adapter_state = payload["behavior_prefix_adapter"]
         keep_prefixes = (
             "prior.",
             "action_prior_adapter.",
             "behavior_global_projector.",
         )
+        if load_scope == "policy_injection" and expected_layout["prefix_layout"] == "zeva_ego":
+            keep_prefixes += ("behavior_effect_projector.",)
         policy_state = {
             key: value
             for key, value in adapter_state.items()
@@ -189,5 +247,5 @@ def load_addon_checkpoint(
                 f"unexpected policy-injection checkpoint keys: {unexpected}"
             )
     else:
-        raise ValueError("load_scope must be 'all' or 'policy_injection'")
+        raise ValueError("load_scope must be 'all', 'policy_injection', or 'policy_warmstart'")
     return payload

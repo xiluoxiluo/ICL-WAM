@@ -1,12 +1,20 @@
 # ICLWAM：把 Zeva 因果记忆接到 FastWAM
 
-## Zeva-Ego cross-attempt 更新
+## Zeva-Ego 独立 global / effect / PIM prefix 更新
 
-新增显式 `pim_variant=cross_attempt` 分支，参考 Zeva `feature/zeva_ego` 的 RoboTwin PIM 设计：只读取已经结束的尝试、最多 3 次历史 × 64 条完整 effect、同时条件化 behavior prefix 和冻结的 action prior，并用同一个新 checkpoint 做 memory-on/off 对照。
+`prefix_layout=zeva_ego` 把原来相加的 behavior slot 改为三个独立 attention 位置：`[G(g + U(c)), E(latest_completed_BIT), P(c)]`。它们分别承载 global、当前尝试已完成的 effect、跨尝试 PIM context；空 effect/PIM 同时从 attention K/V 中屏蔽。跨尝试分支只读取已经结束的尝试，最多 3 次历史 × 64 条完整 effect，保留 PIM 对 global 和 action prior 的条件化，并用同一个新 checkpoint 做 memory-on/off 对照。
 
-**新训练、缓存迁移和 10 × 20 场景评测请使用 [cross-attempt 运行指南](docs/zeva_ego_cross_attempt.md)。** 新分支需要从已有 Stage2A addon 重新训练 Stage2B；旧的 top-4 Stage2B checkpoint 不能直接当作新分支使用。下面原有流程继续对应 legacy 配置，便于复现旧基线。
+这对齐了 Zeva-Ego 的独立 token 布局和读取思路，同时保留 FastWAM 的 video/action experts 与 mixed attention。effect 来自现有 BIT 的最新 completed effect，区别于参考 Zeva-Ego 的当前 effect prediction；v4 cache 的 `phase_query.effect` 是占位字段，不能用于替代预测。
 
-ICLWAM 在 FastWAM 的 RoboTwin action path 上加入 Zeva 的因果记忆模块。FastWAM 仍然负责根据图像、语言和本体状态生成动作；Zeva 负责从历史交互中提取当前 phase、短期 BIT 和跨尝试保留的 PIM，再把这些信息转换成 FastWAM action hidden space 中的条件。
+**新训练、权重迁移和 10 × 20 场景评测请使用 [独立 prefix / cross-attempt 运行指南](docs/zeva_ego_cross_attempt.md)。** 新流程是：
+
+1. `robotwin_zeva_fastwam_ego_policy_3cam_384` 训练新 Stage2A，使用原 legacy prepared cache；可用 `policy_warmstart_checkpoint` 复用旧 Stage2A 的已有模块，新增 effect projector 必须训练。
+2. `robotwin_zeva_fastwam_cross_attempt_3cam_384` 加载训练完成的新 Stage2A，冻结父模型并训练 PIM；使用 cross-attempt prepared cache，已有且身份匹配的版本可复用。
+3. 用同一新 Stage2B checkpoint 做 `new_on/new_off` 配对 RoboTwin 评测，验证实际成功率。
+
+新 addon schema 为 `zeva_ego_prefix_v1`；缺 layout 的历史权重固定按 `legacy_merged` 读取。旧 Stage2A 不能直接初始化新 Stage2B，旧 Stage2B 也不能直接按新布局部署。复现此前 merged cross-attempt 结果时，显式设置 `model.zeva.adapter.prefix_layout=legacy_merged`。本次拆 token 不要求重建 CTE、BIT 或已有身份匹配的缓存；尚无 cross-attempt cache 的实验仍需为 Stage2B 构建它。下面原有流程对应 legacy 配置，便于复现旧基线。
+
+ICLWAM 在 FastWAM 的 RoboTwin action path 上加入 Zeva 的因果记忆模块。FastWAM 仍然负责根据图像、语言和本体状态生成动作；记忆模块从历史交互中提取当前 phase、短期 BIT 和跨尝试保留的 PIM，通过 video 流中的 behavior prefix 与 action hidden space 中的 prior residual 两条路径影响动作。
 
 一次推理可以简单理解为：
 
@@ -174,9 +182,9 @@ data/robotwin2.0/zeva_cache/v4/
 
 如果更换数据集、dataset_stats.json、CTE checkpoint、相机顺序或 action 对齐参数，需要重新构建 cache。manifest.json 会检查这些身份信息，防止错误复用旧 cache。
 
-## 5. Stage 2A：训练 Zeva policy injection addon
+## 5. Legacy Stage 2A：训练 Zeva policy injection addon
 
-Stage 2A 使用已有 FastWAM checkpoint 作为冻结 backbone，只训练 Gaussian action prior、action-prior adapter 和 task/global behavior projector。
+本节的 `legacy_merged` Stage 2A 使用已有 FastWAM checkpoint 作为冻结 backbone，只训练 Gaussian action prior、action-prior adapter 和 task/global behavior projector。新独立 prefix 还需训练 effect projector，请使用上方运行指南中的新 Stage2A task。
 
 先用 pooling 路径跑通训练，不需要额外的 static task-context 文件：
 
@@ -218,9 +226,9 @@ python scripts/train_zeva_fastwam.py \
   resume=./runs/zeva_stage2a/checkpoints/state/step_005000
 ~~~
 
-## 6. Stage 2B：可选的 PIM adapter 训练
+## 6. Legacy Stage 2B：可选的 PIM adapter 训练
 
-Stage 2B 先加载 Stage 2A addon，然后冻结 policy-injection 分支，只训练 CausalPromptEncoder、prefix_project 和 pim_gate。
+本节的旧 Stage 2B 先加载同布局的 Stage 2A addon，然后冻结 policy-injection 分支，只训练 CausalPromptEncoder、prefix_project 和 pim_gate。新 `zeva_ego` cross-attempt Stage2B 使用独立 PIM slot 和 `pim_to_global`，旧 scalar gate 保留在 state dict 中，但不参与输出或训练。
 
 ~~~bash
 POLICY_CKPT=./runs/zeva_stage2a/checkpoints/weights/step_010000_addon.pt
@@ -291,7 +299,7 @@ python scripts/train_zeva_fastwam.py \
   mixed_precision=bf16
 ~~~
 
-## 8. RoboTwin 测试
+## 8. Legacy RoboTwin 测试
 
 ### 8.1 固定 seed 测试
 
@@ -374,7 +382,7 @@ Zeva 测试必须满足：
 - action_horizon=32；
 - replan_steps 是 4 的倍数；
 - skip_get_obs_within_replan=false，因为 CTE 需要每个已执行 action 对应的 after-frame；
-- pim_top_k 与训练时的 prompt.persistent_length 一致，默认都是 4。
+- pim_top_k 与训练时的 prompt.persistent_length 一致；本节 legacy 配置为 4，cross-attempt 配置为 192。
 
 ## 9. 结果和排错
 
@@ -397,6 +405,7 @@ evaluate_results/robotwin/            # RoboTwin 测试结果和日志
 5. static task context requires ...：没有 static bank 时，在训练和 pooling 测试命令中加入 model.zeva.task_context.mode=pooling。
 6. addon checkpoint mismatch：addon 必须由同一个 FastWAM base、同一个 CTE 和同一套 task-context artifacts 训练得到。
 7. CUDA 或 RoboTwin assets 报错：Stage 2 和正式 rollout 需要 CUDA、SAPIEN/Curobo/pytorch3d 以及 RoboTwin assets；CPU 只适合做小型代码 smoke test。
+8. `prefix_layout mismatch` 或缺少 `behavior_effect_projector`：新 Stage2B 需要完整的新布局 Stage2A；用新 Stage2A task 训练后再初始化。旧权重复现请显式选择 `legacy_merged`，不要删除 metadata 来绕过检查。
 
 ## 10. 本地代码检查
 

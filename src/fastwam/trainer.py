@@ -65,6 +65,7 @@ class Wan22Trainer:
         )
         if self.zeva_training:
             logger.info("Zeva training stage: %s", self.zeva_training_stage)
+        self._validate_policy_warmstart_configuration()
 
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
@@ -94,8 +95,11 @@ class Wan22Trainer:
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         self._apply_dit_only_train_mode(self.model)
-        if self.zeva_training and self.zeva_training_stage == "pim_adapter":
-            self._initialize_pim_stage_from_policy_checkpoint()
+        if self.zeva_training:
+            if self.zeva_training_stage == "policy_injection":
+                self._initialize_policy_stage_from_warmstart()
+            elif self.zeva_training_stage == "pim_adapter":
+                self._initialize_pim_stage_from_policy_checkpoint()
         if self.zeva_training:
             if self.zeva_training_stage == "policy_injection":
                 trainable_params = list(self.model.zeva_trainable_parameters())
@@ -103,14 +107,17 @@ class Wan22Trainer:
             elif self.zeva_training_stage == "pim_adapter":
                 adapter = self.model.zeva_behavior_prefix_adapter
                 prompt_params = list(self.model.zeva_prompt_encoder.parameters())
-                if getattr(adapter.config, "pim_variant", "legacy") == "cross_attempt":
+                if (
+                    getattr(adapter.config, "pim_variant", "legacy") == "cross_attempt"
+                    or getattr(adapter.config, "prefix_layout", "legacy_merged") == "zeva_ego"
+                ):
                     adapter_params = list(adapter.pim_adapter_parameters())
                     trainable_params = prompt_params + adapter_params
                     optimizer_params = [
                         {"params": prompt_params, "lr": self.learning_rate, "name": "pim_readout"},
                         {"params": adapter_params, "lr": self.learning_rate, "name": "pim_injection"},
                     ]
-                    logger.info("Cross-attempt PIM learning rates: readout=%g injection=%g", self.learning_rate, self.learning_rate)
+                    logger.info("PIM learning rates: readout=%g injection=%g", self.learning_rate, self.learning_rate)
                 else:
                     projector_params = list(adapter.prefix_project.parameters())
                     gate_params = [adapter.pim_gate]
@@ -372,6 +379,54 @@ class Wan22Trainer:
         eta_h, eta_rem = divmod(eta_seconds, 3600)
         eta_m, eta_s = divmod(eta_rem, 60)
         return f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}", steps_per_sec
+
+    def _validate_policy_warmstart_configuration(self) -> None:
+        zeva_cfg = self.cfg.model.get("zeva", {})
+        value = zeva_cfg.get("policy_warmstart_checkpoint") if hasattr(zeva_cfg, "get") else None
+        if value in (None, "", "None", "null"):
+            return
+        if not self.zeva_training or self.zeva_training_stage != "policy_injection":
+            raise ValueError("policy_warmstart_checkpoint is only valid for Stage2A policy_injection training")
+        if self.resume not in (None, "", "None", "null"):
+            raise ValueError("policy_warmstart_checkpoint cannot be combined with resume; clear it when resuming")
+        if zeva_cfg.get("policy_checkpoint") not in (None, "", "None", "null"):
+            raise ValueError("policy_warmstart_checkpoint and policy_checkpoint are mutually exclusive")
+        layout = getattr(getattr(self.model.zeva_behavior_prefix_adapter, "config", None), "prefix_layout", "legacy_merged")
+        if layout != "zeva_ego":
+            raise ValueError("policy_warmstart_checkpoint requires the new zeva_ego prefix_layout")
+
+    def _initialize_policy_stage_from_warmstart(self) -> None:
+        """Reuse old Stage2A weights while training the new effect projector.
+
+        This is an explicit one-time initialization, never a resume or a way
+        to import an untrained effect projector into frozen-parent Stage2B.
+        """
+        self._validate_policy_warmstart_configuration()
+        zeva_cfg = self.cfg.model.get("zeva", {})
+        value = zeva_cfg.get("policy_warmstart_checkpoint")
+        if value in (None, "", "None", "null"):
+            return
+        path = Path(str(value))
+        if not path.is_file():
+            raise FileNotFoundError(f"zeva.policy_warmstart_checkpoint does not exist: {path}")
+        base_path = self.cfg.get("ckpt")
+        cte_path = zeva_cfg.get("cte", {}).get("checkpoint")
+        if base_path in (None, "", "None", "null"):
+            raise ValueError("policy_warmstart initialization requires cfg.ckpt")
+        if cte_path in (None, "", "None", "null"):
+            raise ValueError("policy_warmstart initialization requires model.zeva.cte.checkpoint")
+        self.model.load_zeva_addon_checkpoint(
+            str(path),
+            base_checkpoint_sha256=checkpoint_sha256(str(base_path)),
+            cte_checkpoint_sha256=checkpoint_sha256(str(cte_path)),
+            load_scope="policy_warmstart",
+        )
+        self.model.zeva_behavior_prefix_adapter.reset_pim_parameters()
+        self.model.configure_zeva_trainable_state()
+        logger.info(
+            "Warmstarted zeva_ego Stage2A from %s (sha256=%s); effect projector remains trainable",
+            path, checkpoint_sha256(path),
+        )
 
     def _get_zeva_policy_checkpoint(self) -> Path | None:
         if not self.zeva_training:

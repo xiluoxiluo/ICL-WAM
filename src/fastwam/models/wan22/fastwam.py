@@ -297,6 +297,37 @@ class FastWAM(torch.nn.Module):
             torch.cat([context_mask, proprio_mask], dim=1),
         )
 
+    def _build_exact_zeva_behavior_prefix(
+        self,
+        causal_prompt: torch.Tensor,
+        pim_mask: torch.Tensor,
+        task_tokens: torch.Tensor,
+        *,
+        bit_effects: Optional[torch.Tensor] = None,
+        bit_mask: Optional[torch.Tensor] = None,
+        enable_pim: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build policy-hidden prefix tokens and per-example key validity.
+
+        The versioned ``zeva_ego`` layout keeps global, completed-effect and
+        PIM in separate positions. The original single-slot layout remains
+        available only for its original configurations/checkpoints.
+        """
+        if getattr(self, "zeva_injection_mode", "memory_residual") != "exact_zeva":
+            raise RuntimeError("main-stream behavior prefixes require exact_zeva")
+        adapter = self.zeva_behavior_prefix_adapter
+        if adapter is None:
+            raise RuntimeError("behavior prefixes require an attached adapter")
+        tokens, valid = adapter.behavior_prefix_tokens(
+            task_tokens, causal_prompt, pim_mask,
+            bit_effects=bit_effects, bit_mask=bit_mask, enable_pim=enable_pim,
+        )
+        expected_slots = 3 if getattr(adapter.config, "prefix_layout", "legacy_merged") == "zeva_ego" else 1
+        expected = (task_tokens.shape[0], expected_slots, int(self.video_expert.hidden_dim))
+        if tuple(tokens.shape) != expected or tuple(valid.shape) != expected[:2]:
+            raise ValueError(f"behavior prefix must have shape {expected} and aligned validity")
+        return tokens, valid
+
     def _build_exact_zeva_behavior_token(
         self,
         causal_prompt: torch.Tensor,
@@ -305,13 +336,7 @@ class FastWAM(torch.nn.Module):
         *,
         enable_pim: bool = True,
     ) -> torch.Tensor:
-        """Build Zeva's single Behavior Prefix in FastWAM main hidden space.
-
-        Zeva writes the static task prefix plus the gated Causal Prompt residual
-        into one reserved token in the policy's main transformer sequence.  The
-        exact FastWAM path therefore must not turn this token into ordinary text
-        cross-attention context.
-        """
+        """Compatibility entry for the original merged FastWAM behavior slot."""
         if getattr(self, "zeva_injection_mode", "memory_residual") != "exact_zeva":
             raise RuntimeError(
                 "main-stream Zeva behavior token is only valid for exact_zeva"
@@ -342,6 +367,9 @@ class FastWAM(torch.nn.Module):
         video_t_mod: torch.Tensor,
         video_freqs: torch.Tensor,
         video_context_mask: torch.Tensor,
+        *,
+        behavior_prefix_mask: Optional[torch.Tensor] = None,
+        prefix_layout: str = "legacy_merged",
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -349,13 +377,17 @@ class FastWAM(torch.nn.Module):
         torch.Tensor,
         int,
     ]:
-        """Insert one causal, non-diffused Zeva token before physical video tokens.
+        """Insert non-diffused conditioning tokens before physical video tokens.
 
-        This is FastWAM's MoT equivalent of Zeva's reserved behavior slot.  It
-        is a main-stream token, not a text-context token.
+        New prefixes use the clean first frame's time modulation and can read
+        instruction context. Identity RoPE leaves all physical patch positions
+        unchanged. Legacy prefixes retain their original numerical path.
         """
-        if behavior_token.ndim != 3 or behavior_token.shape[1] != 1:
-            raise ValueError("behavior_token must be [B,1,D]")
+        if prefix_layout not in {"legacy_merged", "zeva_ego"}:
+            raise ValueError("unsupported behavior prefix layout")
+        expected_slots = 3 if prefix_layout == "zeva_ego" else 1
+        if behavior_token.ndim != 3 or behavior_token.shape[1] != expected_slots:
+            raise ValueError(f"behavior_token must be [B,{expected_slots},D]")
         if video_tokens.ndim != 3:
             raise ValueError("video_tokens must be [B,S,D]")
         if behavior_token.shape[0] != video_tokens.shape[0]:
@@ -377,15 +409,33 @@ class FastWAM(torch.nn.Module):
         ):
             raise ValueError("video_context_mask must be [B,S,L]")
 
-        prefix_t_mod = video_t_mod.new_zeros(
-            (video_tokens.shape[0], 1, *video_t_mod.shape[2:])
-        )
-        prefix_freqs = torch.ones_like(video_freqs[:1])
-        prefix_context_mask = torch.zeros(
-            (video_tokens.shape[0], 1, video_context_mask.shape[-1]),
-            dtype=torch.bool,
-            device=video_context_mask.device,
-        )
+        prefix_len = behavior_token.shape[1]
+        if behavior_prefix_mask is None:
+            behavior_prefix_mask = torch.ones(
+                behavior_token.shape[:2], dtype=torch.bool, device=video_tokens.device,
+            )
+        if behavior_prefix_mask.shape != behavior_token.shape[:2]:
+            raise ValueError("behavior_prefix_mask must align with behavior tokens")
+        valid = behavior_prefix_mask.to(device=video_tokens.device, dtype=torch.bool)
+        if prefix_layout == "zeva_ego":
+            if video_tokens.shape[1] < 1:
+                raise ValueError("zeva_ego prefixes require a clean first-frame token")
+            prefix_t_mod = video_t_mod[:, :1].expand(-1, prefix_len, -1, -1)
+            prefix_context_mask = (
+                video_context_mask[:, :1].expand(-1, prefix_len, -1)
+                & valid.to(video_context_mask.device).unsqueeze(-1)
+            )
+        else:
+            prefix_t_mod = video_t_mod.new_zeros(
+                (video_tokens.shape[0], prefix_len, *video_t_mod.shape[2:])
+            )
+            prefix_context_mask = torch.zeros(
+                (video_tokens.shape[0], prefix_len, video_context_mask.shape[-1]),
+                dtype=torch.bool, device=video_context_mask.device,
+            )
+        prefix_freqs = torch.ones_like(video_freqs[:1]).expand(prefix_len, *video_freqs.shape[1:])
+        behavior_token = behavior_token.to(device=video_tokens.device, dtype=video_tokens.dtype)
+        behavior_token = torch.where(valid.unsqueeze(-1), behavior_token, torch.zeros_like(behavior_token))
 
         return (
             torch.cat(
@@ -404,7 +454,7 @@ class FastWAM(torch.nn.Module):
                 dim=0,
             ),
             torch.cat((prefix_context_mask, video_context_mask), dim=1),
-            1,
+            prefix_len,
         )
 
     @torch.no_grad()
@@ -564,16 +614,23 @@ class FastWAM(torch.nn.Module):
         video_tokens_per_frame: int,
         device: torch.device,
         behavior_prefix_len: int = 0,
+        behavior_prefix_mask: Optional[torch.Tensor] = None,
+        behavior_prefix_layout: str = "legacy_merged",
     ) -> torch.Tensor:
-        """Build MoT attention with an optional Zeva behavior prefix.
+        """Build MoT attention with optional independent behavior conditions.
 
         ``video_seq_len`` includes the behavior prefix.  Physical video masking
         is still computed only on physical video tokens, so the prefix is never
-        mistaken for a spatial patch/frame.
+        mistaken for a spatial patch/frame. ``zeva_ego`` returns [B,1,S,S]
+        so empty effect/PIM keys are removed per example, including mixed
+        batches. Condition tokens and the clean first frame share a prefix
+        block, while neither can read future video or action tokens.
         """
         behavior_prefix_len = int(behavior_prefix_len)
         if behavior_prefix_len < 0 or behavior_prefix_len > video_seq_len:
             raise ValueError("behavior_prefix_len must lie within video_seq_len")
+        if behavior_prefix_layout not in {"legacy_merged", "zeva_ego"}:
+            raise ValueError("unsupported behavior prefix layout")
 
         physical_video_len = video_seq_len - behavior_prefix_len
         total_seq_len = video_seq_len + action_seq_len
@@ -582,7 +639,7 @@ class FastWAM(torch.nn.Module):
         )
 
         if behavior_prefix_len:
-            # Causal understanding token: behavior -> behavior; later video -> behavior.
+            # Behavior conditions are visible to other conditions and video.
             mask[:behavior_prefix_len, :behavior_prefix_len] = True
             mask[behavior_prefix_len:video_seq_len, :behavior_prefix_len] = True
 
@@ -606,6 +663,22 @@ class FastWAM(torch.nn.Module):
         if first_frame_tokens:
             start = behavior_prefix_len
             mask[video_seq_len:, start:start + first_frame_tokens] = True
+            if behavior_prefix_layout == "zeva_ego" and behavior_prefix_len:
+                mask[:behavior_prefix_len, start:start + first_frame_tokens] = True
+        if behavior_prefix_layout == "zeva_ego" and behavior_prefix_len:
+            if behavior_prefix_mask is None or behavior_prefix_mask.ndim != 2:
+                raise ValueError("zeva_ego attention requires behavior_prefix_mask [B,P]")
+            if behavior_prefix_mask.shape[1] != behavior_prefix_len:
+                raise ValueError("behavior prefix validity length mismatch")
+            valid = behavior_prefix_mask.to(device=device, dtype=torch.bool)
+            if not bool(valid[:, 0].all()):
+                raise ValueError("the global behavior token must always be valid")
+            # Invalid query rows may read the valid global token, avoiding
+            # all-masked SDPA rows. Their K/V is hidden from every query, so
+            # they cannot affect valid prefixes, pixels or action outputs.
+            key_valid = torch.ones((valid.shape[0], total_seq_len), dtype=torch.bool, device=device)
+            key_valid[:, :behavior_prefix_len] = valid
+            return mask[None, None] & key_valid[:, None, None, :]
         return mask
 
     def _compute_video_loss_per_sample(
@@ -981,7 +1054,8 @@ class FastWAM(torch.nn.Module):
         self.zeva_behavior_prefix_adapter = behavior_prefix_adapter.to(device=self.device, dtype=self.torch_dtype)
         self.zeva_prompt_encoder.requires_grad_(True)
         self.zeva_behavior_prefix_adapter.requires_grad_(True)
-        if getattr(behavior_prefix_adapter.config, "pim_variant", "legacy") == "cross_attempt":
+        if (getattr(behavior_prefix_adapter.config, "pim_variant", "legacy") == "cross_attempt"
+                or getattr(behavior_prefix_adapter.config, "prefix_layout", "legacy_merged") == "zeva_ego"):
             self.zeva_behavior_prefix_adapter.pim_gate.requires_grad_(False)
         self.zeva_injection_mode = injection_mode
         self.zeva_enabled = True
@@ -1026,6 +1100,9 @@ class FastWAM(torch.nn.Module):
             adapter.action_prior_adapter.requires_grad_(True)
             adapter.behavior_global_projector.train()
             adapter.behavior_global_projector.requires_grad_(True)
+            if hasattr(adapter, "behavior_effect_projector"):
+                adapter.behavior_effect_projector.train()
+                adapter.behavior_effect_projector.requires_grad_(True)
             return
         if stage == "pim_adapter":
             self.zeva_prompt_encoder.train()
@@ -1165,6 +1242,8 @@ class FastWAM(torch.nn.Module):
         zeva_prior_mean: Optional[torch.Tensor] = None,
         zeva_prior_std: Optional[torch.Tensor] = None,
         zeva_task_tokens: Optional[torch.Tensor] = None,
+        zeva_bit_effects: Optional[torch.Tensor] = None,
+        zeva_bit_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Train only the Zeva residual against FastWAM action flow matching."""
         if input_image.ndim != 4 or input_image.shape[1] != 3:
@@ -1197,9 +1276,8 @@ class FastWAM(torch.nn.Module):
             context, context_mask = self._append_proprio_to_context(
                 context, context_mask, proprio[:, 0, :].to(self.device, dtype=self.torch_dtype)
             )
-        # Exact Zeva keeps instruction/proprio context untouched.  Its static
-        # Behavior Prefix and gated Causal Prompt residual are combined into
-        # one main-stream token below, matching Zeva's reserved behavior slot.
+        # Main-stream behavior conditions leave instruction/proprio inputs
+        # unchanged. Their versioned layout controls independent positions.
         clean_action = clean_action.to(self.device, dtype=self.torch_dtype)
         noise = torch.randn_like(clean_action) if noise is None else noise.to(clean_action)
         timestep = self.train_action_scheduler.sample_training_t(
@@ -1239,11 +1317,16 @@ class FastWAM(torch.nn.Module):
             )
 
         behavior_prefix_len = 0
+        behavior_prefix_mask = None
+        behavior_prefix_layout = "legacy_merged"
         if exact_zeva:
-            behavior_token = self._build_exact_zeva_behavior_token(
+            behavior_prefix_layout = getattr(self.zeva_behavior_prefix_adapter.config, "prefix_layout", "legacy_merged")
+            behavior_token, behavior_prefix_mask = self._build_exact_zeva_behavior_prefix(
                 causal_prompt=causal_prompt,
                 pim_mask=pim_mask,
                 task_tokens=zeva_task_tokens,
+                bit_effects=zeva_bit_effects,
+                bit_mask=zeva_bit_mask,
                 enable_pim=(self.zeva_training_stage == "pim_adapter"),
             )
             (
@@ -1258,6 +1341,8 @@ class FastWAM(torch.nn.Module):
                 video_t_mod=video_t_mod,
                 video_freqs=video_freqs,
                 video_context_mask=video_context_mask,
+                behavior_prefix_mask=behavior_prefix_mask,
+                prefix_layout=behavior_prefix_layout,
             )
 
         attention_mask = self._build_mot_attention_mask(
@@ -1266,6 +1351,8 @@ class FastWAM(torch.nn.Module):
             video_tokens_per_frame=tokens_per_frame,
             device=self.device,
             behavior_prefix_len=behavior_prefix_len,
+            behavior_prefix_mask=behavior_prefix_mask,
+            behavior_prefix_layout=behavior_prefix_layout,
         )
 
         if exact_zeva:
@@ -1276,7 +1363,7 @@ class FastWAM(torch.nn.Module):
                 video_t_mod=video_t_mod, video_context=video_context,
                 video_context_mask=video_context_mask,
                 video_attention_mask=attention_mask[
-                    : video_tokens.shape[1], : video_tokens.shape[1]
+                    ..., : video_tokens.shape[1], : video_tokens.shape[1]
                 ],
             )
         else:
@@ -1286,14 +1373,14 @@ class FastWAM(torch.nn.Module):
                     video_t_mod=video_t_mod, video_context=video_context,
                     video_context_mask=video_context_mask,
                     video_attention_mask=attention_mask[
-                        : video_tokens.shape[1], : video_tokens.shape[1]
+                        ..., : video_tokens.shape[1], : video_tokens.shape[1]
                     ],
                 )
         debug_metrics: dict[str, torch.Tensor] = {}
         pred_action = self._denoise_action_with_video_cache_zeva(
             latents_action=noisy_action, timestep_action=timestep, context=context,
             context_mask=context_mask, video_cache_k=video_cache_k, video_cache_v=video_cache_v,
-            action_attention_mask=attention_mask[video_tokens.shape[1]:, :],
+            action_attention_mask=attention_mask[..., video_tokens.shape[1]:, :],
             causal_prompt=causal_prompt, pim_mask=pim_mask,
             zeva_action_residual=zeva_action_residual,
             debug=debug_metrics,
@@ -1372,17 +1459,28 @@ class FastWAM(torch.nn.Module):
             metrics["action_prior/hidden_residual_norm"] = residual_norm
             with torch.no_grad():
                 adapter = self.zeva_behavior_prefix_adapter
-                parent_prefix = adapter.behavior_prefix_slot(
+                parent_prefix, parent_valid = adapter.behavior_prefix_tokens(
                     zeva_task_tokens, causal_prompt, pim_mask, enable_pim=False,
+                    bit_effects=zeva_bit_effects, bit_mask=zeva_bit_mask,
                 )
                 actual_prefix = behavior_token.to(parent_prefix)
                 prefix_delta = actual_prefix - parent_prefix
-                base_norm = parent_prefix.float().norm(dim=-1).mean()
+                parent_norms = parent_prefix.float().norm(dim=-1)
+                base_norm = (parent_norms * parent_valid).sum() / parent_valid.sum().clamp_min(1)
                 delta_norm = prefix_delta.float().norm(dim=-1).mean()
                 metrics["memory/prefix_delta_norm"] = float(delta_norm.cpu())
                 metrics["memory/prefix_delta_ratio"] = float((delta_norm / base_norm.clamp_min(1e-8)).cpu())
                 metrics["memory/nonempty_fraction"] = float(pim_mask.any(dim=-1).float().mean().cpu())
-            if cross_attempt:
+                if behavior_prefix_layout == "zeva_ego":
+                    for index, name in enumerate(("global", "effect", "pim")):
+                        slot_valid = behavior_prefix_mask[:, index]
+                        slot_norm = actual_prefix[:, index].float().norm(dim=-1)
+                        metrics[f"prefix/{name}_valid_fraction"] = float(slot_valid.float().mean().cpu())
+                        metrics[f"prefix/{name}_norm"] = float(
+                            ((slot_norm * slot_valid).sum() / slot_valid.sum().clamp_min(1)).cpu()
+                        )
+                    metrics["prefix/token_capacity"] = 3.0
+            if cross_attempt or behavior_prefix_layout == "zeva_ego":
                 # There is no learned scalar gain in this variant. Omit the
                 # compatibility parameter instead of presenting it as usage.
                 metrics.pop("gate", None)
@@ -1658,6 +1756,8 @@ class FastWAM(torch.nn.Module):
         pim_mask: Optional[torch.Tensor] = None,
         zeva_action_residual: Optional[torch.Tensor] = None,
         zeva_task_tokens: Optional[torch.Tensor] = None,
+        zeva_bit_effects: Optional[torch.Tensor] = None,
+        zeva_bit_mask: Optional[torch.Tensor] = None,
         zeva_mode: str = "base",
         enable_prefix_injection: Optional[bool] = None,
         enable_action_prior: Optional[bool] = None,
@@ -1785,15 +1885,20 @@ class FastWAM(torch.nn.Module):
             fuse_vae_embedding_in_latents=fuse_flag,
         )
         behavior_prefix_len = 0
+        behavior_prefix_mask = None
+        behavior_prefix_layout = "legacy_merged"
         if (
             zeva_mode != "base"
             and getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
             and enable_prefix_injection
         ):
-            behavior_token = self._build_exact_zeva_behavior_token(
+            behavior_prefix_layout = getattr(self.zeva_behavior_prefix_adapter.config, "prefix_layout", "legacy_merged")
+            behavior_token, behavior_prefix_mask = self._build_exact_zeva_behavior_prefix(
                 causal_prompt=causal_prompt,
                 pim_mask=pim_mask,
                 task_tokens=zeva_task_tokens,
+                bit_effects=zeva_bit_effects,
+                bit_mask=zeva_bit_mask,
                 enable_pim=(zeva_mode == "pim_on"),
             )
             (
@@ -1808,6 +1913,8 @@ class FastWAM(torch.nn.Module):
                 video_t_mod=video_t_mod,
                 video_freqs=video_freqs,
                 video_context_mask=video_context_mask,
+                behavior_prefix_mask=behavior_prefix_mask,
+                prefix_layout=behavior_prefix_layout,
             )
 
         video_seq_len = int(video_tokens.shape[1])
@@ -1817,9 +1924,11 @@ class FastWAM(torch.nn.Module):
             video_tokens_per_frame=tokens_per_frame,
             device=video_tokens.device,
             behavior_prefix_len=behavior_prefix_len,
+            behavior_prefix_mask=behavior_prefix_mask,
+            behavior_prefix_layout=behavior_prefix_layout,
         )
-        video_attention_mask = attention_mask[:video_seq_len, :video_seq_len]
-        action_attention_mask = attention_mask[video_seq_len:, :]
+        video_attention_mask = attention_mask[..., :video_seq_len, :video_seq_len]
+        action_attention_mask = attention_mask[..., video_seq_len:, :]
         if compile_action_infer:
             if not hasattr(self, "_prefill_video_cache_compiled"):
                 self._prefill_video_cache_compiled = torch.compile(
@@ -1970,16 +2079,12 @@ class FastWAM(torch.nn.Module):
                                    base_checkpoint_sha256: str = "", cte_checkpoint_sha256: str = ""):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Cannot save a Zeva addon before attaching it")
+        from fastwam.zeva.checkpoint import addon_layout_metadata
         torch.save({
             "causal_prompt_encoder": self.zeva_prompt_encoder.state_dict(),
             "behavior_prefix_adapter": self.zeva_behavior_prefix_adapter.state_dict(),
             "pim_gate": self.zeva_behavior_prefix_adapter.pim_gate.detach().cpu(),
-            "pim_variant": getattr(self.zeva_behavior_prefix_adapter.config, "pim_variant", "legacy"),
-            "addon_schema": (
-                "cross_attempt_v1"
-                if getattr(self.zeva_behavior_prefix_adapter.config, "pim_variant", "legacy") == "cross_attempt"
-                else "legacy"
-            ),
+            **addon_layout_metadata(self.zeva_behavior_prefix_adapter),
             "training_stage": self.zeva_training_stage,
             "step": int(step), "config": config or {},
             "base_checkpoint_sha256": base_checkpoint_sha256,
@@ -1999,6 +2104,7 @@ class FastWAM(torch.nn.Module):
             cte_checkpoint_sha256=cte_checkpoint_sha256,
             task_context_identity=getattr(self, "zeva_task_context_identity", None),
             load_scope=load_scope,
+            target_training_stage=self.zeva_training_stage,
         )
 
     def zeva_parameter_report(self) -> dict[str, object]:
@@ -2010,6 +2116,7 @@ class FastWAM(torch.nn.Module):
                 "zeva_behavior_prefix_adapter.prior.",
                 "zeva_behavior_prefix_adapter.action_prior_adapter.",
                 "zeva_behavior_prefix_adapter.behavior_global_projector.",
+                "zeva_behavior_prefix_adapter.behavior_effect_projector.",
             )
         elif stage == "pim_adapter":
             allowed = (
@@ -2018,7 +2125,7 @@ class FastWAM(torch.nn.Module):
             )
             if getattr(self.zeva_behavior_prefix_adapter.config, "pim_variant", "legacy") == "cross_attempt":
                 allowed += ("zeva_behavior_prefix_adapter.pim_to_global.",)
-            else:
+            elif getattr(self.zeva_behavior_prefix_adapter.config, "prefix_layout", "legacy_merged") == "legacy_merged":
                 allowed += ("zeva_behavior_prefix_adapter.pim_gate",)
         else:
             raise RuntimeError(f"unsupported Zeva training stage: {stage}")
@@ -2169,6 +2276,8 @@ class FastWAM(torch.nn.Module):
             zeva_prior_mean=zeva_prior_mean,
             zeva_prior_std=zeva_prior_std,
             zeva_task_tokens=task_tokens,
+            zeva_bit_effects=sample["bit_effects"].to(self.device),
+            zeva_bit_mask=sample["bit_mask"].to(self.device),
         )
         metrics.update(
             {

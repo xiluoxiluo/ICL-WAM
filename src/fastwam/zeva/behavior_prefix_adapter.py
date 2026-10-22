@@ -66,7 +66,7 @@ class BehaviorPrefixAdapter(nn.Module):
 
 @dataclass(frozen=True)
 class ExactZevaPolicyInjectionConfig:
-    """FastWAM dimensions for the original Zeva two-branch injection path."""
+    """FastWAM adaptation of Zeva's prefix and action-prior injection paths."""
 
     memory_dim: int = 256
     context_dim: int = 4096
@@ -88,6 +88,11 @@ class ExactZevaPolicyInjectionConfig:
     # Opt in explicitly: existing checkpoints retain their original topology.
     pim_variant: str = "legacy"
     pim_prefix_init_std: float = 0.002
+    # Reader identity and prefix topology are separate checkpoint contracts.
+    prefix_layout: str = "legacy_merged"
+    # The existing ICL-WAM CTE encodes completed interactions. It does not
+    # provide Zeva-Ego's prediction of the current state's future effect.
+    effect_source: str = "latest_completed"
 
     def __post_init__(self) -> None:
         values = (
@@ -110,10 +115,14 @@ class ExactZevaPolicyInjectionConfig:
             raise ValueError("pim_variant must be legacy or cross_attempt")
         if self.pim_prefix_init_std <= 0:
             raise ValueError("pim_prefix_init_std must be positive")
+        if self.prefix_layout not in {"legacy_merged", "zeva_ego"}:
+            raise ValueError("prefix_layout must be legacy_merged or zeva_ego")
+        if self.effect_source != "latest_completed":
+            raise ValueError("effect_source must be latest_completed")
 
 
 class FastWAMPolicyInjectionPrior(nn.Module):
-    """Zeva's action prior, adapted only for FastWAM's action dimensions."""
+    """FastWAM action prior using phase and completed BIT effect context."""
 
     def __init__(self, config: ExactZevaPolicyInjectionConfig) -> None:
         super().__init__()
@@ -223,13 +232,41 @@ def gaussian_prior_nll(target: Tensor, mean: Tensor, std: Tensor, valid: Tensor 
     return (nll * valid).sum() / valid.sum().clamp_min(1.0)
 
 
-class ExactZevaPolicyInjectionAdapter(nn.Module):
-    """Separate Zeva behavior-prefix and action-prior injection branches.
+def select_latest_completed_effect(
+    bit_effects: Tensor,
+    bit_mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Select the latest BIT effect without assuming right-aligned valid slots.
 
-    The prefix branch mirrors Zeva's policy-side layout: a task-conditioned
-    base behavior token is written to a reserved slot, and the Causal Prompt
-    contributes a gated residual to that same slot.  The action-prior branch
-    remains independent and is projected into ActionDiT hidden space.
+    BIT positions must be ordered from oldest to newest. Masked entries are
+    cleared before selection so NaN padding cannot enter a learned projection.
+    Empty rows return an exact zero and a false validity flag. This is an
+    observed, completed interaction, not Zeva-Ego's predicted current effect.
+    """
+    if bit_effects.ndim != 3 or bit_mask.shape != bit_effects.shape[:2]:
+        raise ValueError("bit_effects/bit_mask must be [B,L,D]/[B,L]")
+    valid = bit_mask.to(device=bit_effects.device, dtype=torch.bool)
+    has_effect = valid.any(dim=-1)
+    if bit_effects.shape[1] == 0:
+        return bit_effects.new_zeros((bit_effects.shape[0], bit_effects.shape[2])), has_effect
+    clean = torch.where(valid[..., None], bit_effects, torch.zeros_like(bit_effects))
+    positions = torch.arange(valid.shape[1], device=valid.device)[None].expand_as(valid)
+    latest = positions.masked_fill(~valid, -1).max(dim=-1).values.clamp_min(0)
+    selected = clean.gather(
+        1, latest[:, None, None].expand(-1, 1, clean.shape[-1])
+    )[:, 0]
+    selected = torch.where(has_effect[:, None], selected, torch.zeros_like(selected))
+    return selected, has_effect
+
+
+class ExactZevaPolicyInjectionAdapter(nn.Module):
+    """Separate behavior-prefix and action-prior injection branches.
+
+    ``legacy_merged`` preserves ICL-WAM's original combined global/PIM slot.
+    ``zeva_ego`` exposes independent global, completed-effect, and PIM slots,
+    following Zeva-Ego's prefix topology. Its effect source remains the
+    existing ICL-WAM CTE's latest completed BIT, not a predicted future effect.
+    Both layouts project the action-prior mean into ActionDiT hidden space.
     """
 
     is_exact_zeva = True
@@ -248,12 +285,20 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             # Retain the scalar in the state dict for legacy diagnostics, but
             # the new path neither multiplies by it nor trains it.
             self.pim_gate.requires_grad_(False)
+        if cfg.prefix_layout == "zeva_ego":
+            self.behavior_effect_projector = nn.Linear(cfg.effect_dim, cfg.context_dim)
+            # The independent PIM token has no legacy scalar gate, including
+            # the legacy-reader Stage2A configuration used to train its parent.
+            self.pim_gate.requires_grad_(False)
         nn.init.zeros_(self.action_prior_adapter.weight)
         nn.init.zeros_(self.action_prior_adapter.bias)
         nn.init.xavier_uniform_(self.behavior_global_projector.weight)
         nn.init.zeros_(self.behavior_global_projector.bias)
         nn.init.xavier_uniform_(self.prefix_project.weight)
         nn.init.zeros_(self.prefix_project.bias)
+        if cfg.prefix_layout == "zeva_ego":
+            nn.init.xavier_uniform_(self.behavior_effect_projector.weight)
+            nn.init.zeros_(self.behavior_effect_projector.bias)
         if cfg.pim_variant == "cross_attempt":
             self.reset_pim_parameters()
 
@@ -261,12 +306,14 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         yield from self.prior.parameters()
         yield from self.action_prior_adapter.parameters()
         yield from self.behavior_global_projector.parameters()
+        if self.config.prefix_layout == "zeva_ego":
+            yield from self.behavior_effect_projector.parameters()
 
     def pim_adapter_parameters(self):
         yield from self.prefix_project.parameters()
         if self.config.pim_variant == "cross_attempt":
             yield from self.pim_to_global.parameters()
-        else:
+        elif self.config.prefix_layout == "legacy_merged":
             yield self.pim_gate
 
     @torch.no_grad()
@@ -290,8 +337,8 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         """Condition the original global token on completed-attempt memory.
 
         Callers must pass the original task token to both this prior path and
-        ``behavior_prefix_slot``; the latter applies the same conditioning
-        internally. Empty/disabled memory exactly preserves the parent token.
+        the prefix builder; both branches apply the same conditioning once.
+        Empty/disabled memory exactly preserves the parent global token.
         """
         if task_tokens.ndim != 2 or task_tokens.shape[-1] != self.config.global_dim:
             raise ValueError("task_tokens must be [B,global_dim]")
@@ -303,8 +350,11 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             return task_tokens
         parameter = self.pim_to_global.weight
         original = task_tokens.to(device=parameter.device, dtype=parameter.dtype)
-        delta = self.pim_to_global(causal_prompt.to(parameter))
-        valid = pim_mask.to(device=delta.device, dtype=torch.bool).any(dim=-1, keepdim=True)
+        prompt = causal_prompt.to(parameter)
+        valid = pim_mask.to(device=parameter.device, dtype=torch.bool).any(dim=-1, keepdim=True)
+        if self.config.prefix_layout == "zeva_ego":
+            prompt = torch.where(valid, prompt, torch.zeros_like(prompt))
+        delta = self.pim_to_global(prompt)
         return original + torch.where(valid, delta, torch.zeros_like(delta))
 
     def prior_for_prompt(
@@ -349,12 +399,15 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             )
         if pim_mask.ndim != 2 or pim_mask.shape[0] != causal_prompt.shape[0]:
             raise ValueError("pim_mask must be [B,K]")
-        prompt = self.prefix_project(
-            causal_prompt.to(
-                device=self.prefix_project.weight.device,
-                dtype=self.prefix_project.weight.dtype,
-            )
-        )[:, None]
+        prompt_input = causal_prompt.to(self.prefix_project.weight)
+        if self.config.prefix_layout == "zeva_ego":
+            valid_input = pim_mask.to(
+                device=prompt_input.device, dtype=torch.bool
+            ).any(dim=-1, keepdim=True)
+            if not enable_pim:
+                valid_input = torch.zeros_like(valid_input)
+            prompt_input = torch.where(valid_input, prompt_input, torch.zeros_like(prompt_input))
+        prompt = self.prefix_project(prompt_input)[:, None]
         if not enable_pim:
             return torch.zeros_like(prompt)
         has_pim = (
@@ -362,7 +415,7 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             .to(device=prompt.device, dtype=prompt.dtype)
             .unsqueeze(-1)
         )
-        if self.config.pim_variant == "cross_attempt":
+        if self.config.pim_variant == "cross_attempt" or self.config.prefix_layout == "zeva_ego":
             return torch.where(has_pim.bool(), prompt, torch.zeros_like(prompt))
         return torch.tanh(self.pim_gate).to(prompt.dtype) * prompt * has_pim
 
@@ -374,7 +427,11 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         *,
         enable_pim: bool = True,
     ) -> Tensor:
-        """Build the single token written to the reserved behavior slot."""
+        """Build the original ICL-WAM combined slot for legacy checkpoints."""
+        if self.config.prefix_layout != "legacy_merged":
+            raise ValueError(
+                "zeva_ego has independent prefix tokens; use behavior_prefix_tokens"
+            )
         if task_tokens.ndim != 2 or task_tokens.shape[-1] != self.config.global_dim:
             raise ValueError(
                 "task_tokens shape does not match the exact Zeva adapter: "
@@ -401,6 +458,77 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             dtype=base_prefix.dtype,
         )
 
+    def behavior_prefix_tokens(
+        self,
+        task_tokens: Tensor,
+        causal_prompt: Tensor,
+        pim_mask: Tensor,
+        *,
+        bit_effects: Tensor | None = None,
+        bit_mask: Tensor | None = None,
+        enable_pim: bool = True,
+    ) -> tuple[Tensor, Tensor]:
+        """Build prefix embeddings and their attention-key validity mask.
+
+        The Zeva-Ego layout is always ordered ``[global, effect, PIM]``. PIM
+        is a separate token; only ``pim_to_global`` conditions the global
+        token. Empty effect/PIM slots are zeroed and invalid, so callers must
+        also exclude them from attention rather than attending to zero keys.
+        """
+        if self.config.prefix_layout == "legacy_merged":
+            tokens = self.behavior_prefix_slot(
+                task_tokens, causal_prompt, pim_mask, enable_pim=enable_pim,
+            )
+            return tokens, torch.ones(tokens.shape[:2], device=tokens.device, dtype=torch.bool)
+
+        cfg = self.config
+        if task_tokens.ndim != 2 or task_tokens.shape[-1] != cfg.global_dim:
+            raise ValueError("task_tokens must be [B,global_dim]")
+        batch = task_tokens.shape[0]
+        if causal_prompt.shape != (batch, cfg.memory_dim):
+            raise ValueError("causal_prompt must be [B,memory_dim]")
+        if pim_mask.ndim != 2 or pim_mask.shape[0] != batch:
+            raise ValueError("pim_mask must be [B,N]")
+        if bit_effects is None or bit_mask is None:
+            raise ValueError(
+                "zeva_ego prefix requires bit_effects and bit_mask for latest_completed effect"
+            )
+        if bit_effects.shape != (batch, cfg.effect_history_length, cfg.effect_dim):
+            raise ValueError("bit_effects must match [B,effect_history_length,effect_dim]")
+        if bit_mask.shape != bit_effects.shape[:2]:
+            raise ValueError("bit_mask must match bit_effects [B,effect_history_length]")
+
+        parameter = self.prefix_project.weight
+        has_pim = pim_mask.to(device=parameter.device, dtype=torch.bool).any(dim=-1)
+        if not enable_pim:
+            has_pim = torch.zeros_like(has_pim)
+        clean_prompt = causal_prompt.to(parameter)
+        clean_prompt = torch.where(
+            has_pim[:, None], clean_prompt, torch.zeros_like(clean_prompt)
+        )
+        conditioned_task = self.condition_task_tokens(
+            task_tokens, clean_prompt, pim_mask, enable_pim=enable_pim,
+        )
+        global_token = self.behavior_global_projector(
+            conditioned_task.to(self.behavior_global_projector.weight)
+        )
+        completed_effect, has_effect = select_latest_completed_effect(
+            bit_effects.to(self.behavior_effect_projector.weight), bit_mask,
+        )
+        effect_token = self.behavior_effect_projector(completed_effect)
+        effect_token = torch.where(
+            has_effect[:, None], effect_token, torch.zeros_like(effect_token)
+        )
+        pim_token = self.prefix_project(clean_prompt)
+        pim_token = torch.where(has_pim[:, None], pim_token, torch.zeros_like(pim_token))
+        tokens = torch.stack(
+            (global_token, effect_token.to(global_token), pim_token.to(global_token)), dim=1,
+        )
+        valid = torch.stack(
+            (torch.ones_like(has_pim), has_effect.to(has_pim.device), has_pim), dim=1,
+        )
+        return tokens, valid.to(device=tokens.device)
+
     def action_prior_residual(self, prior_mean: Tensor, *, training: bool) -> Tensor:
         residual = self.action_prior_adapter(prior_mean)
         if training and self.config.prior_dropout_rate:
@@ -421,10 +549,9 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
     def add_prefix_to_context(self, context: Tensor, prefix: Tensor) -> Tensor:
         """Backward-compatible legacy helper.
 
-        The exact Zeva path must use :meth:`prepend_behavior_prefix_slot`,
-        which keeps the instruction sequence untouched.  This method remains
-        available for old callers that explicitly request the former residual
-        behavior, but is intentionally no longer used by the exact path.
+        Production injection uses main-stream prefix tokens and leaves the
+        instruction sequence untouched. This former text-residual helper
+        remains available only for legacy callers.
         """
         if context.ndim != 3 or prefix.shape != (context.shape[0], 1, context.shape[-1]):
             raise ValueError("context/prefix shapes do not match")
@@ -445,8 +572,8 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         """Legacy compatibility helper for the former context-token path.
 
         This helper is intentionally NOT used by ``exact_zeva`` anymore.
-        Exact Zeva consumes :meth:`behavior_prefix_slot` as a main MoT prefix
-        token and leaves instruction context unchanged.
+        Production injection consumes :meth:`behavior_prefix_tokens` as main
+        MoT prefix tokens and leaves instruction context unchanged.
         """
         if context.ndim != 3 or context_mask.shape != context.shape[:2]:
             raise ValueError("context/context_mask shapes do not match")
@@ -462,9 +589,8 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             raise ValueError(
                 "Causal Prompt prefix dimension must match the raw FastWAM context dimension"
             )
-        # ``behavior_indexes`` are understanding tokens in Zeva even when the
-        # PIM list is empty.  Empty PIM disables only the residual; the task
-        # base prefix remains a valid behavior condition.
+        # Empty PIM disables only the legacy residual; the task base prefix
+        # remains a valid behavior condition.
         slot_mask = torch.ones(
             (context.shape[0], 1), device=context.device, dtype=torch.bool
         )

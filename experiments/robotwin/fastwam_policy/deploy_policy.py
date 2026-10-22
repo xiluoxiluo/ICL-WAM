@@ -48,6 +48,18 @@ from fastwam.zeva.static_task_context import (
 logger = logging.getLogger(__name__)
 
 
+def _prefix_metadata(model: Any) -> dict[str, Any]:
+    """Record the prefix contract used by the loaded model in rollout logs."""
+    config = getattr(getattr(model, "zeva_behavior_prefix_adapter", None), "config", None)
+    if config is None:
+        return {"prefix_layout": None, "effect_source": None}
+    layout = getattr(config, "prefix_layout", "legacy_merged")
+    return {
+        "prefix_layout": layout,
+        "effect_source": getattr(config, "effect_source", None) if layout == "zeva_ego" else None,
+    }
+
+
 def _is_none_like(value: Any) -> bool:
     if value is None:
         return True
@@ -286,6 +298,7 @@ class WorldActionRobotWinPolicy:
             "cte_sha256": checkpoint_sha256(cte_checkpoint) if cte_checkpoint else None,
             "addon_sha256": checkpoint_sha256(addon_checkpoint) if addon_checkpoint else None,
             "task_context": getattr(self.model, "zeva_task_context_identity", None),
+            **_prefix_metadata(self.model),
         }
         self.cte = None
         self.lifecycle = None
@@ -679,6 +692,11 @@ class WorldActionRobotWinPolicy:
                 "pim_mask": pim_mask,
                 "zeva_action_residual": zeva_action_residual,
                 "zeva_task_tokens": task_tokens,
+                # The separate effect prefix reads the same completed BIT
+                # as the prior. Never use a future effect or phase-cache
+                # query row's zero placeholder as a current prediction.
+                "zeva_bit_effects": memory["bit_effects"],
+                "zeva_bit_mask": memory["bit_mask"],
                 "zeva_mode": self.zeva_mode,
                 "enable_prefix_injection": self.zeva_mode in {"zeva_stage2", "pim_on"},
                 "enable_action_prior": self.zeva_mode in {"zeva_stage2", "pim_on"},
@@ -758,6 +776,10 @@ class WorldActionRobotWinPolicy:
         off_kwargs = dict(infer_kwargs)
         off_kwargs["causal_prompt"] = torch.zeros_like(causal_prompt)
         off_kwargs["pim_mask"] = torch.zeros_like(pim_mask)
+        # Memory-off changes persistent history only. Keep the observed
+        # current-attempt effect context identical in the paired probe.
+        off_kwargs["zeva_bit_effects"] = memory["bit_effects"]
+        off_kwargs["zeva_bit_mask"] = memory["bit_mask"]
         exact = getattr(self.model, "zeva_injection_mode", "memory_residual") == "exact_zeva"
         if exact:
             off_mean, _ = adapter.prior_for_prompt(
@@ -787,8 +809,33 @@ class WorldActionRobotWinPolicy:
             "action_exec_relative_delta": float(delta.norm() / action_off[:, :n_exec].norm().clamp_min(1e-8)),
         }
         if exact:
-            on_prefix = adapter.behavior_prefix_slot(task_tokens, causal_prompt, pim_mask)
-            off_prefix = adapter.behavior_prefix_slot(task_tokens, causal_prompt, pim_mask, enable_pim=False)
+            layout = getattr(getattr(adapter, "config", None), "prefix_layout", "legacy_merged")
+            if layout == "zeva_ego":
+                prefix_kwargs = {
+                    "bit_effects": memory["bit_effects"],
+                    "bit_mask": memory["bit_mask"],
+                }
+                on_prefix, on_valid = adapter.behavior_prefix_tokens(
+                    task_tokens, causal_prompt, pim_mask, **prefix_kwargs,
+                )
+                off_prefix, off_valid = adapter.behavior_prefix_tokens(
+                    task_tokens, causal_prompt, pim_mask, enable_pim=False, **prefix_kwargs,
+                )
+                # Invalid slots have no attention visibility. Mask them in
+                # diagnostics too, including a projector's possible bias.
+                on_prefix = torch.where(on_valid[..., None], on_prefix, torch.zeros_like(on_prefix))
+                off_prefix = torch.where(off_valid[..., None], off_prefix, torch.zeros_like(off_prefix))
+                self._last_pim_diagnostics.update({
+                    "prefix_layout": layout,
+                    "effect_source": adapter.config.effect_source,
+                    "prefix_valid_tokens_on": float(on_valid.float().sum(-1).mean()),
+                    "prefix_valid_tokens_off": float(off_valid.float().sum(-1).mean()),
+                    "effect_token_valid_samples": int(on_valid[:, 1].sum()),
+                    "pim_token_valid_samples": int(on_valid[:, 2].sum()),
+                })
+            else:
+                on_prefix = adapter.behavior_prefix_slot(task_tokens, causal_prompt, pim_mask)
+                off_prefix = adapter.behavior_prefix_slot(task_tokens, causal_prompt, pim_mask, enable_pim=False)
             prefix_delta = on_prefix.float() - off_prefix.float()
             on_mean, _ = adapter.prior_for_prompt(
                 task_tokens, phase, memory["bit_effects"], memory["bit_mask"], causal_prompt, pim_mask,
@@ -810,6 +857,7 @@ class WorldActionRobotWinPolicy:
             "model_seed": self.seed,
             "seed_stream": self._model_seed_stream.snapshot(),
             "checkpoint_identity": self.checkpoint_identity,
+            **_prefix_metadata(self.model),
             "zeva_mode": self.zeva_mode,
             "cross_memory_enabled": self.cross_memory_enabled,
             "action_horizon": self.action_horizon,
@@ -1018,6 +1066,12 @@ def get_model(usr_args: Dict[str, Any]):
     ):
         if not _is_none_like(usr_args.get(key)):
             cfg.model.zeva.task_context[config_key] = usr_args[key]
+    # Direct RoboTwin plugin calls can explicitly select the old topology
+    # when reusing a merged-prefix checkpoint. Resolved Hydra evaluation
+    # configs already carry these fields and need no reconstruction.
+    for key in ("prefix_layout", "effect_source"):
+        if not _is_none_like(usr_args.get(key)):
+            cfg.model.zeva.adapter[key] = str(usr_args[key])
 
     checkpoint_path = usr_args.get("ckpt_setting")
     if _is_none_like(checkpoint_path):

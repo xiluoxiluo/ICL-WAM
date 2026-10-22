@@ -1,7 +1,8 @@
 # @package _global_
 
-# Opt-in Zeva-Ego-inspired Stage2B. Existing legacy task configs/checkpoints
-# retain their original gated top-k behavior.
+# Zeva-Ego-inspired Stage2B with independent global/effect/PIM prefix tokens.
+# Reproduce the previous cross_attempt_v1 single-slot topology with the
+# explicit override model.zeva.adapter.prefix_layout=legacy_merged.
 defaults:
   - robotwin_zeva_fastwam_stage2_3cam_384
   - _self_
@@ -18,7 +19,7 @@ model:
   zeva:
     pim_variant: cross_attempt
     training_stage: pim_adapter
-    policy_checkpoint: null  # REQUIRED: validated legacy Stage2A addon.
+    policy_checkpoint: null  # REQUIRED: trained zeva_ego-layout Stage2A addon.
     freeze_fastwam: true
     freeze_cte_stage2: true
     prompt:
@@ -31,6 +32,8 @@ model:
       pim_support_dropout: 0.0
     adapter:
       pim_variant: cross_attempt
+      prefix_layout: zeva_ego
+      effect_source: latest_completed
       prior_loss_weight: 0.01
     memory:
       pim_retrieval_mode: cross_attempt
