@@ -52,10 +52,23 @@ class CacheManifest:
     feature_dtype: str = "float32"
     action_video_freq_ratio: int = 4
     action_normalization: str = "fastwam_processor_output"
+    # Legacy files remain readable, but selecting main_observed requires the
+    # explicit success-only/observed-effect lineage in every derived artifact.
+    profile: str | None = None
+    artifact_lineage: str | None = None
+    memory_semantics: str | None = None
+    success_data_identity: dict[str, object] = field(default_factory=dict)
+    episode_splits: dict[str, object] = field(default_factory=dict)
+    data_role: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "camera_keys", tuple(self.camera_keys))
         object.__setattr__(self, "vae_metadata", dict(self.vae_metadata))
+        object.__setattr__(self, "success_data_identity", dict(self.success_data_identity))
+        object.__setattr__(self, "episode_splits", dict(self.episode_splits))
+        if self.profile == "main_observed":
+            from .main_data import validate_main_artifact
+            validate_main_artifact(self.to_dict())
         if self.cte_vae_input_size is not None:
             size = tuple(int(value) for value in self.cte_vae_input_size)
             if len(size) != 2 or min(size) < 1:

@@ -1,10 +1,20 @@
 # ICLWAM：把 Zeva 因果记忆接到 FastWAM
 
-## 当前推荐：预测 CTE、语言检索与可切换的 foundation 训练
+## 当前默认：Zeva-main 观察式经验，推理时只更新记忆
 
-本项目按 [Zeva `feature/zeva_ego` 的 README 与实际训练/评测代码](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101) 实现CTE、EAP和PIM并接到FastWAM。**新默认遵循“除必要WAM适配，其余按Zeva-Ego设计对齐”**；底座、video/action接口、joint动作/时间尺度与语言输入空间保持明确边界。逐项修复与证据见 [对齐审计](docs/zeva_ego_alignment_audit.md)；可执行命令见 [训练与RoboTwin评测指南](docs/zeva_ego_training_evaluation.md)。公开数据清单或分类器训练配方缺失的部分明确标注，不声称已经逐条复现参考实验。
+主线现在参考 [原 Zeva main `17ca9fa0c68dca1fc7915dd6433de70a100e93a1`](https://github.com/air-embodied-brain/Zeva/tree/17ca9fa0c68dca1fc7915dd6433de70a100e93a1)，使用 `main_observed` / `zeva_main_v1` 合同：成功示范离线训练，真实完成交互的 `effect_post` 在线写入 BIT/PIM；推理时 foundation、CTE 和 addon 全部冻结，不进行反向更新。MCE 采用 main 的 gated PIM/global 合并与 BIT action prior，再适配 FastWAM 的 video/action 路径。零 PIM gate 对应已经训练的 Stage2A parent，不是未加 EAP 的原始 FastWAM。
 
-**离线训练推荐从 [`scripts/train/`](scripts/train/README.md) 开始。** `01`–`11` 覆盖环境检查、文本预计算、CTE、所有新缓存/语言检索组件及 Stage2A/B；`12_run_all.sh` 支持完整流程、`--from/--to` 和 `--dry-run`。默认复用旧脚本中的真实数据/权重路径，集中在 `_env.sh`，使用单进程CTE与16卡Stage2，并提供独立 `STAGE2A_FOUNDATION_MODE` / `STAGE2B_FOUNDATION_MODE` 开关和完整state续训入口。严格CTE所需的有序 task subset 与真实 episode conditions 仍需提供。
+**完整离线入口在 [`scripts/train/README.md`](scripts/train/README.md)。** `01`–`11` 按环境、文本、VAE latents、CTE、phase/effect、bank/readout、静态检索、static context、PIM cache、Stage2A/B 排序；`12_run_all.sh --dry-run` 只打印命令。默认复用旧脚本中的数据和 checkpoint 路径，新产物位于 `runs/zeva_main_observed_v1`。必须提供有真实采集来源的 success manifest，脚本不会自动将未知数据声明为成功。CTE 的 step-based 优化配方、10% episode holdout 和本地缓存构造属于工程选择；原 main 没有公开完整 CTE 训练 recipe，不能声称逐项复现作者数据与优化参数。
+
+A/B 默认 `foundation_mode=frozen`，分别使用 5000/500 steps、有效 batch 128/64；16 GPU 对应 batch1 × 累积8/4。各阶段可显式切换 joint 作为 WAM 实验；无论训练选择哪种，部署都不更新参数。RoboTwin 使用 [`scripts/eval_zeva_main_robotwin.py`](scripts/eval_zeva_main_robotwin.py)：独立单次 `SR@1`、成功即停的累计 `CSR@k`、固定 K 次的首成后稳定率分开报告。同权重 memory on/off 是恢复实验的基础；success replay 默认关闭，仅 fixed-attempt 稳定性实验显式启用，首次成功前不可用。
+
+原 main benchmark 环境是 RoboCasa；本仓库是 FastWAM/RoboTwin 适配，不继承原论文或 Ego 的成功率数值。当前验证为 CPU、合同、mock rollout 和命令测试，没有据此宣称训练完成、真实 RoboTwin 成功率提升或单卡 32 GB 已实测可用。
+
+## 可选 Zeva-Ego 路线：以下保留该路线的历史说明
+
+可选 Ego 路线按 [Zeva `feature/zeva_ego` 的 README 与实际训练/评测代码](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101) 实现CTE、EAP和PIM并接到FastWAM。下面的“新版本”等表述仅描述该历史分支，不再指当前 main 默认。底座、video/action接口、joint动作/时间尺度与语言输入空间保持明确边界。逐项修复与证据见 [对齐审计](docs/zeva_ego_alignment_audit.md)；可执行命令见 [Ego训练与RoboTwin评测指南](docs/zeva_ego_training_evaluation.md)。两条路线不能混用checkpoint/cache。
+
+**这条可选路线的编号入口已移至 [`scripts/train_ego/`](scripts/train_ego/README.md)。** `01`–`11` 覆盖 Ego 文本、CTE、预测缓存/语言检索组件及 Stage2A/B；`12_run_all.sh` 支持范围和 dry-run。旧 `_env.sh`、严格 task subset / episode conditions 要求及配置均保留，不能拿来替代主线 success manifest。
 
 主要变化：
 

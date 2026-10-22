@@ -1,0 +1,40 @@
+# @package _global_
+defaults:
+  - robotwin_zeva_main_cte_3cam_384
+  - _self_
+
+# Original-main default: frozen foundation and CTE; train global prefix and
+# completed-BIT action prior. Joint is an explicitly recorded FastWAM ablation.
+foundation_mode: frozen
+foundation_mode_settings:
+  frozen:
+    training_recipe: main_frozen_parent
+    freeze_fastwam: true
+  joint:
+    training_recipe: main_joint_parent
+    freeze_fastwam: false
+batch_size: 1
+gradient_accumulation_steps: 8  # 16 GPUs -> 128, launchers validate the actual world size
+learning_rate: 2.0e-4
+zeva_foundation_learning_rate: 5.0e-6
+weight_decay: 0.0
+max_grad_norm: 1.0
+max_steps: 5000
+num_epochs: 1
+lr_scheduler_type: cosine
+mixed_precision: bf16
+zeva_optimizer_sharding: none
+log_every: 10
+save_every: 500
+eval_every: 250
+eval_num_samples: 16
+data:
+  train:
+    use_text_embed_cache: true
+model:
+  mot_checkpoint_mixed_attn: true
+  zeva:
+    training_stage: policy_injection
+    foundation_mode: ${foundation_mode}
+    training_recipe: ${foundation_mode_settings.${foundation_mode}.training_recipe}
+    freeze_fastwam: ${foundation_mode_settings.${foundation_mode}.freeze_fastwam}

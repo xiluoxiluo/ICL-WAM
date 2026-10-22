@@ -13,6 +13,7 @@ from fastwam.zeva.static_task_context import (
     StaticTaskContextRetrievalHead, load_readout_cache, validate_behavior_bank,
 )
 from fastwam.zeva.task_context_training import train_retrieval_head
+from fastwam.zeva.main_data import inherit_main_artifact, is_main_profile, validate_main_source
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
@@ -22,6 +23,8 @@ def main(cfg: DictConfig):
         if tc.get(name) in (None, "", "None", "null"):
             raise ValueError(f"Set model.zeva.task_context.{name}")
     bank = TaskContextBank.load(str(tc.bank_path))
+    if is_main_profile(cfg):
+        validate_main_source(cfg, bank.metadata)
     if Path(str(tc.retrieval_checkpoint)).resolve() in {
         Path(str(tc.bank_path)).resolve(), Path(str(tc.readout_cache_path)).resolve(),
     }:
@@ -41,10 +44,15 @@ def main(cfg: DictConfig):
     tasks = {task: index for index, task in enumerate(sorted({str(entry["task_id"]) for entry in entries}))}
     labels = torch.tensor([tasks[str(entry["task_id"])] for entry in entries])
     keys = torch.stack([entry["retrieval_key"] for entry in entries])
-    metrics = train_retrieval_head(head, readouts, keys, labels, seed=seed, **dict(tc.training))
+    validation_kwargs = {}
+    if is_main_profile(cfg):
+        validation_kwargs = {"validation_readouts": cache["validation_readouts"],
+            "validation_semantic_ids": torch.tensor([tasks[value] for value in cache["validation_task_ids"]])}
+    metrics = train_retrieval_head(head, readouts, keys, labels, seed=seed, **validation_kwargs, **dict(tc.training))
     path = Path(str(tc.retrieval_checkpoint))
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
+        **inherit_main_artifact(bank.metadata),
         "format": HEAD_FORMAT, "readout_kind": READOUT_KIND,
         "bank_sha256": checkpoint_sha256(str(tc.bank_path)),
         "readout_cache_sha256": checkpoint_sha256(str(tc.readout_cache_path)),
@@ -52,7 +60,9 @@ def main(cfg: DictConfig):
         "step": metrics["step"], "training": dict(tc.training), "seed": seed,
         "metrics": metrics["history"],
         "train_episode_ids": [cache["episode_ids"][i] for i in metrics["train_indices"]],
-        "validation_episode_ids": [cache["episode_ids"][i] for i in metrics["validation_indices"]],
+        "validation_episode_ids": [cache["validation_episode_ids" if metrics["external_validation"] else "episode_ids"][i]
+                                   for i in metrics["validation_indices"]],
+        "validation_scope": "fixed_success_episode_holdout" if metrics["external_validation"] else "retrieval_internal_holdout",
     }, path)
     print(f"Saved trained static task-context retrieval head to {path}")
 

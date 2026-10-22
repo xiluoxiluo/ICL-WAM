@@ -12,11 +12,14 @@ from fastwam.runtime import _mixed_precision_to_model_dtype
 from fastwam.zeva import CausalTransitionEncoder, CausalTransitionEncoderConfig, FastWAMCTELatentEncoder, validate_vae_metadata
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.static_task_context import READOUT_FORMAT, READOUT_KIND
-from fastwam.zeva.task_context_data import build_behavior_bank
+from fastwam.zeva.task_context_data import build_behavior_bank, split_main_behavior_artifacts
+from fastwam.zeva.stage1_sampling import build_cte_training_index
+from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig):
+    normalize_main_dataset_paths(cfg)
     if not torch.cuda.is_available():
         raise RuntimeError("Real FastWAM readout extraction requires CUDA; CPU tests use small fixtures")
     if not bool(cfg.data.train.get("is_training_set", False)):
@@ -74,21 +77,36 @@ def main(cfg: DictConfig):
         ).encode_history
     elif input_type != "rgb_frame" or cte.cfg.image_channels != 3:
         raise ValueError("unsupported CTE input representation")
+    dataset = ZevaRobotWinDataset(instantiate(cfg.data.train))
+    indices, main_metadata = select_main_success_rows(build_cte_training_index(dataset), cfg)
+    if main_metadata:
+        validate_main_artifact(payload, main_metadata)
     bank, readouts = build_behavior_bank(
-        ZevaRobotWinDataset(instantiate(cfg.data.train)), cte, policy,
+        dataset, cte, policy,
         frame_encoder=frame_encoder, temperature=float(tc.temperature),
+        allowed_episode_ids={row.episode_id for row in indices} if main_metadata else None,
         metadata={
+            **main_metadata,
             "base_checkpoint_sha256": checkpoint_sha256(str(cfg.ckpt)),
             "cte_checkpoint_sha256": checkpoint_sha256(cte_path),
             "dataset_stats_sha256": checkpoint_sha256(str(cfg.data.train.pretrained_norm_stats)),
+            "semantic_task_map_sha256": checkpoint_sha256(str(cfg.data.train.semantic_task_map_path)),
+            "history_semantics": "full_episode_prefix",
+            "semantic_task_count": len({str(row.task_id) for row in indices}),
+            "num_episodes": len({str(row.episode_id) for row in indices}),
             "video_size": video_size, "context_len": int(cfg.model.tokenizer_max_len),
             "dataset_dirs": list(cfg.data.train.dataset_dirs),
         },
     )
+    bank, readouts, validation_readouts = split_main_behavior_artifacts(bank, readouts)
+    if main_metadata:
+        main_metadata = {**main_metadata, "data_role": "train"}
     for path in (tc.bank_path, tc.readout_cache_path):
         Path(str(path)).parent.mkdir(parents=True, exist_ok=True)
     bank.save(str(tc.bank_path))
     torch.save({
+        **main_metadata,
+        **validation_readouts,
         "format": READOUT_FORMAT, "readout_kind": READOUT_KIND,
         "bank_sha256": checkpoint_sha256(str(tc.bank_path)),
         "episode_ids": [entry["episode_id"] for entry in bank.entries],

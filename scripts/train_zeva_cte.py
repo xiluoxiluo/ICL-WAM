@@ -30,6 +30,8 @@ from fastwam.zeva import (
 )
 from fastwam.zeva.checkpoint import load_cte_checkpoint, save_cte_checkpoint
 from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset
+from fastwam.zeva.cte_training import MainCTEEpisodeDataset, pad_cte_trajectories
+from fastwam.zeva.main_data import is_main_profile, main_split_rows, normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.semantic_tasks import parse_episode_index_from_id
 from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_vae
@@ -157,6 +159,7 @@ def _validate_semantic_index(rows: list[CTETrainIndex], cfg: DictConfig) -> dict
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    normalize_main_dataset_paths(cfg)
     rank, local_rank, world_size, is_main_process = _distributed_context()
     metrics_file = None
     try:
@@ -314,6 +317,22 @@ def main(cfg: DictConfig) -> None:
             assert base is not None
             training_index = _semantic_remap_training_index(raw_training_index, base)
 
+        training_index, main_metadata = select_main_success_rows(training_index, cfg)
+        validation_dataset = None
+        validation_index = []
+        if is_main_profile(cfg):
+            if use_latent_cache:
+                validate_main_artifact(dataset.manifest, main_metadata)
+            validation_dataset = MainCTEEpisodeDataset(
+                dataset, main_split_rows(training_index, main_metadata, "validation"), preencoded=use_latent_cache,
+            )
+            validation_index = validation_dataset.training_index
+            dataset = MainCTEEpisodeDataset(
+                dataset, main_split_rows(training_index, main_metadata, "train"), preencoded=use_latent_cache,
+            )
+            training_index = dataset.training_index
+            main_metadata = {**main_metadata, "data_role": "train"}
+
         semantic_stats = _validate_semantic_index(training_index, cfg)
         semantic_tasks = tuple(sorted({str(row.task_id) for row in training_index}))
         semantic_lookup = {task: index for index, task in enumerate(semantic_tasks)}
@@ -365,6 +384,9 @@ def main(cfg: DictConfig) -> None:
         if is_main_process:
             OmegaConf.save(config=cfg, f=str(output_dir / "config.yaml"), resolve=True)
             dataset_manifest = {
+                **main_metadata,
+                "cte_training_history": "complete_episode_prefix" if main_metadata else "window_local",
+                "local_training_recipe": "task_balanced_adamw_cosine_steps_v1",
                 "dataset_dirs": [str(v) for v in cfg.data.train.dataset_dirs],
                 "dataset_stats": stats_value,
                 "dataset_stats_sha256": sha256_file(stats_value),
@@ -410,6 +432,8 @@ def main(cfg: DictConfig) -> None:
                 scheduler=scheduler,
                 map_location=str(device),
             )
+            if main_metadata:
+                validate_main_artifact(resume_payload, main_metadata)
             old_identity = resume_payload.get("semantic_task_identity") or {}
             if old_identity.get("sha256") != semantic_identity.get("sha256"):
                 raise ValueError(
@@ -438,13 +462,13 @@ def main(cfg: DictConfig) -> None:
 
             for sample in batch:
                 frames = sample.get("cte_frames")
-                preencoded = frames is not None
+                preencoded = bool(sample.get("cte_frames_preencoded", frames is not None))
                 if frames is None:
                     frames = torch.cat(
                         (sample["before_frames"], sample["after_frames"][-1:]), dim=0
                     )
-                elif frames.ndim != 4 or frames.shape[0] != 9:
-                    raise ValueError("sample['cte_frames'] must be [9,C,H,W]")
+                elif frames.ndim != 4 or (not main_metadata and frames.shape[0] != 9):
+                    raise ValueError("sample['cte_frames'] must be [T,C,H,W] with the configured history")
 
                 frames_list.append(frames)
                 preencoded_flags.append(preencoded)
@@ -461,7 +485,9 @@ def main(cfg: DictConfig) -> None:
                 batch_episode_ids.append(str(episode.episode_id))
                 batch_window_starts.append(int(episode.episode_step))
 
-            frames = torch.stack(frames_list, dim=0)
+            frames, actions, valid, transition_valid = pad_cte_trajectories(
+                frames_list, actions_list, valid_list, transition_valid_list,
+            )
             if any(preencoded_flags) and not all(preencoded_flags):
                 raise ValueError("CTE batch cannot mix RGB and pre-encoded latent frames")
             if frame_encoder is not None and not all(preencoded_flags):
@@ -479,18 +505,15 @@ def main(cfg: DictConfig) -> None:
             else:
                 frames = frames.to(device, non_blocking=True)
 
-            actions = torch.stack(actions_list, dim=0).to(
+            actions = actions.to(
                 device,
                 non_blocking=True,
             )
-            valid = torch.stack(valid_list, dim=0).to(
+            valid = valid.to(
                 device,
                 non_blocking=True,
             )
-            transition_valid = torch.stack(
-                transition_valid_list,
-                dim=0,
-            ).to(
+            transition_valid = transition_valid.to(
                 device,
                 non_blocking=True,
             )
@@ -646,9 +669,52 @@ def main(cfg: DictConfig) -> None:
             metrics_file = None
         _barrier(world_size)
 
+        validation_metrics = None
+        if validation_dataset is not None:
+            # Frozen held-out diagnostics: no optimizer/EMA updates and no
+            # held-out episode can become an action imitation target.
+            model.eval()
+            local_validation = validation_index[rank::world_size]
+            totals = torch.zeros(7, dtype=torch.float64, device=device)
+            with torch.inference_mode():
+                for row in local_validation:
+                    sample = validation_dataset[int(row.dataset_index)]
+                    observations = sample["cte_frames"].unsqueeze(0)
+                    if frame_encoder is not None and not sample["cte_frames_preencoded"]:
+                        observations = frame_encoder(observations)
+                    observations = observations.to(device=device, dtype=torch.float32)
+                    controls = sample["transition_actions"].unsqueeze(0).to(device)
+                    valid = sample["frame_valid"].unsqueeze(0).to(device)
+                    completed = sample["transition_valid"].unsqueeze(0).to(device)
+                    output = model(observations, controls, valid, completed)
+                    losses = causal_transition_encoder_loss(output, controls, valid,
+                        torch.tensor([semantic_lookup[str(row.task_id)]], device=device), CTELossConfig())
+                    values = [losses[key].detach().double() for key in
+                              ("total", "action", "vision", "loss_phase", "loss_effect", "effect_contrastive")]
+                    if not all(bool(torch.isfinite(value)) for value in values):
+                        raise FloatingPointError("non-finite held-out main CTE loss")
+                    totals[:6] += torch.stack(values)
+                    totals[6] += 1
+            if world_size > 1:
+                dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+            if int(totals[6]) != len(validation_index):
+                raise RuntimeError("held-out CTE diagnostics missed validation episodes")
+            validation_metrics = {key: float(value) for key, value in zip(
+                ("loss", "action", "vision", "phase", "effect", "effect_contrastive"),
+                (totals[:6] / totals[6]).cpu().tolist(), strict=True)}
+            validation_metrics.update({"num_episodes": len(validation_index), "step": step,
+                "split": "fixed_success_episode_holdout", "aggregation": "mean_per_episode",
+                "task_contrastive_note": "single-episode validation has no cross-episode positive; task term is excluded"})
+            if is_main_process:
+                (output_dir / "validation_metrics.json").write_text(json.dumps(validation_metrics, indent=2, sort_keys=True) + "\n")
+                print(f"Held-out main CTE diagnostics: {validation_metrics}")
+
         if is_main_process:
             checkpoint_config = _cfg_dict(zeva)
             checkpoint_config["semantic_task_identity"] = semantic_identity
+            checkpoint_config.update(main_metadata)
+            checkpoint_config["cte_training_history"] = "complete_episode_prefix" if main_metadata else "window_local"
+            checkpoint_config["local_training_recipe"] = "task_balanced_adamw_cosine_steps_v1"
             save_cte_checkpoint(
                 output_dir / "cte.pt",
                 model,
@@ -664,6 +730,8 @@ def main(cfg: DictConfig) -> None:
             payload = torch.load(output_dir / "cte.pt", map_location="cpu", weights_only=False)
             payload["semantic_task_identity"] = semantic_identity
             payload["semantic_task_stats"] = semantic_stats
+            if validation_metrics is not None:
+                payload["validation_metrics"] = validation_metrics
             torch.save(payload, output_dir / "cte.pt")
             print(f"saved Stage 1 checkpoint: {output_dir / 'cte.pt'}")
 

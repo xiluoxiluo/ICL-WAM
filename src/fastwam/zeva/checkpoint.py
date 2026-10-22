@@ -15,7 +15,7 @@ FOUNDATION_CONTRACT_SCHEMA = "iclwam_foundation_contract_v1"
 
 def checkpoint_foundation_mode(payload: dict) -> str:
     """Read the explicit mode, retaining recipe-based legacy compatibility."""
-    inferred = "joint" if payload.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup"} else "frozen"
+    inferred = "joint" if payload.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup", "main_joint_parent", "main_joint_pim"} else "frozen"
     mode = payload.get("foundation_mode", inferred)
     if mode not in {"frozen", "joint"}:
         raise ValueError("checkpoint foundation_mode must be 'frozen' or 'joint'")
@@ -44,7 +44,8 @@ def checkpoint_requires_foundation(payload: dict) -> bool:
             "foundation_parent_identity", "pim_memory_contract",
         ))
         or payload.get("training_recipe") == "ego_joint_parent"
-        or (memory is not None and (memory["compression"], memory["uniform_indexing"])
+        or payload.get("profile") == "main_observed"
+        or (memory is not None and (memory.get("compression"), memory.get("uniform_indexing"))
             != ("uniform", "legacy_floor"))
     )
     if new_contract:
@@ -55,6 +56,14 @@ def checkpoint_requires_foundation(payload: dict) -> bool:
         if missing:
             raise ValueError(f"incomplete foundation contract: missing {sorted(missing)}")
     mode = checkpoint_foundation_mode(payload)
+    if payload.get("profile") == "main_observed":
+        from fastwam.zeva_main_contract import MAIN_RECIPES
+        recipe = payload.get("training_recipe")
+        if recipe not in MAIN_RECIPES:
+            raise ValueError("main checkpoint requires an explicit main training recipe")
+        expected_stage = "policy_injection" if recipe.endswith("parent") else "pim_adapter"
+        if payload.get("training_stage") != expected_stage:
+            raise ValueError("main checkpoint training stage and recipe disagree")
     required = payload.get("foundation_checkpoint_required", mode == "joint")
     if type(required) is not bool:
         raise ValueError("foundation_checkpoint_required must be boolean")
@@ -69,12 +78,17 @@ def checkpoint_requires_foundation(payload: dict) -> bool:
     stage, recipe = payload.get("training_stage"), payload.get("training_recipe")
     valid = ((stage == "policy_injection" and recipe == "ego_joint_parent")
              or (stage == "pim_adapter" and recipe in {"ego_joint_warmup", "ego_adapter_warmup"}))
-    if payload.get("addon_schema") != "zeva_ego_prediction_v1" or not valid:
+    main = payload.get("profile") == "main_observed"
+    if main:
+        valid = ((stage == "policy_injection" and recipe == "main_joint_parent")
+                 or (stage == "pim_adapter" and recipe in {"main_joint_pim", "main_frozen_pim"}))
+    expected_schema = "zeva_main_observed_policy_v1" if main else "zeva_ego_prediction_v1"
+    if payload.get("addon_schema") != expected_schema or not valid:
         raise ValueError("foundation bundle requires a predictive joint Stage2A/Stage2B or inherited frozen Stage2B")
     if mode == "frozen":
         parent = payload.get("foundation_parent_identity")
         if (not isinstance(parent, dict) or parent.get("training_stage") != "policy_injection"
-                or parent.get("training_recipe") != "ego_joint_parent"):
+                or parent.get("training_recipe") != ("main_joint_parent" if main else "ego_joint_parent")):
             raise ValueError("frozen foundation bundle requires its joint Stage2A parent identity")
         for name in ("addon_sha256", "foundation_sha256"):
             digest = parent.get(name)
@@ -190,11 +204,16 @@ def save_cte_checkpoint(
         payload["latent_channels"] = int(model.cfg.image_channels)
         payload["vae_metadata"] = dict(vae_metadata or {})
         payload["cte_vae_input_size"] = list(cte_vae_input_size)
+    from .main_data import inherit_main_artifact
+    payload.update(inherit_main_artifact(config or {}))
     torch.save(payload, path)
 
 
 def load_cte_checkpoint(path: str | Path, model, optimizer=None, scheduler=None, map_location: str = "cpu") -> dict:
     payload = torch.load(path, map_location=map_location, weights_only=False)
+    from .main_data import MAIN_PROFILE, validate_main_artifact
+    if payload.get("profile") == MAIN_PROFILE:
+        validate_main_artifact(payload)
     model.load_state_dict(payload["model"], strict=True)
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])
@@ -224,16 +243,20 @@ def addon_layout_metadata(behavior_prefix_adapter) -> dict[str, str | None]:
         if effect_source not in {"latest_completed", "current_prediction"}:
             raise ValueError("unsupported zeva_ego effect_source")
     predictive = effect_source == "current_prediction"
+    main = getattr(config, "numerical_contract", None) == "zeva_main_v1"
     if predictive != (prior_variant == "zeva_ego"):
         raise ValueError("predictive CTE and zeva_ego action prior must be used together")
     return {
         "pim_variant": variant,
         "prefix_layout": layout,
         "effect_source": effect_source,
+        **({"profile": "main_observed", "effect_source": "latest_completed",
+            "prior_variant": "legacy_bit", "memory_semantics": "completed_effect_trace",
+            "numerical_contract": "zeva_main_v1"} if main else {}),
         **({"prior_variant": prior_variant, "memory_semantics": "predicted_effect_trace",
             "numerical_contract": getattr(config, "numerical_contract", "legacy_v1")} if predictive else {}),
         "addon_schema": (
-            "zeva_ego_prediction_v1" if predictive
+            "zeva_main_observed_policy_v1" if main else "zeva_ego_prediction_v1" if predictive
             else "zeva_ego_prefix_v1" if layout == "zeva_ego"
             else "cross_attempt_v1" if variant == "cross_attempt"
             else "legacy"
@@ -311,13 +334,14 @@ def load_addon_checkpoint(
     pim_memory_contract: dict | None = None,
     allow_pim_compression_override: bool = False,
     loaded_foundation_identity: dict | None = None,
+    main_artifact_metadata: dict | None = None,
 ) -> dict:
     payload = torch.load(path, map_location=map_location, weights_only=False)
     foundation_path = resolve_joint_foundation_checkpoint(path, payload)
     if foundation_path is None and loaded_foundation_identity is not None:
         raise ValueError("load the original FastWAM base before loading an addon that does not require trained foundation weights")
     if load_scope == "all" and target_training_recipe is not None:
-        target_joint = target_training_recipe in {"ego_joint_parent", "ego_joint_warmup"}
+        target_joint = target_training_recipe in {"ego_joint_parent", "ego_joint_warmup", "main_joint_parent", "main_joint_pim"}
         checkpoint_joint = checkpoint_foundation_mode(payload) == "joint"
         if target_joint != checkpoint_joint:
             raise ValueError("joint/frozen foundation recipe mismatch; use the matching complete checkpoint bundle")
@@ -336,6 +360,16 @@ def load_addon_checkpoint(
         if expected is not None and payload.get(name) != expected:
             raise ValueError(f"addon checkpoint {name} mismatch")
     expected_layout = addon_layout_metadata(behavior_prefix_adapter)
+    if expected_layout.get("profile") == "main_observed":
+        from .main_data import validate_main_artifact
+        if main_artifact_metadata is None:
+            raise ValueError("main addon loading requires the target CTE success-data and episode-split metadata")
+        validate_main_artifact(payload, expected=main_artifact_metadata)
+        for name, expected in expected_layout.items():
+            if payload.get(name) != expected:
+                raise ValueError(f"main_observed addon contract mismatch: {name}; train the observed-effect main recipe")
+    elif payload.get("profile") == "main_observed":
+        raise ValueError("main_observed addon cannot be loaded into a different policy profile")
     from fastwam.zeva_numerical_contract import validate_checkpoint_numerical_contract
     expected_numerics = expected_layout.get("numerical_contract", "legacy_v1")
     if getattr(getattr(causal_prompt_encoder, "config", None), "numerical_contract", "legacy_v1") != expected_numerics:

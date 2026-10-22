@@ -132,8 +132,12 @@ class ExactZevaPolicyInjectionConfig:
             raise ValueError("adapter initialization must be legacy_xavier or zeva_ego")
         if self.initialization == "zeva_ego" and self.prior_variant != "zeva_ego":
             raise ValueError("zeva_ego initialization requires the predictive Zeva-Ego prior")
-        if self.numerical_contract not in {"legacy_v1", "zeva_ego_v1"}:
-            raise ValueError("numerical_contract must be legacy_v1 or zeva_ego_v1")
+        if self.numerical_contract not in {"legacy_v1", "zeva_ego_v1", "zeva_main_v1"}:
+            raise ValueError("unsupported numerical_contract")
+        if self.numerical_contract == "zeva_main_v1" and (
+                self.prefix_layout != "legacy_merged" or self.prior_variant != "legacy_bit"
+                or self.effect_source != "latest_completed" or self.pim_variant != "legacy"):
+            raise ValueError("zeva_main_v1 requires the original gated prefix and completed-BIT prior")
         if self.numerical_contract == "zeva_ego_v1" and self.prior_variant != "zeva_ego":
             raise ValueError("zeva_ego_v1 numerical_contract requires the predictive Zeva-Ego prior")
         if self.effect_source == "current_prediction":
@@ -198,6 +202,11 @@ class FastWAMPolicyInjectionPrior(nn.Module):
             elif isinstance(module, nn.LayerNorm) and module.elementwise_affine:
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
+        # The original main init_weights explicitly resets both MHA modules
+        # after initializing Linear/LayerNorm; preserve that order for main.
+        if self.config.numerical_contract == "zeva_main_v1":
+            self.progress_attention._reset_parameters()
+            self.effect_attention._reset_parameters()
         nn.init.normal_(self.anchor_position, std=0.02)
         nn.init.normal_(self.effect_position, std=0.02)
         nn.init.normal_(self.bos_effect, std=0.02)
@@ -632,7 +641,7 @@ class ExactZevaPolicyInjectionAdapter(ReferenceFloat32Module):
 
     @reference_inference_precision
     def action_prior_residual(self, prior_mean: Tensor, *, training: bool) -> Tensor:
-        if self.config.numerical_contract == "zeva_ego_v1":
+        if self.config.numerical_contract in {"zeva_ego_v1", "zeva_main_v1"}:
             prior_mean = prior_mean.to(self.action_prior_adapter.weight)
         residual = self.action_prior_adapter(prior_mean)
         if training and self.config.prior_dropout_rate:

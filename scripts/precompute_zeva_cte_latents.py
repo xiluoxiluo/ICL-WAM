@@ -53,6 +53,7 @@ from fastwam.zeva.cte_latent_cache import (
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.semantic_tasks import parse_episode_index_from_id
 from fastwam.zeva.stage1_sampling import CTETrainIndex, build_cte_training_index
+from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
 from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_vae
 
 
@@ -317,6 +318,7 @@ def _flush_arrays(arrays: dict[str, np.ndarray]) -> None:
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    normalize_main_dataset_paths(cfg)
     rank, local_rank, world_size, is_main = _distributed_context()
     device = torch.device("cuda", local_rank)
 
@@ -383,8 +385,22 @@ def main(cfg: DictConfig) -> None:
             source_window_actions=32,
             sample_stride=sample_stride,
         )
+        all_rows, main_metadata = select_main_success_rows(all_rows, cfg)
         if not all_rows:
             raise RuntimeError("no Stage-1 CTE windows found")
+
+        # A resumed cache must refer to the same successful demonstrations;
+        # equal window counts alone cannot establish that identity.
+        provenance_path = cache_root / "success_data_contract.json"
+        if main_metadata:
+            if is_main:
+                if provenance_path.exists():
+                    validate_main_artifact(json.loads(provenance_path.read_text()), main_metadata)
+                elif any(cache_root.glob("rank_*/progress.json")):
+                    raise ValueError("cannot resume a legacy latent cache as main_observed; rebuild in a new path")
+                else:
+                    _atomic_json(provenance_path, main_metadata)
+            _barrier(world_size)
 
         # Keep all windows from one episode on one GPU.  This is deterministic
         # and prevents duplicate window generation across ranks.
@@ -399,6 +415,8 @@ def main(cfg: DictConfig) -> None:
 
         if (rank_dir / "DONE").is_file() and (rank_dir / "rank_meta.json").is_file():
             rank_meta = json.loads((rank_dir / "rank_meta.json").read_text(encoding="utf-8"))
+            if main_metadata:
+                validate_main_artifact(rank_meta, main_metadata)
             if int(rank_meta.get("num_windows", -1)) != local_count:
                 raise ValueError(
                     f"rank {rank} DONE cache count mismatch: "
@@ -507,6 +525,7 @@ def main(cfg: DictConfig) -> None:
                             ),
                         )
                         rank_meta = {
+                            **main_metadata,
                             "rank": rank,
                             "world_size": world_size,
                             "num_windows": local_count,
@@ -546,6 +565,9 @@ def main(cfg: DictConfig) -> None:
                 raise RuntimeError("rank produced no latent batch despite non-empty row assignment")
             if arrays is not None:
                 _flush_arrays(arrays)
+            if local_count == 0:
+                _atomic_json(existing_meta_path, {"rank": rank, "world_size": world_size,
+                    "num_windows": 0, "latent_shape": [], **main_metadata})
             if write_offset != local_count:
                 raise RuntimeError(
                     f"rank {rank} cache incomplete: wrote {write_offset}, expected {local_count}"
@@ -626,6 +648,7 @@ def main(cfg: DictConfig) -> None:
             payload_bytes_estimate = int(len(index_rows) * bytes_per_window)
 
             manifest = {
+                **main_metadata,
                 "format": CACHE_FORMAT,
                 "dataset_dirs": [str(v) for v in cfg.data.train.dataset_dirs],
                 "dataset_stats": str(stats_path.resolve()),

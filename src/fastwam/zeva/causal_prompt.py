@@ -67,8 +67,10 @@ class CausalPromptConfig:
             raise ValueError("prompt initialization must be legacy_xavier or zeva_ego")
         if self.initialization == "zeva_ego" and self.pim_variant != "cross_attempt":
             raise ValueError("zeva_ego initialization requires the cross-attempt phase reader")
-        if self.numerical_contract not in {"legacy_v1", "zeva_ego_v1"}:
-            raise ValueError("numerical_contract must be legacy_v1 or zeva_ego_v1")
+        if self.numerical_contract not in {"legacy_v1", "zeva_ego_v1", "zeva_main_v1"}:
+            raise ValueError("unsupported numerical_contract")
+        if self.numerical_contract == "zeva_main_v1" and self.pim_variant != "legacy":
+            raise ValueError("zeva_main_v1 requires the original MCE reader")
         if self.numerical_contract == "zeva_ego_v1" and self.pim_variant != "cross_attempt":
             raise ValueError("zeva_ego_v1 numerical_contract requires the cross-attempt phase reader")
         if self.pim_variant == "cross_attempt" and (self.pim_context_dropout or self.pim_support_dropout):

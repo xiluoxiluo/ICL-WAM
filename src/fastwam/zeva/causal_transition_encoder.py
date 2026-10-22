@@ -4,14 +4,14 @@
 # Adapted from air-embodied-brain/Zeva's
 # ``cosmos_framework/model/zeva/causal_transition_encoder.py``.
 #
-# This legacy window-based implementation predates feature/zeva_ego. The
-# branch's RGB/replanning-cadence predictive CTE is implemented in ego_cte.py.
+# Zeva main's observed-effect implementation. The separate feature/zeva_ego
+# RGB/replanning-cadence predictive CTE is implemented in ego_cte.py.
 
-"""Legacy window-based Causal Transition Encoder retained for old artifacts.
+"""Zeva main Causal Transition Encoder with genuinely observed effects.
 
 The four-action transition and sixteen-action completed-effect semantics are
 not the predictive CTE used by Zeva's feature/zeva_ego branch. RGB/Wan-VAE
-conversion belongs to this legacy path's caller. Do not load these weights
+conversion belongs to the caller. Do not load these weights
 into the new RGB/Mamba CTE or reinterpret effect_post as current prediction.
 """
 
@@ -251,7 +251,11 @@ class CausalTransitionEncoder(nn.Module):
             ends = starts + cfg.effect_window_transitions
             effect_actions = transition_actions[:, : windows * cfg.effect_window_transitions].reshape(frames.shape[0], windows, cfg.effect_window_transitions, cfg.transition_steps, cfg.action_dim)
             effect_valid = transition_valid[:, : windows * cfg.effect_window_transitions].reshape(frames.shape[0], windows, cfg.effect_window_transitions, cfg.transition_steps)
-            effect_complete = valid_mask[:, starts] & valid_mask[:, ends] & effect_valid.all(dim=(-1, -2))
+            # Every intermediate observation/control interval must have been
+            # observed. Endpoints alone do not establish a completed effect.
+            effect_complete = transition_complete[:, : windows * cfg.effect_window_transitions].reshape(
+                frames.shape[0], windows, cfg.effect_window_transitions,
+            ).all(dim=-1) & effect_valid.all(dim=(-1, -2))
             effect_embed = self.effect_action_encoder(effect_actions.flatten(-3))
             frozen_visual = frozen_effect_visual
             effect_delta = frozen_visual[:, ends] - frozen_visual[:, starts]

@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from fastwam.zeva import TaskContextBank
 from fastwam.zeva.checkpoint import checkpoint_sha256
+from fastwam.zeva.main_data import inherit_main_artifact, is_main_profile, validate_main_source
 from fastwam.zeva.static_task_context import (
     HEAD_FORMAT,
     READOUT_KIND,
@@ -73,6 +74,8 @@ def main(cfg: DictConfig) -> None:
         raise FileNotFoundError("behavior bank/readout cache must be built first")
 
     bank = TaskContextBank.load(bank_path)
+    if is_main_profile(cfg):
+        validate_main_source(cfg, bank.metadata)
     validate_behavior_bank(bank)
     semantic_path = Path(str(cfg.data.train.semantic_task_map_path)).expanduser().resolve()
     stats_path = Path(str(cfg.data.train.pretrained_norm_stats)).expanduser().resolve()
@@ -84,7 +87,7 @@ def main(cfg: DictConfig) -> None:
         "video_size": [int(v) for v in cfg.data.train.video_size],
         "context_len": int(cfg.model.tokenizer_max_len),
         "history_semantics": "full_episode_prefix",
-        "semantic_task_count": 50,
+        "semantic_task_count": len({str(entry["task_id"]) for entry in bank.entries}) if is_main_profile(cfg) else 50,
     }
     for key, expected in expected_bank_identity.items():
         if bank.metadata.get(key) != expected:
@@ -95,12 +98,12 @@ def main(cfg: DictConfig) -> None:
     if len(bank) < 2:
         raise ValueError("static retrieval training requires at least two demonstrations")
     task_names = sorted({str(entry["task_id"]) for entry in bank.entries})
-    if len(task_names) != 50:
+    if not is_main_profile(cfg) and len(task_names) != 50:
         raise ValueError(f"formal RoboTwin bank must contain 50 semantic tasks, got {len(task_names)}")
     counts = {task: 0 for task in task_names}
     for entry in bank.entries:
         counts[str(entry["task_id"])] += 1
-    if min(counts.values()) < 2:
+    if not is_main_profile(cfg) and min(counts.values()) < 2:
         raise ValueError("every semantic task requires >=2 demonstrations for disjoint validation")
 
     cache = load_readout_cache(readout_path, bank_path, bank)
@@ -131,21 +134,35 @@ def main(cfg: DictConfig) -> None:
     device = torch.device(str(configured_device) if configured_device else ("cuda" if torch.cuda.is_available() else "cpu"))
     head = StaticTaskContextRetrievalHead(head_cfg).to(device)
 
+    validation_kwargs = {}
+    if is_main_profile(cfg):
+        validation_kwargs = {"validation_readouts": cache["validation_readouts"],
+            "validation_semantic_ids": torch.tensor([task_to_index[value] for value in cache["validation_task_ids"]])}
     metrics = train_retrieval_head(
         head,
         readouts,
         keys,
         labels,
         seed=seed,
+        **validation_kwargs,
         **dict(tc.training),
     )
+    report_readouts, report_keys, report_labels = readouts, keys, labels
+    report_train, report_val = metrics["train_indices"], metrics["validation_indices"]
+    if metrics["external_validation"]:
+        report_readouts = torch.cat((readouts, cache["validation_readouts"]), dim=0)
+        # The validation branch indexes keys only with report_train. Zero
+        # placeholders make the lack of held-out candidate prototypes explicit.
+        report_keys = torch.cat((keys, torch.zeros(len(cache["validation_readouts"]), keys.shape[-1])), dim=0)
+        report_labels = torch.cat((labels, validation_kwargs["validation_semantic_ids"]))
+        report_val = [len(readouts) + index for index in report_val]
     final_report = _full_validation(
         head,
-        readouts,
-        keys,
-        labels,
-        metrics["train_indices"],
-        metrics["validation_indices"],
+        report_readouts,
+        report_keys,
+        report_labels,
+        report_train,
+        report_val,
         device,
     )
     if not all(torch.isfinite(torch.tensor(value)) for value in final_report.values()):
@@ -153,6 +170,7 @@ def main(cfg: DictConfig) -> None:
 
     head_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        **inherit_main_artifact(bank.metadata),
         "format": HEAD_FORMAT,
         "readout_kind": READOUT_KIND,
         "bank_sha256": checkpoint_sha256(bank_path),
@@ -166,7 +184,9 @@ def main(cfg: DictConfig) -> None:
         "validation": final_report,
         "semantic_tasks": task_names,
         "train_episode_ids": [cache["episode_ids"][i] for i in metrics["train_indices"]],
-        "validation_episode_ids": [cache["episode_ids"][i] for i in metrics["validation_indices"]],
+        "validation_episode_ids": [cache["validation_episode_ids" if metrics["external_validation"] else "episode_ids"][i]
+                                   for i in metrics["validation_indices"]],
+        "validation_scope": "fixed_success_episode_holdout" if metrics["external_validation"] else "retrieval_internal_holdout",
     }
     tmp_head = head_path.with_name(f".{head_path.name}.tmp")
     torch.save(payload, tmp_head)

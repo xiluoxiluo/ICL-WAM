@@ -50,6 +50,7 @@ from fastwam.zeva.static_task_context import (
 )
 from fastwam.zeva.task_language import TaskLanguageMemory, task_language_identity
 from fastwam.zeva.prompt_cache import load_policy_prompt_cache
+from fastwam.zeva.main_runtime import MainObservedRuntime, PhaseMatchedSuccessReplay
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,8 @@ def _prefix_metadata(model: Any) -> dict[str, Any]:
     layout = getattr(config, "prefix_layout", "legacy_merged")
     return {
         "prefix_layout": layout,
-        "effect_source": getattr(config, "effect_source", None) if layout == "zeva_ego" else None,
+        "effect_source": (getattr(config, "effect_source", None)
+                          if layout == "zeva_ego" or getattr(model, "zeva_profile", None) == "main_observed" else None),
     }
 
 
@@ -261,11 +263,29 @@ class WorldActionRobotWinPolicy:
         skip_get_obs_within_replan: bool = False,
         policy_text_encoder_device: str = "cpu",
         policy_text_cache_size: int = 16,
+        pim_success_replay_enabled: bool = False,
+        pim_success_replay_phase_threshold: float = 0.80,
+        pim_success_replay_blend: float = 1.0,
     ) -> None:
         model_cfg_copy = _inference_model_config(model_cfg)
+        self.zeva_profile = str(model_cfg_copy.get("zeva", {}).get("profile", "legacy"))
+        self._main_observed = self.zeva_profile == "main_observed"
+        if pim_success_replay_enabled and not self._main_observed:
+            raise ValueError("successful-action replay requires the explicit main_observed profile")
+        self._success_replay = PhaseMatchedSuccessReplay(
+            enabled=pim_success_replay_enabled,
+            phase_threshold=pim_success_replay_phase_threshold, blend=pim_success_replay_blend,
+        )
+        self._main_runtime: MainObservedRuntime | None = None
+        self._main_episode_instruction: str | None = None
+        self._pending_replay_actions: deque[bool] = deque()
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval().requires_grad_(False)
+        if self._main_observed:
+            # Joint main weights must not change the frozen initial-observation
+            # retrieval feature space. The model preserves the base readout on CPU.
+            self.model.zeva_freeze_readout_on_load = True
         # Build UMT5 independently on CPU by default. It is never registered
         # under self.model, so policy.to(cuda) cannot move it or create a peak
         # GPU allocation before offloading. Only cached text features move.
@@ -290,6 +310,12 @@ class WorldActionRobotWinPolicy:
                 and not _supports_boundary_observations(model_cfg_copy, processor_cfg)):
             raise ValueError("skipping non-boundary observations requires current_prediction with state-independent joint normalization")
         zeva_memory_cfg = model_cfg_copy.get("zeva", {}).get("memory", {})
+        if self._main_observed and (
+            zeva_memory_cfg.get("memory_semantics") != "completed_effect_trace"
+            or bool(zeva_memory_cfg.get("cross_attempt_only", False))
+            or model_cfg_copy.get("zeva", {}).get("adapter", {}).get("effect_source", "latest_completed") != "latest_completed"
+        ):
+            raise ValueError("main_observed requires observed completed effects and immediate phase-retrieved PIM")
         task_context_cfg = model_cfg_copy.get("zeva", {}).get("task_context", {})
         self.task_context_bank = None
         self._static_task_context_session = None
@@ -441,6 +467,21 @@ class WorldActionRobotWinPolicy:
                     "addon_checkpoint is required for zeva_stage2 and pim_on evaluation"
                 )
             cte_payload = torch.load(str(cte_checkpoint), map_location="cpu", weights_only=False)
+            if self._main_observed:
+                from fastwam.zeva.main_data import inherit_main_artifact, validate_main_artifact
+                validate_main_artifact(cte_payload)
+                if cte_payload["success_data_identity"]["dataset_stats_sha256"] != checkpoint_sha256(dataset_stats_path):
+                    raise ValueError("main_observed deployment normalization differs from the verified training data")
+                self.model.zeva_success_data_identity = dict(cte_payload["success_data_identity"])
+                self.model.zeva_main_artifact_metadata = inherit_main_artifact(cte_payload)
+                self.checkpoint_identity["success_data_identity"] = dict(cte_payload["success_data_identity"])
+                for artifact_key in ("bank_path", "retrieval_checkpoint"):
+                    artifact_path = task_context_cfg.get(artifact_key)
+                    if not _is_none_like(artifact_path):
+                        validate_main_artifact(
+                            torch.load(str(artifact_path), map_location="cpu", weights_only=False),
+                            expected=cte_payload,
+                        )
             cte_values = dict(cte_payload.get("config", cte_payload.get("model_config", {})))
             cte_values = dict(cte_values.get("cte", cte_values))
             checkpoint_action_dim = int(cte_payload.get("action_dim", cte_values.get("action_dim", -1)))
@@ -452,6 +493,8 @@ class WorldActionRobotWinPolicy:
             self.cte_schema = str(cte_payload.get("schema", "legacy_cte"))
             self.checkpoint_identity["cte_schema"] = self.cte_schema
             self._ego_cte = self.cte_schema == "iclwam_zeva_ego_cte_v1"
+            if self._main_observed and self._ego_cte:
+                raise ValueError("main_observed cannot consume a predictive Zeva-Ego CTE checkpoint")
             if self._ego_cte:
                 from fastwam.zeva.ego_cte_training import load_ego_cte_checkpoint
                 cte_options = model_cfg_copy.get("zeva", {}).get("cte", {})
@@ -529,6 +572,8 @@ class WorldActionRobotWinPolicy:
                 load_cte_checkpoint(str(cte_checkpoint), self.cte, map_location="cpu")
             self.cte.requires_grad_(False)
             cte_input_type = str(cte_payload.get("cte_input_type", cte_values.get("input_type", "rgb_frame")))
+            if self._main_observed and cte_input_type != "wan_vae_latent":
+                raise ValueError("main_observed requires the frozen Wan-VAE observed-effect CTE input contract")
             if self._ego_cte:
                 if cte_input_type != "rgb_multiview":
                     raise ValueError("Zeva-Ego CTE checkpoint must declare rgb_multiview")
@@ -588,6 +633,9 @@ class WorldActionRobotWinPolicy:
                     base_checkpoint_sha256=checkpoint_sha256(checkpoint_path),
                     cte_checkpoint_sha256=checkpoint_sha256(cte_checkpoint),
                 )
+                if self._main_observed:
+                    from fastwam.zeva.main_data import validate_main_artifact
+                    validate_main_artifact(addon_payload, expected=cte_payload)
                 self.checkpoint_identity["checkpoint_numerical_contract"] = validate_checkpoint_numerical_contract(
                     addon_payload, numerical_contract)
                 self.checkpoint_identity["training_recipe"] = addon_payload.get("training_recipe", "frozen_parent")
@@ -600,6 +648,9 @@ class WorldActionRobotWinPolicy:
                 )
                 if addon_payload.get("foundation_checkpoint") is not None:
                     self.checkpoint_identity["foundation_sha256"] = addon_payload["foundation_checkpoint"]["sha256"]
+            # Loading a joint checkpoint can restore trainability. Inference
+            # updates only runtime memory, never foundation/addon parameters.
+            self.model.eval().requires_grad_(False)
             pim = PersistentInteractionMemory(
                 PersistentInteractionMemoryConfig(
                     phase_dim=cte_cfg.phase_dim,
@@ -890,8 +941,11 @@ class WorldActionRobotWinPolicy:
                     current_effect = current_effect.to(device=self.model.device, dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype))
                     current_effect_mask = torch.ones(phase.shape[0], dtype=torch.bool, device=self.model.device)
                 else:
-                    encoded = self._cte_history.forward()
-                    phase = encoded["phase"][:, -1]
+                    if getattr(self, "_main_observed", False):
+                        phase = self._main_runtime.current_phase()
+                    else:
+                        encoded = self._cte_history.forward()
+                        phase = encoded["phase"][:, -1]
                     current_effect, current_effect_mask = None, None
                 memory = self.lifecycle.memory_inputs(phase, task_tokens)
                 phase = phase.to(device=self.model.device, dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype))
@@ -1123,13 +1177,17 @@ class WorldActionRobotWinPolicy:
             # the old episode's store will be cleared before its first read.
             pim = None
         return {
+            "evaluation_profile": getattr(self, "zeva_profile", "legacy"),
+            "zeva_profile": getattr(self, "zeva_profile", "legacy"),
+            "inference_parameters_frozen": self._inference_parameters_frozen(),
             "model_seed": self.seed,
             "seed_stream": (getattr(self, "_model_noise_stream", None) or self._model_seed_stream).snapshot(),
             "evaluation_slot": {"index": getattr(self, "evaluation_slot_index", 0), "count": getattr(self, "evaluation_slot_count", 1)},
             "memory_semantics": "predicted_effect_trace" if getattr(self, "_ego_cte", False) else "completed_effect_trace",
+            "observed_effect_source": "observed_post" if getattr(self, "_main_observed", False) else None,
             "checkpoint_identity": self.checkpoint_identity,
             "training_recipe": self.checkpoint_identity.get("training_recipe", "frozen_parent"),
-            "foundation_mode": ("joint" if self.checkpoint_identity.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup"} else "frozen"),
+            "foundation_mode": ("joint" if self.checkpoint_identity.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup", "main_joint_parent", "main_joint_pim"} else "frozen"),
             "foundation_checkpoint_required": self.checkpoint_identity.get("foundation_checkpoint_required", False),
             "foundation_contract_schema": self.checkpoint_identity.get("foundation_contract_schema"),
             "pim_memory_contract": self.checkpoint_identity.get("pim_memory_contract"),
@@ -1162,7 +1220,31 @@ class WorldActionRobotWinPolicy:
             "replans": self._replan_index,
             "terminal_observation_step": self._terminal_observation_step,
             "pim_diagnostics_last": dict(self._last_pim_diagnostics),
+            "main_observed_runtime": (self._main_runtime.snapshot() if getattr(self, "_main_runtime", None) is not None else None),
+            **(self._success_replay.snapshot() if getattr(self, "_success_replay", None) is not None else {}),
         }
+
+    def _inference_parameters_frozen(self) -> bool | None:
+        modules = [self.model]
+        if getattr(self, "cte", None) is not None:
+            modules.append(self.cte)
+        if any(not callable(getattr(module, "parameters", None)) for module in modules):
+            return None
+        return all(not module.training and not any(p.requires_grad for p in module.parameters()) for module in modules)
+
+    def _ensure_main_runtime(self, observation: Dict[str, Any], instruction: str) -> None:
+        if self._main_episode_instruction is not None and instruction != self._main_episode_instruction:
+            raise ValueError("main_observed retries must preserve the episode instruction; reset for a new episode")
+        if self._main_runtime is not None:
+            return
+        if self._needs_episode_reset:
+            self.lifecycle.reset_episode(instruction, episode_id=f"episode-{self.episode_count}")
+            self._needs_episode_reset = False
+        self._main_episode_instruction = instruction
+        runtime = MainObservedRuntime(self.cte, self.lifecycle, frame_encoder=self._cte_frame_encoder)
+        runtime.start(self._build_robotwin_image_tensor(observation)[0].float())
+        self._main_runtime = runtime
+        self._cte_history = runtime.history
 
     def save_model_rng_state(self) -> None:
         stream = getattr(self, "_model_noise_stream", None)
@@ -1171,15 +1253,43 @@ class WorldActionRobotWinPolicy:
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
+        replayed_steps = 0
+        if getattr(self, "_main_observed", False) and self.zeva_mode != "base":
+            # Preserve the policy's normal sampling/RNG call even when a later
+            # attempt can replay the first successful trace, as original main does.
+            action_tensor, replayed_steps = self._success_replay.apply(
+                self._main_runtime.current_phase(), torch.as_tensor(action_chunk),
+                replan_index=self._replan_index - 1,
+                conditioning=self.zeva_mode == "pim_on" and self.cross_memory_enabled,
+            )
+            action_chunk = action_tensor.numpy()
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         for i in range(n_exec):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
+            if getattr(self, "_main_observed", False) and self.zeva_mode != "base":
+                self._pending_replay_actions.append(i < replayed_steps)
 
     def should_request_observation(self) -> bool:
+        if getattr(self, "_main_observed", False) and self.zeva_mode != "base":
+            return not self.pending_actions or self._main_runtime is None or self._main_runtime.needs_boundary_observation
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
-        if self.zeva_mode != "base" and not getattr(self, "_ego_cte", False) and observation is not None and self._cte_history is not None:
+        main_observed = getattr(self, "_main_observed", False) and self.zeva_mode != "base"
+        if main_observed:
+            if self._attempt_finalized:
+                raise RuntimeError("begin a new attempt before executing more controls")
+            if self._main_runtime is None:
+                if observation is None:
+                    raise ValueError("main_observed requires its initial real observation")
+                self._ensure_main_runtime(observation, task_env.get_instruction())
+            if self._main_runtime.needs_boundary_observation:
+                if observation is None:
+                    raise ValueError("main_observed requires a fresh observation after each four executed actions")
+                self._main_runtime.observe(
+                    self._build_robotwin_image_tensor(observation)[0].float(), raw_step=self.step_count,
+                )
+        if not main_observed and self.zeva_mode != "base" and not getattr(self, "_ego_cte", False) and observation is not None and self._cte_history is not None:
             next_image = self._build_robotwin_image_tensor(observation)[0].float()
             if len(self._transition_actions) >= self.cte.cfg.transition_steps:
                 action_group = torch.stack(self._transition_actions[: self.cte.cfg.transition_steps]).to(self.model.device)
@@ -1210,12 +1320,24 @@ class WorldActionRobotWinPolicy:
             logger.warning("No action generated; skip current eval step.")
             return
 
-        action = self.pending_actions.popleft()
-        sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
-        task_env.take_action(action, action_type="qpos")
+        action = self.pending_actions[0]
+        normalized_action = None
         if self.zeva_mode != "base":
             raw_state = None if observation is None else np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
-            self._transition_actions.append(self._normalize_action(action, raw_state))
+            normalized_action = self._normalize_action(action, raw_state)
+            if main_observed:
+                normalized_action = self._main_runtime.validate_action(normalized_action)
+        sim_t0 = time.perf_counter() if self.timing_enabled else 0.0
+        task_env.take_action(action, action_type="qpos")
+        self.pending_actions.popleft()
+        if self.zeva_mode != "base":
+            if main_observed:
+                self._main_runtime.record_executed_action(normalized_action)
+                self._success_replay.record_executed_action(
+                    torch.as_tensor(action), replayed=self._pending_replay_actions.popleft(),
+                )
+            else:
+                self._transition_actions.append(normalized_action)
         if self.timing_enabled:
             self._timing_rollout["sim_s"] += time.perf_counter() - sim_t0
         self.step_count += 1
@@ -1231,6 +1353,11 @@ class WorldActionRobotWinPolicy:
         }
 
     def reset(self) -> None:
+        self._main_runtime = None
+        self._main_episode_instruction = None
+        if getattr(self, "_success_replay", None) is not None:
+            self._success_replay.reset_episode()
+            self._pending_replay_actions.clear()
         if getattr(self, "_static_task_context_session", None) is not None:
             self._static_task_context_session.reset()
         self._task_language_instruction = self._task_language_result = None
@@ -1255,6 +1382,21 @@ class WorldActionRobotWinPolicy:
 
     def begin_attempt(self, attempt_id: int) -> None:
         """Reset transient CTE/BIT while preserving episode PIM and seed schedule."""
+        attempt_id = int(attempt_id)
+        if getattr(self, "_main_observed", False) and self.zeva_mode != "base":
+            if attempt_id not in {self._attempt_id, self._attempt_id + 1}:
+                raise ValueError("main_observed attempt IDs must increment by one")
+            if attempt_id == self._attempt_id and self.step_count:
+                raise RuntimeError("cannot erase a running main_observed attempt without episode reset")
+            if attempt_id == self._attempt_id + 1 and not self._attempt_finalized:
+                raise RuntimeError("finalize the previous attempt with its terminal observation before retrying")
+            if attempt_id == 0:
+                self._success_replay.reset_episode()
+                self._main_episode_instruction = None
+            else:
+                self._success_replay.begin_attempt(attempt_id)
+            self._main_runtime = None
+            self._pending_replay_actions.clear()
         if getattr(self, "_static_task_context_session", None) is not None:
             self._static_task_context_session.reset()
         self._task_language_instruction = self._task_language_result = None
@@ -1324,6 +1466,20 @@ class WorldActionRobotWinPolicy:
             if not has_terminal_obs:
                 raise RuntimeError("Missing terminal observation; refusing to commit stale PIM")
             self._terminal_observation_step = self.step_count
+            if getattr(self, "_main_observed", False):
+                if self._main_runtime is None:
+                    self._ensure_main_runtime(terminal_obs, task_env.get_instruction())
+                self._main_runtime.observe(
+                    self._build_robotwin_image_tensor(terminal_obs)[0].float(),
+                    raw_step=self.step_count, terminal=True,
+                )
+                self._success_replay.finalize_attempt(success=success, terminal_observed=True)
+                self.lifecycle.end_attempt()
+                self.pending_actions.clear()
+                self._pending_replay_actions.clear()
+                self._transition_actions.clear()
+                self._attempt_finalized = True
+                return
             has_complete_tail = len(self._transition_actions) == self.cte.cfg.transition_steps
 
             if not getattr(self, "_ego_cte", False) and has_terminal_obs and has_complete_tail and self._cte_history is not None:
@@ -1488,6 +1644,12 @@ def get_model(usr_args: Dict[str, Any]):
                                        or cfg.EVALUATION.get("policy_text_encoder_device", "cpu")),
         policy_text_cache_size=int(usr_args.get("policy_text_cache_size",
                                                cfg.EVALUATION.get("policy_text_cache_size", 16))),
+        pim_success_replay_enabled=_parse_bool(usr_args.get("pim_success_replay_enabled",
+                                                         cfg.EVALUATION.get("pim_success_replay_enabled", False))),
+        pim_success_replay_phase_threshold=float(usr_args.get("pim_success_replay_phase_threshold",
+                                                             cfg.EVALUATION.get("pim_success_replay_phase_threshold", 0.80))),
+        pim_success_replay_blend=float(usr_args.get("pim_success_replay_blend",
+                                                   cfg.EVALUATION.get("pim_success_replay_blend", 1.0))),
     )
     return policy
 

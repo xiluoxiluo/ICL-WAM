@@ -6,7 +6,7 @@ from functools import wraps
 import torch
 from torch import nn
 
-from fastwam.zeva_numerical_contract import REFERENCE_NUMERICAL_CONTRACT
+from fastwam.zeva_numerical_contract import FP32_NUMERICAL_CONTRACTS
 
 
 _reference_training = ContextVar("zeva_reference_training", default=None)
@@ -21,7 +21,7 @@ class ReferenceFloat32Module(nn.Module):
     """
 
     def _apply(self, fn, recurse=True):
-        strict = getattr(getattr(self, "config", None), "numerical_contract", None) == REFERENCE_NUMERICAL_CONTRACT
+        strict = getattr(getattr(self, "config", None), "numerical_contract", None) in FP32_NUMERICAL_CONTRACTS
         if not strict:
             return super()._apply(fn, recurse=recurse)
 
@@ -38,7 +38,7 @@ def reference_inference_precision(method):
     """Match reference FP32 eval while retaining its training AMP behavior."""
     @wraps(method)
     def wrapped(self, *args, **kwargs):
-        strict = getattr(getattr(self, "config", None), "numerical_contract", None) == REFERENCE_NUMERICAL_CONTRACT
+        strict = getattr(getattr(self, "config", None), "numerical_contract", None) in FP32_NUMERICAL_CONTRACTS
         if not strict:
             return method(self, *args, **kwargs)
         # FastWAM stage freezing toggles individual child modules, rather

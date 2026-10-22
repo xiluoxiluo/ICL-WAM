@@ -115,6 +115,14 @@ def main(usr_args):
     max_attempts = int(usr_args.get("max_attempts", 1))
     if max_attempts < 1:
         raise ValueError(f"`max_attempts` must be >= 1, got: {max_attempts}")
+    evaluation_profile = usr_args.get("evaluation_profile")
+    attempt_protocol = str(usr_args.get("attempt_protocol", "stop_on_success"))
+    if attempt_protocol not in {"single_attempt", "stop_on_success", "fixed_attempts"}:
+        raise ValueError("Unknown attempt_protocol")
+    if attempt_protocol != "stop_on_success" and evaluation_profile != "main_observed":
+        raise ValueError("Independent SR/fixed-attempt protocols require the explicit main_observed profile")
+    if attempt_protocol == "single_attempt" and max_attempts != 1:
+        raise ValueError("single_attempt requires max_attempts=1")
     fixed_seed = usr_args.get("fixed_seed", None)
     if isinstance(fixed_seed, str) and fixed_seed.strip().lower() in {"", "none", "null"}:
         fixed_seed = None
@@ -135,7 +143,10 @@ def main(usr_args):
     get_model = eval_function_decorator(policy_name, "get_model")
     # Import after the policy establishes the project root on sys.path. The
     # helpers themselves are stdlib-only and can be used without the simulator.
-    from experiments.robotwin.multiattempt import load_manifest
+    if evaluation_profile == "main_observed":
+        from fastwam.zeva_main_evaluation import load_manifest
+    else:
+        from experiments.robotwin.multiattempt import load_manifest
     manifest_episodes = None
     manifest_sha256 = None
     manifest_path = usr_args.get("episode_manifest")
@@ -151,6 +162,12 @@ def main(usr_args):
         for name in ("action_horizon", "replan_steps", "max_attempts"):
             if int(usr_args.get(name, manifest[name])) != manifest[name]:
                 raise ValueError(f"Manifest {name} differs from policy execution contract")
+        if evaluation_profile == "main_observed":
+            if manifest["attempt_protocol"] != attempt_protocol:
+                raise ValueError("Main manifest attempt protocol differs from runtime")
+            for name in ("pim_success_replay_enabled", "pim_success_replay_phase_threshold", "pim_success_replay_blend"):
+                if usr_args.get(name) != manifest[name]:
+                    raise ValueError(f"Main manifest {name} differs from runtime")
         manifest_episodes = [row for row in manifest["episodes"] if row["task"] == task_name]
         if not manifest_episodes:
             raise ValueError(f"Task {task_name} is not in the frozen manifest")
@@ -261,6 +278,8 @@ def main(usr_args):
                                    skip_get_obs_within_replan=skip_get_obs_within_replan,
                                    fixed_seed=fixed_seed,
                                    max_attempts=max_attempts,
+                                   attempt_protocol=attempt_protocol,
+                                   evaluation_profile=evaluation_profile,
                                    manifest_episodes=manifest_episodes,
                                    fixed_instruction=usr_args.get("fixed_instruction"),
                                    attempt_log_path=usr_args.get("attempt_log_path") or str(save_dir / "attempts.jsonl"),
@@ -285,6 +304,10 @@ def main(usr_args):
     with open(file_path, "w") as file:
         file.write(f"Timestamp: {eval_ts}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
+        if evaluation_profile == "main_observed":
+            metric = "SR@1" if attempt_protocol == "single_attempt" else f"CSR@{max_attempts}"
+            file.write(f"Protocol: {attempt_protocol}\nMetric: {metric}\n")
+            file.write("CSR is any success within the attempt budget; post-success stability is reported separately.\n\n")
         # file.write(str(task_reward) + '\n')
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
 
@@ -306,8 +329,19 @@ def eval_policy(task_name,
                 manifest_episodes=None,
                 fixed_instruction=None,
                 attempt_log_path=None,
-                record_context=None):
-    from experiments.robotwin.multiattempt import ATTEMPT_SCHEMA, append_attempt
+                record_context=None,
+                attempt_protocol="stop_on_success",
+                evaluation_profile=None):
+    if evaluation_profile == "main_observed":
+        from fastwam.zeva_main_evaluation import ATTEMPT_SCHEMA, append_attempt
+    else:
+        from experiments.robotwin.multiattempt import ATTEMPT_SCHEMA, append_attempt
+    if attempt_protocol not in {"single_attempt", "stop_on_success", "fixed_attempts"}:
+        raise ValueError("Unknown attempt_protocol")
+    if attempt_protocol == "single_attempt" and max_attempts != 1:
+        raise ValueError("single_attempt requires exactly one attempt")
+    if evaluation_profile != "main_observed" and attempt_protocol != "stop_on_success":
+        raise ValueError("New attempt protocols must use main_observed")
     if manifest_episodes is not None and len(manifest_episodes) != test_num:
         raise ValueError("Manifest task size differs from test_num")
     if manifest_episodes is not None and fixed_seed is not None:
@@ -475,8 +509,14 @@ def eval_policy(task_name,
                 TASK_ENV._del_eval_video_ffmpeg()
 
         succ = False
+        ever_succ = False
+        first_success_attempt = None
         reset_func(model)  # Episode reset exactly once; retries preserve PIM.
         for attempt_id in range(max_attempts):
+            # fixed_attempts continues after success, so per-attempt success
+            # must not inherit the preceding attempt's outcome.
+            succ = False
+            first_success_before = first_success_attempt
             if attempt_id > 0:
                 # Recreate the same fixed-seed episode for a genuine retry.
                 stop_attempt_video()
@@ -491,6 +531,11 @@ def eval_policy(task_name,
                 reset_scope = "episode"  # Explicitly record incompatible fallback behavior.
                 reset_func(model)
             before = model.evaluation_metadata() if hasattr(model, "evaluation_metadata") else {}
+            if evaluation_profile == "main_observed":
+                if before.get("evaluation_profile") != "main_observed" or before.get("memory_semantics") != "completed_effect_trace":
+                    raise ValueError("Main evaluator requires the actual observed-effect runtime, not an Ego checkpoint/config")
+                if reset_scope != ("episode" if attempt_id == 0 else "attempt"):
+                    raise ValueError("Main retries require an attempt reset that preserves experience")
             started = time.perf_counter()
             status, error = "timeout", None
             try:
@@ -509,6 +554,10 @@ def eval_policy(task_name,
                         break
                 if hasattr(model, "finalize_attempt"):
                     model.finalize_attempt(TASK_ENV, success=succ)
+                if succ:
+                    ever_succ = True
+                    if first_success_attempt is None:
+                        first_success_attempt = attempt_id + 1
             except Exception as exc:
                 status, error = "error", repr(exc)
                 raise
@@ -537,8 +586,18 @@ def eval_policy(task_name,
                         "seed_stream_before": before.get("seed_stream"),
                         "video_path": str(current_video_path) if current_video_path else None,
                     })
+                    if evaluation_profile == "main_observed":
+                        record.update({
+                            "attempt_protocol": attempt_protocol,
+                            "scene_reset": True,
+                            "memory_reset": attempt_id == 0,
+                            "model_rng_reset": False,
+                            "first_success_attempt_before": first_success_before,
+                            "first_success_attempt": first_success_attempt,
+                            "post_success_attempt": first_success_before is not None,
+                        })
                     append_attempt(attempt_log_path, record)
-            if succ:
+            if succ and attempt_protocol != "fixed_attempts":
                 break
         # task_total_reward += TASK_ENV.episode_score
         if video_enabled:
@@ -547,7 +606,7 @@ def eval_policy(task_name,
                 raise FileNotFoundError(f"Expected eval video file not found: {current_video_path}")
             # Keep immutable per-attempt paths referenced by structured logs.
 
-        if succ:
+        if ever_succ:
             TASK_ENV.suc += 1
             print("\033[92mSuccess!\033[0m")
         else:
@@ -561,9 +620,10 @@ def eval_policy(task_name,
 
         TASK_ENV.test_num += 1
 
+        metric_label = ("SR@1" if attempt_protocol == "single_attempt" else f"CSR@{max_attempts}") if evaluation_profile == "main_observed" else "Success rate"
         print(
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
-            f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
+            f"{metric_label}: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
         # TASK_ENV._take_picture()
         if not strict_seed:

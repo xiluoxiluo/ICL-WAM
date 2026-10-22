@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - robotwin_zeva_fastwam_3cam_384
+  - override /model: zeva_main_fastwam
+  - _self_
+
+# Local optimization choices: main publishes CTE architecture/losses, not a
+# complete reproducible CTE training recipe. Do not label this as Ego 80 epochs.
+ckpt: null
+batch_size: 8
+cte_tasks_per_batch: 4
+cte_samples_per_task: 2
+num_workers: 4
+max_steps: 5000
+learning_rate: 2.0e-4
+weight_decay: 0.0
+seed: 42
+data:
+  train:
+    use_text_embed_cache: false
+    val_set_proportion: 0.0
+    skip_padding_as_possible: false
+  val: null

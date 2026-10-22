@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - sim_robotwin_zeva
+  - override /task: robotwin_zeva_main_pim_3cam_384
+  - _self_
+
+EVALUATION:
+  evaluation_profile: main_observed
+  attempt_protocol: stop_on_success
+  cross_memory_enabled: true
+  pim_top_k: 4
+  skip_get_obs_within_replan: false
+  pim_success_replay_enabled: false
+  pim_success_replay_phase_threshold: 0.8
+  pim_success_replay_blend: 1.0

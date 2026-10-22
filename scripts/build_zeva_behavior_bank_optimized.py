@@ -56,6 +56,8 @@ from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset  # noqa: 
 from fastwam.runtime import _mixed_precision_to_model_dtype  # noqa: E402
 from fastwam.zeva import CausalTransitionEncoder, CausalTransitionEncoderConfig  # noqa: E402
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint  # noqa: E402
+from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact  # noqa: E402
+from fastwam.zeva.task_context_data import split_main_behavior_artifacts  # noqa: E402
 from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset  # noqa: E402
 from fastwam.zeva.schemas import sha256_file  # noqa: E402
 from fastwam.zeva.static_task_context import (  # noqa: E402
@@ -238,6 +240,7 @@ def _build_readouts(
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    normalize_main_dataset_paths(cfg)
     info = _init_distributed()
     try:
         if not torch.cuda.is_available():
@@ -337,6 +340,10 @@ def main(cfg: DictConfig) -> None:
             source_window_actions=32,
             show_progress=info.rank == 0,
         )
+        plans, main_metadata = select_main_success_rows(plans, cfg)
+        if main_metadata:
+            validate_main_artifact(payload, main_metadata)
+            validate_main_artifact(latent_cache.manifest, main_metadata)
         plans = _canonicalize_plans(plans, latent_cache)
         _validate_plan_alignment(plans, latent_cache)
         buckets, loads = _partition_episode_plans(plans, info.world_size)
@@ -506,12 +513,13 @@ def main(cfg: DictConfig) -> None:
             if len(entries) != len(plans) or len(set(ids)) != len(ids):
                 raise RuntimeError("merged behavior bank does not contain one unique entry per episode")
             task_set = {str(entry["task_id"]) for entry in entries}
-            if len(task_set) != 50:
+            if not main_metadata and len(task_set) != 50:
                 raise RuntimeError(f"formal RoboTwin behavior bank expected 50 semantic tasks, got {len(task_set)}")
             if not bool(torch.isfinite(all_readouts).all()):
                 raise FloatingPointError("merged FastWAM readouts contain NaN/Inf")
 
             metadata = {
+                **main_metadata,
                 "builder": "build_zeva_behavior_bank_optimized.py",
                 "base_checkpoint_sha256": checkpoint_sha256(base_ckpt),
                 "cte_checkpoint_sha256": checkpoint_sha256(cte_path),
@@ -537,6 +545,12 @@ def main(cfg: DictConfig) -> None:
                 temperature=float(tc.temperature),
                 metadata=metadata,
             )
+            bank, all_readouts, validation_readouts = split_main_behavior_artifacts(bank, all_readouts)
+            if main_metadata:
+                main_metadata = {**main_metadata, "data_role": "train"}
+            entries = list(bank.entries)
+            ids = [str(entry["episode_id"]) for entry in entries]
+            metadata = dict(bank.metadata)
             bank_path.parent.mkdir(parents=True, exist_ok=True)
             readout_path.parent.mkdir(parents=True, exist_ok=True)
             # Build both final files under the private work directory first.
@@ -549,6 +563,8 @@ def main(cfg: DictConfig) -> None:
             bank_hash = checkpoint_sha256(tmp_bank)
             torch.save(
                 {
+                    **main_metadata,
+                    **validation_readouts,
                     "format": READOUT_FORMAT,
                     "readout_kind": READOUT_KIND,
                     "bank_sha256": bank_hash,

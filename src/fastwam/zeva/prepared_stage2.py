@@ -115,7 +115,12 @@ class PreparedPIMCache:
             raise ValueError("prepared PIM episode_ids count differs from manifest")
         if int(self.manifest.get("semantic_task_count", len(self.task_ids))) != len(self.task_ids):
             raise ValueError("prepared PIM task_ids count differs from manifest")
-        if len(self.task_ids) != 50:
+        if self.manifest.get("profile") == "main_observed":
+            from .main_data import validate_main_artifact, validate_main_episode_ids
+
+            validate_main_artifact(self.manifest)
+            validate_main_episode_ids(self.manifest, self.episode_ids)
+        elif len(self.task_ids) != 50:
             raise ValueError(f"formal RoboTwin prepared PIM requires 50 semantic tasks, got {len(self.task_ids)}")
 
         raw_shards = list(self.manifest.get("shards", []))

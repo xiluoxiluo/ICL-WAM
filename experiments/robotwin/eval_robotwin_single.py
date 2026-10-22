@@ -215,7 +215,8 @@ def main(cfg: DictConfig):
     robotwin_eval_base = run_output_dir / str(cfg.EVALUATION.task_name)
 
     zeva_enabled = bool(cfg.model.get("zeva", {}).get("enabled", False))
-    sim_cfg_name = "sim_robotwin_zeva.yaml" if zeva_enabled else "sim_robotwin.yaml"
+    sim_cfg_name = ("sim_robotwin_zeva_main.yaml" if zeva_enabled and cfg.model.zeva.get("profile") == "main_observed"
+                    else "sim_robotwin_zeva.yaml" if zeva_enabled else "sim_robotwin.yaml")
     sim_cfg_path = (PROJECT_ROOT / "configs" / sim_cfg_name).resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
 
@@ -273,6 +274,8 @@ def main(cfg: DictConfig):
         "model_rng_state_path", "model_rng_task_name", "model_rng_run_id",
         "expected_manifest_sha256",
         "policy_text_encoder_device", "policy_text_cache_size",
+        "evaluation_profile", "attempt_protocol",
+        "pim_success_replay_enabled", "pim_success_replay_phase_threshold", "pim_success_replay_blend",
     ):
         value = cfg.EVALUATION.get(key)
         if key in {"episode_manifest", "attempt_log_path", "model_rng_state_path"}:

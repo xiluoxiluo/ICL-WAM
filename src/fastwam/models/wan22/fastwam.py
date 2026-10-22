@@ -272,6 +272,11 @@ class FastWAM(torch.nn.Module):
         This is the legacy FastWAM image+text retrieval adaptation. The newer
         task-language route does not call into the changing policy backbone.
         """
+        snapshot = getattr(self, "_main_frozen_readout_snapshot", None)
+        with snapshot.activate(self.video_expert) if snapshot is not None else nullcontext():
+            return self._extract_task_context_readout(input_image, context, context_mask)
+
+    def _extract_task_context_readout(self, input_image, context, context_mask):
         if input_image.ndim != 4 or input_image.shape[1] != 3:
             raise ValueError("initial image must be [B,3,H,W]")
         if context.ndim != 3 or context.shape[0] != input_image.shape[0] or context_mask.shape != context.shape[:2]:
@@ -1085,7 +1090,7 @@ class FastWAM(torch.nn.Module):
         # Wan22Trainer: the pretrained FastWAM path is frozen before the addon
         # modules are attached, while the addon remains explicitly trainable.
         self.requires_grad_(False)
-        addon_dtype = torch.float32 if adapter_numerics == "zeva_ego_v1" else self.torch_dtype
+        addon_dtype = torch.float32 if adapter_numerics in {"zeva_ego_v1", "zeva_main_v1"} else self.torch_dtype
         self.zeva_prompt_encoder = causal_prompt_encoder.to(device=self.device, dtype=addon_dtype)
         self.zeva_behavior_prefix_adapter = behavior_prefix_adapter.to(device=self.device, dtype=addon_dtype)
         self.zeva_prompt_encoder.requires_grad_(True)
@@ -1114,7 +1119,7 @@ class FastWAM(torch.nn.Module):
 
     @property
     def zeva_condition_dtype(self) -> torch.dtype:
-        return torch.float32 if self.zeva_numerical_contract == "zeva_ego_v1" else self.torch_dtype
+        return torch.float32 if self.zeva_numerical_contract in {"zeva_ego_v1", "zeva_main_v1"} else self.torch_dtype
 
     def zeva_trainable_parameters(self):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
@@ -1138,8 +1143,8 @@ class FastWAM(torch.nn.Module):
     @property
     def zeva_joint_foundation(self) -> bool:
         recipe = getattr(self, "zeva_training_recipe", "frozen_parent")
-        return ((self.zeva_training_stage == "pim_adapter" and recipe == "ego_joint_warmup")
-                or (self.zeva_training_stage == "policy_injection" and recipe == "ego_joint_parent"))
+        return ((self.zeva_training_stage == "pim_adapter" and recipe in {"ego_joint_warmup", "main_joint_pim"})
+                or (self.zeva_training_stage == "policy_injection" and recipe in {"ego_joint_parent", "main_joint_parent"}))
 
     @property
     def zeva_foundation_mode(self) -> str:
@@ -1175,9 +1180,10 @@ class FastWAM(torch.nn.Module):
         """
         config = getattr(self.zeva_behavior_prefix_adapter, "config", None)
         if (not self.zeva_enabled
-                or getattr(config, "effect_source", None) != "current_prediction"
+                or (getattr(config, "effect_source", None) != "current_prediction"
+                    and getattr(config, "numerical_contract", None) != "zeva_main_v1")
                 or self.zeva_training_stage not in {"policy_injection", "pim_adapter"}):
-            raise ValueError("FP32 Zeva training preparation requires predictive Stage2A or Stage2B")
+            raise ValueError("FP32 Zeva training preparation requires a versioned main/Ego Stage2 recipe")
         with torch.no_grad():
             for parameter in self.parameters():
                 if parameter.requires_grad:
@@ -1408,9 +1414,10 @@ class FastWAM(torch.nn.Module):
         # Main-stream behavior conditions leave instruction/proprio inputs
         # unchanged. Their versioned layout controls independent positions.
         reference_numerics = self.zeva_numerical_contract == "zeva_ego_v1"
+        precise_numerics = reference_numerics or self.zeva_numerical_contract == "zeva_main_v1"
         # EAP supervises the original normalized full-horizon target. The
         # WAM flow targets retain the model dtype and native noise formula.
-        prior_target = clean_action.to(self.device, dtype=torch.float32) if reference_numerics else None
+        prior_target = clean_action.to(self.device, dtype=torch.float32) if precise_numerics else None
         clean_action = clean_action.to(self.device, dtype=self.torch_dtype)
         noise = torch.randn_like(clean_action) if noise is None else noise.to(clean_action)
         timestep = self.train_action_scheduler.sample_training_t(
@@ -1544,7 +1551,7 @@ class FastWAM(torch.nn.Module):
         if exact_zeva and (self.zeva_training_stage == "policy_injection" or cross_attempt):
             if zeva_prior_mean is None or zeva_prior_std is None:
                 raise ValueError("exact Zeva training requires action-prior outputs")
-            prior_target = prior_target if reference_numerics else clean_action.float()
+            prior_target = prior_target if precise_numerics else clean_action.float()
             prior_valid = None if reference_numerics else action_valid
             prior_loss = gaussian_prior_nll(
                 prior_target,
@@ -2250,6 +2257,16 @@ class FastWAM(torch.nn.Module):
             "foundation_mode": self.zeva_foundation_mode,
             "foundation_checkpoint_required": self.zeva_requires_foundation_checkpoint,
         }
+        if getattr(self, "zeva_profile", None) == "main_observed":
+            from fastwam.zeva_main_contract import main_profile_metadata
+            from fastwam.zeva.main_data import inherit_main_artifact, validate_main_artifact
+            artifact = inherit_main_artifact(getattr(self, "zeva_main_artifact_metadata", {}))
+            if not artifact:
+                raise ValueError("main checkpoint requires complete success-data and episode-split metadata")
+            training_metadata.update(artifact)
+            training_metadata.update(main_profile_metadata(getattr(self, "zeva_success_data_identity", None)))
+            training_metadata["numerical_contract"] = self.zeva_numerical_contract
+            validate_main_artifact(training_metadata)
         if getattr(self.zeva_behavior_prefix_adapter.config, "effect_source", None) == "current_prediction":
             training_metadata["numerical_contract"] = self.zeva_numerical_contract
         if getattr(self, "zeva_foundation_parent_identity", None) is not None:
@@ -2310,6 +2327,9 @@ class FastWAM(torch.nn.Module):
         from fastwam.zeva.checkpoint import JOINT_FOUNDATION_SCHEMA, checkpoint_foundation_mode
         payload = torch.load(path, map_location="cpu", weights_only=False)
         checkpoint_foundation_mode(payload)
+        if addon_payload.get("profile") == "main_observed":
+            from fastwam.zeva.main_data import validate_main_artifact
+            validate_main_artifact(payload, expected=addon_payload)
         expected = {
             "schema": JOINT_FOUNDATION_SCHEMA, "training_recipe": addon_payload["training_recipe"],
             "step": addon_payload["step"],
@@ -2326,17 +2346,29 @@ class FastWAM(torch.nn.Module):
         for name in ("foundation_parent_identity", "pim_memory_contract", "numerical_contract"):
             if name in addon_payload:
                 expected[name] = addon_payload[name]
+        if addon_payload.get("profile") == "main_observed":
+            for name in ("profile", "reference_commit", "artifact_lineage", "memory_semantics",
+                         "success_data_identity", "episode_splits", "data_role"):
+                expected[name] = addon_payload[name]
         for name, value in expected.items():
             if payload.get(name) != value:
                 raise ValueError(f"joint foundation checkpoint lineage mismatch: {name}")
         if ("proprio_encoder" in payload) != (self.proprio_encoder is not None):
             raise ValueError("joint foundation checkpoint proprio architecture mismatch")
+        _validate_complete_state_dict(self.mot, payload.get("mot"), name="mot")
+        if self.proprio_encoder is not None:
+            _validate_complete_state_dict(self.proprio_encoder, payload.get("proprio_encoder"), name="proprio_encoder")
         if getattr(self, "zeva_trainable_precision", None) == "float32":
             # Preserve a trained FP32 parent even when Stage2B freezes it.
             # Otherwise loading into a BF16 destination erases small updates.
             with torch.no_grad():
                 for parameter in self.zeva_foundation_parameters():
                     parameter.data = parameter.data.float()
+        if (getattr(self, "zeva_profile", None) == "main_observed"
+                and getattr(self, "zeva_freeze_readout_on_load", False)
+                and not hasattr(self, "_main_frozen_readout_snapshot")):
+            from fastwam.zeva.frozen_readout import FrozenReadoutSnapshot
+            self._main_frozen_readout_snapshot = FrozenReadoutSnapshot(self.video_expert)
         self.mot.load_state_dict(payload["mot"], strict=True)
         if self.proprio_encoder is not None:
             self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
@@ -2361,6 +2393,7 @@ class FastWAM(torch.nn.Module):
             pim_memory_contract=getattr(self, "zeva_pim_memory_contract", None),
             allow_pim_compression_override=getattr(self, "zeva_allow_pim_compression_override", False),
             loaded_foundation_identity=getattr(self, "zeva_foundation_identity", None),
+            main_artifact_metadata=getattr(self, "zeva_main_artifact_metadata", None),
         )
         if load_scope == "policy_injection" and checkpoint_requires_foundation(payload):
             self.zeva_foundation_parent_identity = {
@@ -2459,6 +2492,10 @@ class FastWAM(torch.nn.Module):
         # addon bundle's provenance; a later addon must restore its own pair.
         self.zeva_foundation_identity = None
         self.zeva_foundation_parent_identity = None
+        # An explicit successful base reload establishes a new frozen
+        # retrieval source. Do not retain a snapshot from a previous bundle.
+        if hasattr(self, "_main_frozen_readout_snapshot"):
+            del self._main_frozen_readout_snapshot
         return payload
 
     def forward(self, *args, **kwargs):

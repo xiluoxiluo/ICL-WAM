@@ -71,7 +71,12 @@ class CachedCTELatentWindowDataset(Dataset):
             )
 
         self.manifest: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if self.manifest.get("profile") == "main_observed":
+            from .main_data import validate_main_artifact
+            validate_main_artifact(self.manifest)
         self.rows: list[dict[str, Any]] = json.loads(index_path.read_text(encoding="utf-8"))
+        from .main_data import validate_main_episode_ids
+        validate_main_episode_ids(self.manifest, (row["episode_id"] for row in self.rows))
 
         actual_format = str(self.manifest.get("format"))
         if actual_format not in CACHE_FORMAT_ALIASES:

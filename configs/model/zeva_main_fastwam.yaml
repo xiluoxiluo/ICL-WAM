@@ -1,0 +1,51 @@
+defaults:
+  - zeva_fastwam
+  - _self_
+
+zeva:
+  profile: main_observed
+  reference_commit: 17ca9fa0c68dca1fc7915dd6433de70a100e93a1
+  training_recipe: main_frozen_parent
+  foundation_mode: frozen
+  offline:
+    success_manifest_path: null
+    validation_fraction: 0.1
+    split_seed: 42
+  cte:
+    # Released main runtime also encodes completed RGB boundaries with Wan VAE.
+    # Wan2.2 channels/resolution and Joint14 are the FastWAM adaptation.
+    input_type: wan_vae_latent
+    image_channels: 48
+    latent_cache_path: null
+  memory:
+    memory_semantics: completed_effect_trace
+    cross_attempt_only: false
+    pim_retrieval_mode: phase
+    bit_size: 4
+    pim_top_k: 4
+    pim_max_entries: 64
+    merge_threshold: 0.85
+    beta_phase: 0.5
+    beta_effect: 0.5
+  prompt:
+    pim_variant: legacy
+    numerical_contract: zeva_main_v1
+    # The public main MCE has no internal dropout. Prepared-data regularization
+    # below consumes the declared context/support rates once, before the MCE.
+    pim_context_dropout: 0.0
+    pim_support_dropout: 0.0
+  adapter:
+    pim_variant: legacy
+    numerical_contract: zeva_main_v1
+    prefix_layout: legacy_merged
+    effect_source: latest_completed
+    prior_variant: legacy_bit
+    initialization: legacy_xavier
+  task_context:
+    mode: static
+    static_episode_cache_path: null
+  prepared_stage2:
+    pim_cache_path: null
+    validation_pim_cache_path: null
+    context_dropout: 0.2
+    support_dropout: 0.2

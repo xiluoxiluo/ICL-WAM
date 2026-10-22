@@ -47,6 +47,11 @@ from scripts.build_zeva_robotwin_cache import (  # noqa: E402
 )
 from fastwam.zeva.prepared_stage2 import PIM_CACHE_FORMAT  # noqa: E402
 from fastwam.zeva.checkpoint import checkpoint_sha256  # noqa: E402
+from fastwam.zeva.cache import _validate_v4_temporal_row  # noqa: E402
+from fastwam.zeva.main_data import (  # noqa: E402
+    inherit_main_artifact, is_main_profile, normalize_main_dataset_paths, select_main_success_rows,
+    validate_main_artifact, validate_main_episode_ids,
+)
 from fastwam.zeva.schemas import CacheManifest, sha256_file  # noqa: E402
 
 
@@ -101,6 +106,17 @@ def _load_phase_cache_metadata(root: Path) -> tuple[CacheManifest, list[dict[str
     rows = json.loads(index_path.read_text(encoding="utf-8"))
     if not isinstance(rows, list) or not rows:
         raise ValueError("phase/effect cache index is empty")
+    validate_main_episode_ids(manifest.to_dict(), (row["episode_id"] for row in rows))
+    previous_by_episode: dict[str, tuple[int, int]] = {}
+    for index, row in enumerate(rows):
+        _validate_v4_temporal_row(row, index)
+        episode_id = str(row["episode_id"])
+        order = (int(row["raw_step"]), 0 if row["record_type"] == "effect" else 1)
+        if episode_id in previous_by_episode and order <= previous_by_episode[episode_id]:
+            raise ValueError("PIM cache requires chronological unique effects before queries at the same boundary")
+        previous_by_episode[episode_id] = order
+        if row["record_type"] == "effect" and int(row["end_raw_step"]) - int(row["start_raw_step"]) != 16:
+            raise ValueError("observed PIM effects must contain a complete 16-control window")
     return manifest, rows
 
 
@@ -221,7 +237,7 @@ def _build_staging(
             raise ValueError(f"unsupported cache record_type {record_type!r}")
     if qi != phase_count or ei != effect_count:
         raise RuntimeError(f"staging counts mismatch: q={qi}/{phase_count}, e={ei}/{effect_count}")
-    if len(task_ids) != 50:
+    if manifest.profile != "main_observed" and len(task_ids) != 50:
         raise RuntimeError(f"formal RoboTwin cache expected 50 semantic tasks, got {len(task_ids)}")
 
     for array in (q_window, q_raw, q_ep, q_task, q_phase, q_bit, q_bit_mask, e_phase, e_effect, e_ep, e_task):
@@ -229,6 +245,7 @@ def _build_staging(
     (staging / "episode_ids.json").write_text(json.dumps(episode_ids) + "\n", encoding="utf-8")
     (staging / "task_ids.json").write_text(json.dumps(task_ids) + "\n", encoding="utf-8")
     stage_manifest = {
+        **inherit_main_artifact(manifest.to_dict()),
         "phase_count": phase_count,
         "effect_count": effect_count,
         "episode_count": len(episode_ids),
@@ -295,6 +312,18 @@ def _stable_topk_memorybank(scores: torch.Tensor, k: int) -> tuple[torch.Tensor,
     return values, indices
 
 
+def _main_candidate_mask(staging: Path, effect_episode_indices: np.ndarray) -> np.ndarray:
+    """Validation outcomes can condition their own causal BIT, never the bank."""
+    metadata = json.loads((staging / "manifest.json").read_text())
+    if metadata.get("profile") != "main_observed":
+        return np.ones(len(effect_episode_indices), dtype=bool)
+    validate_main_artifact(metadata)
+    episode_ids = json.loads((staging / "episode_ids.json").read_text())
+    training_ids = set(metadata["episode_splits"]["train"])
+    episode_allowed = np.asarray([episode_id in training_ids for episode_id in episode_ids], dtype=bool)
+    return episode_allowed[np.asarray(effect_episode_indices)]
+
+
 def _prepare_rank(
     *,
     staging: Path,
@@ -339,6 +368,7 @@ def _prepare_rank(
     e_effect = np.load(staging / "e_effect.npy", mmap_mode="r")
     e_ep = np.load(staging / "e_episode_index.npy", mmap_mode="r")
     e_task = np.load(staging / "e_task_index.npy", mmap_mode="r")
+    candidate_allowed = _main_candidate_mask(staging, e_ep)
 
     out = {
         "window_index": _open_memmap(shard_dir / "window_index.npy", np.int64, (n,)),
@@ -366,7 +396,7 @@ def _prepare_rank(
     local_tasks = np.unique(np.asarray(q_task[start:end]))
     progress = tqdm(local_tasks.tolist(), desc=f"PIM retrieve rank {rank}", unit="task", position=rank, dynamic_ncols=True)
     for task in progress:
-        candidate_idx = np.flatnonzero(np.asarray(e_task) == task)
+        candidate_idx = np.flatnonzero((np.asarray(e_task) == task) & candidate_allowed)
         local_rel = np.flatnonzero(np.asarray(q_task[start:end]) == task)
         if len(candidate_idx) < top_k:
             raise RuntimeError(f"task {task} has fewer than top_k={top_k} effect candidates")
@@ -419,6 +449,7 @@ def _validate_random(
     e_effect = np.load(staging / "e_effect.npy", mmap_mode="r")
     e_ep = np.load(staging / "e_episode_index.npy", mmap_mode="r")
     e_task = np.load(staging / "e_task_index.npy", mmap_mode="r")
+    candidate_allowed = _main_candidate_mask(staging, e_ep)
     total = len(q_phase)
     generator = torch.Generator().manual_seed(seed)
     chosen = torch.randperm(total, generator=generator)[: min(samples, total)].tolist()
@@ -439,7 +470,7 @@ def _validate_random(
     for index in chosen:
         task = int(q_task[index])
         episode = int(q_ep[index])
-        candidate = np.flatnonzero((np.asarray(e_task) == task) & (np.asarray(e_ep) != episode))
+        candidate = np.flatnonzero((np.asarray(e_task) == task) & (np.asarray(e_ep) != episode) & candidate_allowed)
         phase = torch.from_numpy(np.array(e_phase[candidate], copy=True)).float()
         effect = torch.from_numpy(np.array(e_effect[candidate], copy=True)).float()
         query = F.normalize(torch.from_numpy(np.array(q_phase[index], copy=True)).float(), dim=-1)
@@ -476,6 +507,7 @@ def _validate_random(
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    normalize_main_dataset_paths(cfg)
     info = _init_distributed()
     try:
         zeva = cfg.model.zeva
@@ -514,6 +546,9 @@ def main(cfg: DictConfig) -> None:
         if manifest.cte_checkpoint_sha256 != cte_sha:
             raise ValueError("phase/effect cache CTE checkpoint differs from prepared-PIM config")
         cte_payload = torch.load(cte_path, map_location="cpu", weights_only=False)
+        if is_main_profile(cfg):
+            validate_main_artifact(cte_payload)
+            validate_main_artifact(manifest.to_dict(), cte_payload)
         cte_identity = cte_payload.get("semantic_task_identity") or {}
         if str(cte_identity.get("sha256")) != semantic_sha:
             raise ValueError("semantic task map differs from the CTE checkpoint used by phase/effect cache")
@@ -530,6 +565,11 @@ def main(cfg: DictConfig) -> None:
             _manifest_rank0, rows = _load_phase_cache_metadata(phase_root)
             if _manifest_rank0.to_dict() != manifest.to_dict():
                 raise RuntimeError("rank-0 phase/effect manifest changed during staging")
+            if is_main_profile(cfg):
+                success_rows, expected_main = select_main_success_rows(rows, cfg)
+                if len(success_rows) != len(rows):
+                    raise ValueError("main PIM preparation refuses unsuccessful offline source episodes")
+                validate_main_artifact(manifest.to_dict(), expected_main)
             if work_root.exists():
                 shutil.rmtree(work_root)
             staging.mkdir(parents=True, exist_ok=True)
@@ -586,6 +626,11 @@ def main(cfg: DictConfig) -> None:
                 seed=int(cfg.get("seed", 42)),
             )
             final_manifest = {
+                **inherit_main_artifact(manifest.to_dict()),
+                **({"offline_history_recipe": "success_demonstration_leave_one_episode_out_v1",
+                    "reference_training_recipe_complete": False,
+                    "candidate_split": "train",
+                    "query_splits": ["train", "validation"]} if is_main_profile(cfg) else {}),
                 "format": PIM_CACHE_FORMAT,
                 "retrieval_mode": "phase",
                 "history_semantics": "full_episode_prefix",

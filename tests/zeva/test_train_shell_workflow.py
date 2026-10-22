@@ -12,7 +12,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKFLOW = ROOT / "scripts/train"
+WORKFLOW = ROOT / "scripts/train_ego"
 
 
 def _write_json(path: Path, value) -> None:

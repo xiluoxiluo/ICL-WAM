@@ -12,6 +12,7 @@ prevents the YAML knobs from becoming dead configuration again.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import os
 
 import hydra
@@ -35,6 +36,12 @@ from fastwam.zeva.prepared_stage2 import (
 )
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.static_task_context import task_context_identity
+from fastwam.zeva.main_data import (
+    inherit_main_artifact, is_main_profile, normalize_main_dataset_paths,
+    validate_main_artifact, validate_main_source,
+)
+from fastwam.zeva.main_prepared import split_main_prepared_dataset
+from fastwam.zeva_main_contract import validate_main_model_config
 from fastwam.zeva.cross_attempt_cache import (CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT,
                                             LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT,
                                             ALL_CTE_FRAMES, COMPLETE_POLICY_WINDOWS, LEGACY_PAIRING_METRIC, HISTORY_KINDS)
@@ -67,6 +74,13 @@ def _resolve_process_device() -> torch.device:
 
 
 def _dropout_config(cfg: DictConfig) -> PIMTrainingDropoutConfig:
+    if is_main_profile(cfg):
+        prepared = cfg.model.zeva.prepared_stage2
+        return PIMTrainingDropoutConfig(
+            context_dropout=float(prepared.get("context_dropout", 0.2)),
+            support_dropout=float(prepared.get("support_dropout", 0.2)),
+            seed=int(cfg.seed),
+        )
     prompt = cfg.model.zeva.prompt
     return PIMTrainingDropoutConfig(
         context_dropout=float(prompt.get("pim_context_dropout", 0.2)),
@@ -80,15 +94,16 @@ def _print_pim_dropout_probe(
     config: PIMTrainingDropoutConfig,
     *,
     count: int = 256,
+    query_indices=None,
 ) -> None:
     """Verify empty/sparse/full occupancy without decoding any training video."""
-    probe = min(int(count), len(pim_cache))
+    probe = min(int(count), len(pim_cache) if query_indices is None else len(query_indices))
     if probe <= 0:
         raise ValueError("Stage-2B prepared PIM cache is empty")
     histogram: dict[int, int] = {}
     context_drops = 0
     for index in range(probe):
-        prepared = pim_cache.get(index)
+        prepared = pim_cache.get(index if query_indices is None else int(query_indices[index]))
         result = apply_pim_training_dropout(
             phases=prepared["pim_phases"],
             effects=prepared["pim_effects"],
@@ -131,6 +146,7 @@ def _print_cross_attempt_probe(pim_cache: PreparedPIMCache, *, seed: int, count:
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    normalize_main_dataset_paths(cfg)
     if not torch.cuda.is_available():
         raise RuntimeError("Zeva Stage-2 requires CUDA")
     device = _resolve_process_device()
@@ -142,6 +158,13 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("Stage-2 requires action_video_freq_ratio=4")
 
     zeva = cfg.model.zeva
+    main_observed = is_main_profile(cfg)
+    if main_observed:
+        validate_main_model_config(zeva)
+        if len(cfg.data.train.dataset_dirs) != 1:
+            raise ValueError("main prepared pipeline currently requires one source dataset root")
+        if float(cfg.data.train.get("val_set_proportion", -1)) != 0:
+            raise ValueError("main success manifest owns the fixed holdout; set data.train.val_set_proportion=0")
     predictive = str(zeva.adapter.get("effect_source", "latest_completed")) == "current_prediction"
     cross_attempt = str(zeva.prompt.get("pim_variant", "legacy")) == "cross_attempt"
     if cross_attempt != (str(zeva.adapter.get("pim_variant", "legacy")) == "cross_attempt"):
@@ -220,6 +243,20 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("BIT size must match prompt brief_length")
 
     cte_payload = torch.load(cte_ckpt, map_location="cpu", weights_only=False)
+    if main_observed:
+        validate_main_artifact(cte_payload)
+        validate_main_source(cfg, cte_payload)
+        if cte_payload["data_role"] != "train":
+            raise ValueError("main CTE must have been optimized on the training episode split only")
+        phase_metadata = json.loads(phase_manifest_path.read_text())
+        validate_main_artifact(phase_metadata, cte_payload)
+        if phase_metadata["data_role"] != "all":
+            raise ValueError("main phase cache must cover both successful train and heldout query episodes")
+        for artifact_path in (bank_path, head_path, readout_path):
+            artifact = torch.load(artifact_path, map_location="cpu", weights_only=False)
+            validate_main_artifact(artifact, cte_payload)
+            if artifact["data_role"] != "train":
+                raise ValueError(f"main bank/retrieval training must exclude heldout episodes: {artifact_path}")
     video_size = [int(v) for v in cfg.data.train.video_size]
     boundary = None
     if predictive:
@@ -264,7 +301,7 @@ def main(cfg: DictConfig) -> None:
             "bit_size": bit_size,
             "cte_checkpoint_sha256": cte_sha,
             "dataset_stats_sha256": stats_sha,
-            "dataset_path": str(Path(cfg.data.train.dataset_dirs[0]).expanduser().resolve()) if predictive else str(cfg.data.train.dataset_dirs[0]),
+            "dataset_path": str(Path(cfg.data.train.dataset_dirs[0]).expanduser().resolve()) if predictive or main_observed else str(cfg.data.train.dataset_dirs[0]),
             "semantic_task_map_sha256": semantic_sha,
             "phase_cache_manifest_sha256": sha256_file(phase_manifest_path),
             "phase_cache_index_sha256": sha256_file(phase_index_path),
@@ -297,6 +334,10 @@ def main(cfg: DictConfig) -> None:
             if uniform_indexing == "reference_round":
                 pim_expected.update({"uniform_indexing": "reference_round", "history_compression": "uniform"})
     pim = PreparedPIMCache(pim_root, expected=pim_expected)
+    if main_observed:
+        validate_main_artifact(pim.manifest, cte_payload)
+        if pim.manifest.get("candidate_split") != "train":
+            raise ValueError("main PIM candidates must come exclusively from training demonstrations")
     if predictive and pim._cross_attempt.splits != boundary.splits:
         raise ValueError("prepared PIM cache must use the exact CTE/boundary episode split")
     if predictive:
@@ -306,6 +347,10 @@ def main(cfg: DictConfig) -> None:
             query_scope=query_scope, pairing_metric=pairing_metric,
         )
     static_context = StaticEpisodeContextCache(static_path)
+    if main_observed:
+        validate_main_artifact(static_context.metadata, cte_payload)
+        if static_context.metadata["data_role"] != "all":
+            raise ValueError("main static context must cover both train and heldout queries")
     static_expected = {
         "cte_checkpoint_sha256": cte_sha,
         "dataset_stats_sha256": stats_sha,
@@ -360,7 +405,12 @@ def main(cfg: DictConfig) -> None:
     dataset = PreparedZevaStage2Dataset(base, pim, static_context, history_schedule=history_schedule)
     validation_dataset = None
     validation_path = zeva.prepared_stage2.get("validation_pim_cache_path")
-    if validation_path not in (None, "", "None", "null"):
+    if main_observed:
+        if (validation_path not in (None, "", "None", "null")
+                and Path(str(validation_path)).expanduser().resolve() != pim_root):
+            raise ValueError("main train/validation views share the same prepared PIM artifact and fixed episode split")
+        dataset, validation_dataset = split_main_prepared_dataset(dataset)
+    elif validation_path not in (None, "", "None", "null"):
         if not cross_attempt:
             raise ValueError("explicit prepared validation split requires the cross-attempt schema")
         validation_pim = PreparedPIMCache(str(validation_path), expected={**pim_expected, "split": "validation"})
@@ -407,7 +457,7 @@ def main(cfg: DictConfig) -> None:
             )
         if dropout is not None:
             if int(os.environ.get("RANK", "0")) == 0:
-                _print_pim_dropout_probe(pim, dropout)
+                _print_pim_dropout_probe(pim, dropout, query_indices=getattr(dataset, "indices", None))
             dataset = PIMTrainingDropoutDataset(dataset, dropout)
 
     model = instantiate(
@@ -416,6 +466,9 @@ def main(cfg: DictConfig) -> None:
         device=str(device),
     )
     model.load_checkpoint(str(base_ckpt))
+    if main_observed:
+        model.zeva_success_data_identity = dict(cte_payload["success_data_identity"])
+        model.zeva_main_artifact_metadata = inherit_main_artifact(cte_payload)
     if task_language:
         from fastwam.zeva.task_language import task_language_identity
 

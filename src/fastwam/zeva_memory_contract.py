@@ -8,10 +8,37 @@ import math
 
 LEGACY_PIM_MEMORY_CONTRACT_SCHEMA = "iclwam_cross_attempt_pim_memory_v1"
 PIM_MEMORY_CONTRACT_SCHEMA = "iclwam_cross_attempt_pim_memory_v2"
+MAIN_PIM_MEMORY_CONTRACT_SCHEMA = "iclwam_main_observed_pim_v1"
+
+
+def main_pim_memory_contract(config: Mapping) -> dict:
+    if config.get("cross_attempt_only", False):
+        raise ValueError("original Zeva PIM accepts completed current-attempt interactions")
+    capacity = config.get("pim_max_entries", config.get("capacity", 64))
+    top_k = config.get("pim_top_k", config.get("top_k", 4))
+    bit_size = config.get("bit_size", 4)
+    if any(type(x) is not int or x < 1 for x in (capacity, top_k, bit_size)) or top_k > capacity:
+        raise ValueError("invalid main PIM capacity/top_k/BIT size")
+    threshold = float(config.get("merge_threshold", 0.85))
+    phase = float(config.get("beta_phase", config.get("phase_weight", 0.5)))
+    effect = float(config.get("beta_effect", config.get("effect_weight", 0.5)))
+    if (not all(math.isfinite(x) for x in (threshold, phase, effect))
+            or not -1 <= threshold <= 1 or min(phase, effect) < 0 or phase + effect <= 0):
+        raise ValueError("invalid main similarity merge parameters")
+    if config.get("pim_retrieval_mode", "phase") != "phase":
+        raise ValueError("original Zeva PIM retrieves by current phase")
+    return {"schema": MAIN_PIM_MEMORY_CONTRACT_SCHEMA,
+            "memory_semantics": "completed_effect_trace", "capacity": capacity,
+            "top_k": top_k, "bit_size": bit_size, "merge_threshold": threshold,
+            "phase_weight": phase / (phase + effect), "effect_weight": effect / (phase + effect),
+            "retrieval": "phase", "commit_timing": "completed_window",
+            "episode_scoped": True, "cross_attempt_only": False}
 
 
 def pim_memory_contract(config: Mapping) -> dict | None:
     """Resolve only behavior-relevant memory settings; legacy defaults stay explicit."""
+    if config.get("memory_semantics") == "completed_effect_trace":
+        return main_pim_memory_contract(config)
     if not bool(config.get("cross_attempt_only", False)):
         return None
     compression = str(config.get("compression", "uniform"))
@@ -57,6 +84,11 @@ def pim_memory_contract(config: Mapping) -> dict | None:
 
 
 def validate_pim_memory_contract(contract: dict) -> dict:
+    if isinstance(contract, dict) and contract.get("schema") == MAIN_PIM_MEMORY_CONTRACT_SCHEMA:
+        canonical = main_pim_memory_contract(contract)
+        if canonical != contract:
+            raise ValueError("main PIM contract contains inconsistent or unversioned fields")
+        return canonical
     if not isinstance(contract, dict) or contract.get("schema") not in {PIM_MEMORY_CONTRACT_SCHEMA, LEGACY_PIM_MEMORY_CONTRACT_SCHEMA}:
         raise ValueError("Missing or unsupported PIM memory contract")
     if contract["schema"] == PIM_MEMORY_CONTRACT_SCHEMA and not {"commit_timing", "storage_device"} <= contract.keys():
@@ -91,6 +123,8 @@ def checkpoint_pim_memory_contract(payload: dict) -> dict | None:
     # Old full training configs establish the historical uniform/floor policy.
     # Do not accept unmarked new compression semantics as an old checkpoint.
     if from_config is not None:
+        if from_config["schema"] == MAIN_PIM_MEMORY_CONTRACT_SCHEMA:
+            raise ValueError("main observed-effect checkpoint must record its PIM memory contract")
         if (from_config["schema"] != LEGACY_PIM_MEMORY_CONTRACT_SCHEMA
                 or (from_config["compression"], from_config["uniform_indexing"]) != ("uniform", "legacy_floor")):
             raise ValueError("Checkpoint must explicitly record its non-legacy PIM memory contract")

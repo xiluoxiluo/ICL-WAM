@@ -1,9 +1,9 @@
-"""Zeva-aligned stochastic PIM conditioning for Stage-2B training.
+"""Local implementation of the context/support dropout declared by Zeva main.
 
-The released Zeva PIM adapter does not train on a permanently full top-k
-memory.  It independently drops the whole persistent context and individual
-support entries so the frozen policy sees empty, sparse, and full memory
-states.  This module keeps that behavior explicit and deterministic per sample,
+The release specifies both dropout rates but omits the complete data builder.
+Here the whole persistent context and individual support entries are dropped
+so the frozen policy sees empty, sparse, and full memory states. This local
+implementation is explicit and deterministic per sample,
 which is important for multi-worker/multi-rank Stage-2 training.
 """
 
@@ -102,6 +102,18 @@ class PIMTrainingDropoutDataset(torch.utils.data.Dataset):
 
     def __len__(self) -> int:
         return len(self.dataset)
+
+    @property
+    def pim(self):
+        return self.dataset.pim
+
+    @property
+    def static_context(self):
+        return self.dataset.static_context
+
+    @property
+    def split_identity(self):
+        return getattr(self.dataset, "split_identity", None)
 
     def __getitem__(self, index: int):
         sample = dict(self.dataset[index])

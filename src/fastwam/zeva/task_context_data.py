@@ -12,7 +12,7 @@ from .static_task_context import (
 from .task_context import TaskContextBank
 
 
-def iter_demo_trajectories(dataset):
+def iter_demo_trajectories(dataset, *, allowed_episode_ids=None):
     """Join valid four-action boundaries, one full demonstration at a time.
 
     The source is ZevaRobotWinDataset. Overlapping windows are deduplicated;
@@ -24,6 +24,8 @@ def iter_demo_trajectories(dataset):
         if "episode_id" not in sample or "episode_step" not in sample:
             raise ValueError("behavior bank requires real episode IDs and raw-step coordinates")
         episode = sample["episode"]
+        if allowed_episode_ids is not None and str(episode.episode_id) not in allowed_episode_ids:
+            continue
         if episode.episode_step % 4 == 0:
             grouped[str(episode.episode_id)].append((episode.episode_step, index))
     for episode_id in sorted(grouped):
@@ -73,13 +75,13 @@ def iter_demo_trajectories(dataset):
 
 
 @torch.no_grad()
-def build_behavior_bank(dataset, cte, policy, *, frame_encoder=None, temperature=0.07, metadata=None):
+def build_behavior_bank(dataset, cte, policy, *, frame_encoder=None, temperature=0.07, metadata=None, allowed_episode_ids=None):
     """Pair a demonstrated CTE trajectory with its clean initial policy readout."""
     cte.eval().requires_grad_(False)
     policy.eval().requires_grad_(False)
     device = next(cte.parameters()).device
     entries, readouts = [], []
-    for demo in iter_demo_trajectories(dataset):
+    for demo in iter_demo_trajectories(dataset, allowed_episode_ids=allowed_episode_ids):
         frames = demo["frames"].unsqueeze(0)
         initial_readout = policy.extract_task_context_readout(
             frames[:, 0], demo["context"].unsqueeze(0), demo["context_mask"].unsqueeze(0),
@@ -105,3 +107,24 @@ def build_behavior_bank(dataset, cte, policy, *, frame_encoder=None, temperature
         },
     )
     return bank, torch.stack(readouts)
+
+
+def split_main_behavior_artifacts(bank: TaskContextBank, readouts: torch.Tensor):
+    """Keep held-out initial readouts separate from retrievable prototypes."""
+    from .main_data import validate_main_artifact, validate_main_episode_ids
+    if bank.metadata.get("profile") != "main_observed":
+        return bank, readouts, {}
+    validate_main_artifact(bank.metadata)
+    validate_main_episode_ids(bank.metadata, (entry["episode_id"] for entry in bank.entries))
+    train_ids = set(bank.metadata["episode_splits"]["train"])
+    train_indices = [i for i, entry in enumerate(bank.entries) if entry["episode_id"] in train_ids]
+    validation_indices = [i for i, entry in enumerate(bank.entries) if entry["episode_id"] not in train_ids]
+    entries = [bank.entries[i] for i in train_indices]
+    train_bank = TaskContextBank(entries, key_dim=bank.key_dim, value_dim=bank.value_dim,
+        temperature=bank.temperature, metadata={**bank.metadata, "data_role": "train", "num_episodes": len(entries)})
+    validation = {
+        "validation_episode_ids": [bank.entries[i]["episode_id"] for i in validation_indices],
+        "validation_task_ids": [str(bank.entries[i]["task_id"]) for i in validation_indices],
+        "validation_readouts": readouts[validation_indices].clone(),
+    }
+    return train_bank, readouts[train_indices].clone(), validation

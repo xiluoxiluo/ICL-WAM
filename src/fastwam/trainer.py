@@ -46,6 +46,11 @@ def _zeva_stage2a_schedule(cfg, recipe: str) -> str:
 
 
 class Wan22Trainer:
+    @property
+    def strict_zeva_training(self):
+        """Versioned main/Ego recipes share precision and resumable DDP machinery."""
+        return bool(getattr(self, "predictive_zeva", False) or getattr(self, "main_zeva", False))
+
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
         self.train_dataset = train_dataset
@@ -85,31 +90,37 @@ class Wan22Trainer:
             logger.info("Zeva training stage: %s", self.zeva_training_stage)
         self.zeva_training_recipe = str(getattr(self.model, "zeva_training_recipe", "frozen_parent"))
         self.ego_curriculum = self.zeva_training and self.zeva_training_recipe in {"ego_adapter_warmup", "ego_joint_warmup"}
-        self.joint_foundation_training = self.zeva_training and self.zeva_training_recipe in {"ego_joint_parent", "ego_joint_warmup"}
+        self.joint_foundation_training = self.zeva_training and self.zeva_training_recipe in {"ego_joint_parent", "ego_joint_warmup", "main_joint_parent", "main_joint_pim"}
+        self.main_zeva = self.zeva_training and getattr(self.model, "zeva_profile", None) == "main_observed"
         self.predictive_zeva = self.zeva_training and getattr(
             getattr(getattr(self.model, "zeva_behavior_prefix_adapter", None), "config", None),
             "effect_source", "latest_completed",
         ) == "current_prediction"
         self.zeva_stage2a_schedule = (
             _zeva_stage2a_schedule(cfg, self.zeva_training_recipe)
-            if self.predictive_zeva and self.zeva_training_stage == "policy_injection" else None
+            if self.strict_zeva_training and self.zeva_training_stage == "policy_injection" else None
         )
         self.zeva_optimizer_sharding = optimizer_sharding_mode(cfg.get("zeva_optimizer_sharding", "none"))
         self.optimizer_betas = optimizer_betas(cfg.get("optimizer_betas"), predictive=self.predictive_zeva)
-        if self.zeva_optimizer_sharding != "none" and not self.predictive_zeva:
-            raise ValueError("zero1 is supported only for predictive Zeva Stage2 training")
-        if self.predictive_zeva and self.mixed_precision == "fp16":
-            raise ValueError("Predictive Stage2 supports bf16/no precision; fp16 scaler state is not part of its checkpoint contract")
+        if self.zeva_optimizer_sharding != "none" and not self.strict_zeva_training:
+            raise ValueError("zero1 requires a versioned main or predictive Zeva Stage2 recipe")
+        if self.strict_zeva_training and self.mixed_precision == "fp16":
+            raise ValueError("Versioned Zeva Stage2 supports bf16/no precision; fp16 scaler state is not part of its checkpoint contract")
         self._zeva_data_identity = {}
-        if self.predictive_zeva:
+        if self.strict_zeva_training:
             for split, dataset in (("train", self.train_dataset), ("validation", self.val_dataset)):
                 if dataset is None:
-                    raise ValueError("Predictive Stage2 requires separate train and validation prepared datasets")
+                    raise ValueError("Versioned Zeva Stage2 requires separate train and validation prepared datasets")
                 self._zeva_data_identity[split] = {
                     "pim_manifest_sha256": checkpoint_sha256(dataset.pim.root / "manifest.json"),
                     "static_context_sha256": checkpoint_sha256(dataset.static_context.path),
                     "num_queries": len(dataset),
                 }
+                if self.main_zeva:
+                    split_identity = getattr(dataset, "split_identity", None)
+                    if not isinstance(split_identity, dict) or split_identity.get("split") != split:
+                        raise ValueError("main Stage2 requires the fixed episode-disjoint prepared dataset views")
+                    self._zeva_data_identity[split]["split_identity"] = split_identity
         self._zeva_resume_rng = None
         self.ego_warmup_steps = int(cfg.get("zeva_pim_warmup_steps", 500))
         self.ego_available_history_kinds = ()
@@ -124,7 +135,7 @@ class Wan22Trainer:
         self.accelerator = Accelerator(
             **({"gradient_accumulation_plugin": GradientAccumulationPlugin(
                 num_steps=self.gradient_accumulation_steps, sync_with_dataloader=False,
-            )} if self.predictive_zeva else {"gradient_accumulation_steps": self.gradient_accumulation_steps}),
+            )} if self.strict_zeva_training else {"gradient_accumulation_steps": self.gradient_accumulation_steps}),
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
             # Action-only training does not use the video output head or the
@@ -132,14 +143,14 @@ class Wan22Trainer:
             # while keeping a static trainable set across the LR-only warmup.
             kwargs_handlers=([DistributedDataParallelKwargs(
                 find_unused_parameters=True, broadcast_buffers=False, gradient_as_bucket_view=True,
-            )] if self.predictive_zeva else []),
+            )] if self.strict_zeva_training else []),
         )
         
         deepspeed_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
-        if self.predictive_zeva and self.accelerator.distributed_type not in {
+        if self.strict_zeva_training and self.accelerator.distributed_type not in {
             DistributedType.NO, DistributedType.MULTI_GPU, DistributedType.MULTI_CPU,
         }:
-            raise ValueError("Predictive checkpoints support ordinary DDP with none/zero1 Adam state, not DeepSpeed/FSDP")
+            raise ValueError("Versioned Zeva checkpoints support ordinary DDP with none/zero1 Adam state, not DeepSpeed/FSDP")
         if self.zeva_optimizer_sharding == "zero1" and self.accelerator.num_processes < 2:
             raise ValueError("zero1 requires ordinary DDP with at least two processes; use none for one process")
         deepspeed_config = getattr(deepspeed_plugin, "deepspeed_config", {}) or {}
@@ -163,11 +174,11 @@ class Wan22Trainer:
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         self._apply_dit_only_train_mode(self.model)
-        if self.predictive_zeva:
+        if self.strict_zeva_training:
             # Promote the destination before loading a FP32 Stage2A parent;
             # loading into bf16 first would irreversibly round its updates.
             self.model.prepare_zeva_training_precision()
-            logger.info("Predictive training uses FP32 trainable parameters/Adam states with %s autocast; frozen encoders retain their dtype",
+            logger.info("Versioned Zeva training uses FP32 trainable parameters/Adam states with %s autocast; frozen encoders retain their dtype",
                         self.mixed_precision)
         if self.zeva_training:
             if self.zeva_training_stage == "policy_injection":
@@ -181,7 +192,7 @@ class Wan22Trainer:
         if self.zeva_training:
             if self.zeva_training_stage == "policy_injection":
                 trainable_params = list(self.model.zeva_trainable_parameters())
-                if self.predictive_zeva:
+                if self.strict_zeva_training:
                     eap_params = list(self.model.zeva_behavior_prefix_adapter.policy_injection_parameters())
                     optimizer_params = [{"params": eap_params, "lr": self.learning_rate, "name": "eap"}]
                     if self.joint_foundation_training:
@@ -190,7 +201,7 @@ class Wan22Trainer:
                             raise ValueError("zeva_foundation_learning_rate must be finite and positive")
                         optimizer_params.append({"params": self.model.zeva_foundation_parameters(),
                                                  "lr": foundation_lr, "name": "foundation"})
-                    logger.info("Predictive Stage2A: %s from the first update; effective batch=%d",
+                    logger.info("Zeva Stage2A: %s; effective batch=%d",
                                 "foundation+EAP" if self.joint_foundation_training else "EAP with frozen foundation",
                                 self.batch_size * self.gradient_accumulation_steps * self.accelerator.num_processes)
                 else:
@@ -241,6 +252,14 @@ class Wan22Trainer:
                     logger.info(
                         "PIM LR multipliers: prompt_encoder=5.0 prefix_project=5.0 pim_gate=1.0"
                     )
+                    if self.main_zeva and self.joint_foundation_training:
+                        foundation_params = self.model.zeva_foundation_parameters()
+                        trainable_params += foundation_params
+                        foundation_lr = float(cfg.get("zeva_foundation_learning_rate", 1e-6))
+                        if not math.isfinite(foundation_lr) or foundation_lr <= 0:
+                            raise ValueError("zeva_foundation_learning_rate must be finite and positive")
+                        optimizer_params.append({"params": foundation_params,
+                            "lr": foundation_lr, "name": "foundation"})
             else:
                 raise RuntimeError(f"unsupported Zeva training stage: {self.zeva_training_stage}")
             if not trainable_params:
@@ -271,6 +290,7 @@ class Wan22Trainer:
             raise ValueError("optimizer groups contain duplicate trainable parameters")
         self.optimizer = create_training_optimizer(
             optimizer_params, sharding=self.zeva_optimizer_sharding, predictive=self.predictive_zeva,
+            fp32_contract=self.main_zeva,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             betas=self.optimizer_betas,
@@ -419,7 +439,7 @@ class Wan22Trainer:
             seed=self.seed,
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
-            pad_to_global_batch=getattr(self, "predictive_zeva", False),
+            pad_to_global_batch=self.strict_zeva_training,
         )
         return DataLoader(
             dataset,
@@ -432,7 +452,7 @@ class Wan22Trainer:
             # Predictive inputs/candidate histories are deterministic. Keep
             # worker startup out of the model's flow-noise RNG on resume.
             generator=(torch.Generator().manual_seed(self.seed + self.accelerator.process_index)
-                       if getattr(self, "predictive_zeva", False) else None),
+                       if self.strict_zeva_training else None),
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
@@ -620,7 +640,7 @@ class Wan22Trainer:
             return
         resume_path = Path(str(resume))
         if resume_path.is_dir():
-            if getattr(self, "predictive_zeva", False):
+            if self.strict_zeva_training:
                 required = ("optimizer_scheduler.pt", "trainer_state.json", "COMPLETE",
                             f"rng_rank_{self.accelerator.process_index:04d}.pt")
                 missing = [name for name in required if not (resume_path / name).is_file()]
@@ -657,7 +677,7 @@ class Wan22Trainer:
                         f"checkpoint={checkpoint_stage}, current={self.zeva_training_stage}"
                     )
                 self.addon_weights_path = str(addon_path)
-                if getattr(self, "predictive_zeva", False):
+                if self.strict_zeva_training:
                     load_optimizer_checkpoint(
                         resume_path / "optimizer_scheduler.pt", self.optimizer, self.scheduler,
                         world_size=self.accelerator.num_processes, predictive=True,
@@ -673,7 +693,7 @@ class Wan22Trainer:
                     self.global_step = int(progress.get("global_step", 0))
                     self.epoch = int(progress.get("epoch", 0))
                     self.batch_in_epoch = int(progress.get("batch_in_epoch", 0))
-                if getattr(self, "predictive_zeva", False):
+                if self.strict_zeva_training:
                     if progress.get("data_identity") != self._zeva_data_identity:
                         raise ValueError("Predictive Stage2 resume train/validation cache identity changed")
                     if int(addon_payload.get("step", -1)) != self.global_step:
@@ -700,7 +720,7 @@ class Wan22Trainer:
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
         if self.zeva_training:
-            if getattr(self, "predictive_zeva", False):
+            if self.strict_zeva_training:
                 raise ValueError("Predictive Stage2 resume requires checkpoints/state/step_XXXXXX with optimizer and rank RNG; addon-only is not a resume")
             base_path = self.cfg.get("ckpt")
             zeva_cfg = self.cfg.model.get("zeva", {})
@@ -733,32 +753,32 @@ class Wan22Trainer:
         if payload.get("training_recipe", "frozen_parent") != expected:
             raise ValueError("Zeva resume training_recipe mismatch")
         keys = set()
-        if getattr(self, "predictive_zeva", False):
+        if self.strict_zeva_training:
             keys.update(("learning_rate", "weight_decay", "max_grad_norm", "lr_scheduler_type",
                          "max_steps", "num_epochs", "seed", "batch_size",
                          "gradient_accumulation_steps", "mixed_precision"))
         if expected in {"ego_adapter_warmup", "ego_joint_warmup"}:
             keys.update(("zeva_pim_warmup_steps", "zeva_eap_learning_rate", "learning_rate", "seed",
                          "gradient_accumulation_steps", "batch_size"))
-        if expected in {"ego_joint_parent", "ego_joint_warmup"}:
+        if expected in {"ego_joint_parent", "ego_joint_warmup", "main_joint_parent", "main_joint_pim"}:
             keys.add("zeva_foundation_learning_rate")
         saved = payload.get("config", {})
-        if getattr(self, "predictive_zeva", False) and getattr(self, "zeva_training_stage", None) == "policy_injection":
+        if self.strict_zeva_training and getattr(self, "zeva_training_stage", None) == "policy_injection":
             if _zeva_stage2a_schedule(saved, expected) != _zeva_stage2a_schedule(self.cfg, expected):
                 raise ValueError("Predictive Stage2 resume curriculum/optimizer mismatch: zeva_stage2a_schedule")
         for key in sorted(keys):
             if saved.get(key) != self.cfg.get(key):
                 raise ValueError(f"Predictive Stage2 resume curriculum/optimizer mismatch: {key}")
-        if getattr(self, "predictive_zeva", False):
+        if self.strict_zeva_training:
             if optimizer_sharding_mode(saved.get("zeva_optimizer_sharding")) != optimizer_sharding_mode(self.cfg.get("zeva_optimizer_sharding")):
                 raise ValueError("Predictive Stage2 resume curriculum/optimizer mismatch: zeva_optimizer_sharding")
-            if optimizer_betas(saved.get("optimizer_betas"), predictive=True) != optimizer_betas(self.cfg.get("optimizer_betas"), predictive=True):
+            if optimizer_betas(saved.get("optimizer_betas"), predictive=not getattr(self, "main_zeva", False)) != optimizer_betas(self.cfg.get("optimizer_betas"), predictive=not getattr(self, "main_zeva", False)):
                 raise ValueError("Predictive Stage2 resume curriculum/optimizer mismatch: optimizer_betas")
 
     def _rank_rng_state(self):
         device = torch.device(self.accelerator.device)
         return {
-            "format": "zeva_ego_stage2_rng_v1", "step": self.global_step,
+            "format": "zeva_main_stage2_rng_v1" if getattr(self, "main_zeva", False) else "zeva_ego_stage2_rng_v1", "step": self.global_step,
             "world_size": self.accelerator.num_processes, "rank": self.accelerator.process_index,
             "python": random.getstate(), "numpy": np.random.get_state(),
             "torch_cpu": torch.get_rng_state(),
@@ -766,7 +786,7 @@ class Wan22Trainer:
         }
 
     def _validate_rank_rng(self, state):
-        for name, expected in (("format", "zeva_ego_stage2_rng_v1"), ("step", self.global_step),
+        for name, expected in (("format", "zeva_main_stage2_rng_v1" if getattr(self, "main_zeva", False) else "zeva_ego_stage2_rng_v1"), ("step", self.global_step),
                                ("world_size", self.accelerator.num_processes), ("rank", self.accelerator.process_index)):
             if state.get(name) != expected:
                 raise ValueError(f"Predictive Stage2 rank RNG mismatch: {name}")
@@ -1204,20 +1224,20 @@ class Wan22Trainer:
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
         }
-        if getattr(self, "predictive_zeva", False):
+        if self.strict_zeva_training:
             payload["data_identity"] = self._zeva_data_identity
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
     def save_checkpoint(self):
-        if getattr(self, "predictive_zeva", False) and not self.accelerator.sync_gradients:
+        if self.strict_zeva_training and not self.accelerator.sync_gradients:
             raise ValueError("Predictive Stage2 checkpoint must be saved at a completed optimizer boundary, not during gradient accumulation")
         step_tag = f"step_{self.global_step:06d}"
         state_path = os.path.join(self.state_dir, step_tag)
 
         self.accelerator.wait_for_everyone()
         ensure_dir(state_path)
-        if getattr(self, "predictive_zeva", False) and self.accelerator.is_main_process:
+        if self.strict_zeva_training and self.accelerator.is_main_process:
             # An interrupted overwrite must never retain a stale completion
             # marker beside a mix of old/new weights, optimizer and RNG state.
             (Path(state_path) / "COMPLETE").unlink(missing_ok=True)
@@ -1247,7 +1267,7 @@ class Wan22Trainer:
             finally:
                 del optimizer_payload
                 release_optimizer_checkpoint(self.optimizer)
-            if getattr(self, "predictive_zeva", False):
+            if self.strict_zeva_training:
                 rng_path = Path(state_path) / f"rng_rank_{self.accelerator.process_index:04d}.pt"
                 temporary = rng_path.with_suffix(".tmp")
                 torch.save(self._rank_rng_state(), temporary)
@@ -1257,7 +1277,7 @@ class Wan22Trainer:
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
-            if getattr(self, "predictive_zeva", False):
+            if self.strict_zeva_training:
                 (Path(state_path) / "COMPLETE").write_text("complete\n", encoding="utf-8")
         self.accelerator.wait_for_everyone()
 

@@ -60,6 +60,7 @@ from fastwam.zeva import (
 )
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.schemas import CacheManifest, sha256_file
+from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
 
 
 # -----------------------------------------------------------------------------
@@ -1163,6 +1164,7 @@ def _merge_rank_caches(
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    normalize_main_dataset_paths(cfg)
     info = _init_distributed()
     torch_cpu_threads = _configure_cpu_runtime(info.world_size)
     video_backend = _configure_video_backend(cfg)
@@ -1303,6 +1305,9 @@ def main(cfg: DictConfig) -> None:
             source_window_actions=model.cfg.transition_steps * 8,
             show_progress=(info.rank == 0),
         )
+        plans, main_metadata = select_main_success_rows(plans, cfg)
+        if main_metadata:
+            validate_main_artifact(payload, main_metadata)
         if not plans:
             raise RuntimeError("cache metadata planner found no complete RoboTwin episodes")
 
@@ -1419,6 +1424,7 @@ def main(cfg: DictConfig) -> None:
         model.eval().requires_grad_(False)
 
         manifest = CacheManifest(
+            **main_metadata,
             schema_version="zeva_fastwam_robotwin_cache_v4",
             history_semantics="full_episode_prefix",
             query_step_unit="raw_action_step",

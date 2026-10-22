@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - robotwin_zeva_main_policy_3cam_384
+  - _self_
+
+foundation_mode: frozen
+foundation_mode_settings:
+  frozen:
+    training_recipe: main_frozen_pim
+    freeze_fastwam: true
+  joint:
+    training_recipe: main_joint_pim
+    freeze_fastwam: false
+learning_rate: 5.0e-5  # MCE/projector x5, gate x1 as main's released PIM config
+zeva_foundation_learning_rate: 1.0e-6
+max_steps: 500
+save_every: 100
+eval_every: 100
+gradient_accumulation_steps: 4  # 16 GPUs -> 64
+model:
+  zeva:
+    training_stage: pim_adapter
+    policy_checkpoint: null

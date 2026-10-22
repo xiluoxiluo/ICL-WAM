@@ -61,7 +61,7 @@ prior_mean, prior_std = EAP_prior(g_t, z_t)
 
 ## 3. 环境与统一路径
 
-**编号 shell 入口见 [`scripts/train/README.md`](../scripts/train/README.md)。** `01`–`11` 覆盖下面的完整离线训练流程，默认路径已按原仓库 `.sh` 配置统一；`12_run_all.sh --dry-run` 可检查实际命令，`--from/--to` 可选择阶段。下文保留 Python 命令及各阶段合同，便于审计和定制。
+**Zeva-Ego 编号 shell 入口已移到 [`scripts/train_ego/README.md`](../scripts/train_ego/README.md)。** `01`–`11` 覆盖下面的完整离线训练流程，默认路径已按原仓库 `.sh` 配置统一；`12_run_all.sh --dry-run` 可检查实际命令，`--from/--to` 可选择阶段。新的 `scripts/train/` 使用独立的 Zeva-main observed-effect 合同，不能混用缓存或 checkpoint。下文保留 Ego Python 命令及各阶段合同，便于审计和定制。
 
 先完成本项目原有 FastWAM / RoboTwin 安装及资产准备。正式新 CTE 另外需要可在当前 Torch/CUDA 环境运行的 `mamba_ssm` 和 `causal_conv1d`。参考仓库 [环境说明](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/docs/README.md) 使用其 vendored 扩展；若使用该版本，固定上面的 commit，先安装 `causal-conv1d`，再安装 `mamba`，不要混用另一套 CUDA 编译产物。ResNet18 使用 torchvision 预训练权重，首次运行需已缓存或可下载。
 

@@ -50,17 +50,17 @@ def _is_zero1(optimizer) -> bool:
 
 
 def create_training_optimizer(parameters, *, sharding: str, predictive: bool,
-                              lr: float, weight_decay: float, betas):
+                              lr: float, weight_decay: float, betas, fp32_contract: bool = False):
     mode = optimizer_sharding_mode(sharding)
     options = dict(lr=lr, weight_decay=weight_decay, betas=tuple(betas))
-    if predictive:
+    if predictive or fp32_contract:
         # Keep the Adam implementation equal in frozen/joint experiments and
         # avoid foreach tensor-list temporaries on large FP32 parameter groups.
         options["foreach"] = False
     if mode == "none":
         return torch.optim.AdamW(parameters, **options)
-    if not predictive:
-        raise ValueError("zero1 is supported only for predictive Zeva Stage2 training")
+    if not (predictive or fp32_contract):
+        raise ValueError("zero1 requires a versioned main FP32 or predictive Zeva training recipe")
     if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() < 2:
         raise ValueError("zero1 requires ordinary DDP with at least two processes; use none for one process")
     from torch.distributed.optim import ZeroRedundancyOptimizer

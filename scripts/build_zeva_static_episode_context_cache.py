@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 from fastwam.zeva import TaskContextBank
 from fastwam.zeva.checkpoint import checkpoint_sha256
+from fastwam.zeva.main_data import inherit_main_artifact, is_main_profile, validate_main_source
 from fastwam.zeva.prepared_stage2 import STATIC_CONTEXT_FORMAT
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.static_task_context import (
@@ -52,6 +53,8 @@ def main(cfg: DictConfig) -> None:
         raise FileExistsError(f"static episode-context cache exists: {output_path}")
 
     bank = TaskContextBank.load(bank_path)
+    if is_main_profile(cfg):
+        validate_main_source(cfg, bank.metadata)
     semantic_path = Path(str(cfg.data.train.semantic_task_map_path)).expanduser().resolve()
     stats_path = Path(str(cfg.data.train.pretrained_norm_stats)).expanduser().resolve()
     if not semantic_path.is_file() or not stats_path.is_file():
@@ -62,7 +65,7 @@ def main(cfg: DictConfig) -> None:
         "video_size": [int(v) for v in cfg.data.train.video_size],
         "context_len": int(cfg.model.tokenizer_max_len),
         "history_semantics": "full_episode_prefix",
-        "semantic_task_count": 50,
+        "semantic_task_count": len({str(entry["task_id"]) for entry in bank.entries}) if is_main_profile(cfg) else 50,
     }
     validate_behavior_bank(bank, expected_bank_identity)
     readout_payload = load_readout_cache(readout_path, bank_path, bank)
@@ -78,6 +81,10 @@ def main(cfg: DictConfig) -> None:
     episode_ids = list(readout_payload["episode_ids"])
     if len(episode_ids) != len(bank):
         raise ValueError("readout/bank episode count mismatch")
+    if is_main_profile(cfg):
+        readouts = torch.cat((readouts, readout_payload["validation_readouts"].float()), dim=0)
+        episode_ids += list(readout_payload["validation_episode_ids"])
+    num_queries = len(episode_ids)
 
     keys = torch.stack([entry["retrieval_key"] for entry in bank.entries]).float().to(device)
     values = torch.stack([entry["behavior_value"] for entry in bank.entries]).float().to(device)
@@ -87,19 +94,22 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("leave-one-out static retrieval requires 1 <= top_k < bank size")
     batch_size = _env_int("ZEVA_STATIC_CONTEXT_BATCH_SIZE", 512)
 
-    contexts = torch.empty((len(bank), bank.value_dim), dtype=torch.float32)
-    indices_all = torch.empty((len(bank), top_k), dtype=torch.int64)
-    scores_all = torch.empty((len(bank), top_k), dtype=torch.float32)
-    iterator = range(0, len(bank), batch_size)
-    progress = tqdm(iterator, total=(len(bank) + batch_size - 1) // batch_size, desc="static context", unit="batch")
+    contexts = torch.empty((num_queries, bank.value_dim), dtype=torch.float32)
+    indices_all = torch.empty((num_queries, top_k), dtype=torch.int64)
+    scores_all = torch.empty((num_queries, top_k), dtype=torch.float32)
+    iterator = range(0, num_queries, batch_size)
+    progress = tqdm(iterator, total=(num_queries + batch_size - 1) // batch_size, desc="static context", unit="batch")
     with torch.inference_mode():
         for start in progress:
-            end = min(len(bank), start + batch_size)
+            end = min(num_queries, start + batch_size)
             q = retriever.head(readouts[start:end].to(device))
             scores = q @ keys.T
             local_rows = torch.arange(end - start, device=device)
             global_rows = torch.arange(start, end, device=device)
-            scores[local_rows, global_rows] = -torch.inf
+            # Only training queries have a matching bank row. Held-out
+            # episodes are queries only and have no retrievable prototype.
+            has_self = global_rows < len(bank)
+            scores[local_rows[has_self], global_rows[has_self]] = -torch.inf
             top_scores, top_indices = torch.topk(scores, top_k, dim=-1, largest=True, sorted=True)
             weights = F.softmax(top_scores / float(bank.temperature), dim=-1)
             selected = values[top_indices]
@@ -112,9 +122,9 @@ def main(cfg: DictConfig) -> None:
         raise FloatingPointError("static episode-context cache contains NaN/Inf")
 
     # Random deterministic equivalence test against the public online retriever.
-    validation_samples = min(_env_int("ZEVA_STATIC_CONTEXT_VALIDATE", 64), len(bank))
+    validation_samples = min(_env_int("ZEVA_STATIC_CONTEXT_VALIDATE", 64), num_queries)
     generator = torch.Generator().manual_seed(int(cfg.get("seed", 42)))
-    sample_indices = torch.randperm(len(bank), generator=generator)[:validation_samples].tolist()
+    sample_indices = torch.randperm(num_queries, generator=generator)[:validation_samples].tolist()
     worst_value = 0.0
     worst_score = 0.0
     for index in sample_indices:
@@ -137,6 +147,7 @@ def main(cfg: DictConfig) -> None:
 
     metadata = {
         **dict(bank.metadata),
+        **({"data_role": "all"} if is_main_profile(cfg) else {}),
         "bank_sha256": checkpoint_sha256(bank_path),
         "retrieval_checkpoint_sha256": checkpoint_sha256(head_path),
         "readout_cache_sha256": checkpoint_sha256(readout_path),
@@ -148,6 +159,7 @@ def main(cfg: DictConfig) -> None:
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        **inherit_main_artifact(metadata),
         "format": STATIC_CONTEXT_FORMAT,
         "episode_ids": episode_ids,
         "task_contexts": contexts,

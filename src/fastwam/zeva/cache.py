@@ -54,6 +54,8 @@ def _validate_v4_temporal_row(row: dict, index: int) -> None:
 class PhaseEffectCache:
     def __init__(self, root: str | Path, manifest: CacheManifest, rows: list[dict]):
         self.root, self.manifest, self.rows = Path(root), manifest, rows
+        from .main_data import validate_main_episode_ids
+        validate_main_episode_ids(manifest.to_dict(), (row["episode_id"] for row in rows))
         self._shards: dict[str, dict[str, torch.Tensor]] = {}
         required = {"episode_id", "task_id", "attempt_id", "transition_index", "window_index", "episode_step", "shard", "offset"}
         if manifest.schema_version in {"zeva_fastwam_robotwin_cache_v3", "zeva_fastwam_robotwin_cache_v4"}:

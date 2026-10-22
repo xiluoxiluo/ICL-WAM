@@ -69,6 +69,7 @@ from fastwam.zeva import (  # noqa: E402
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint  # noqa: E402
 from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset  # noqa: E402
 from fastwam.zeva.schemas import sha256_file  # noqa: E402
+from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact  # noqa: E402
 
 
 def _cfg_dict(value: Any) -> dict[str, Any]:
@@ -507,6 +508,7 @@ def _materialize_episode(
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    normalize_main_dataset_paths(cfg)
     info = _init_distributed()
     try:
         zeva = cfg.model.get("zeva", {})
@@ -645,6 +647,10 @@ def main(cfg: DictConfig) -> None:
             source_window_actions=model.cfg.transition_steps * 8,
             show_progress=(info.rank == 0),
         )
+        plans, main_metadata = select_main_success_rows(plans, cfg)
+        if main_metadata:
+            validate_main_artifact(payload, main_metadata)
+            validate_main_artifact(latent_cache.manifest, main_metadata)
         if not plans:
             raise RuntimeError("cache planner found no complete episodes")
         plans = _canonicalize_plans(plans, latent_cache)
@@ -825,6 +831,7 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.empty_cache()
 
         manifest = CacheManifest(
+            **main_metadata,
             schema_version="zeva_fastwam_robotwin_cache_v4",
             history_semantics="full_episode_prefix",
             query_step_unit="raw_action_step",

@@ -98,6 +98,8 @@ def trajectory_prototype(outputs: dict[str, Tensor], valid: Tensor) -> tuple[Ten
 
 
 def validate_behavior_bank(bank: TaskContextBank, expected: dict | None = None) -> None:
+    from .main_data import validate_main_episode_ids
+    validate_main_episode_ids(bank.metadata, (entry["episode_id"] for entry in bank.entries))
     for name, value in {
         "key_space": BEHAVIOR_KEY_SPACE,
         "value_space": BEHAVIOR_VALUE_SPACE,
@@ -143,6 +145,9 @@ class StaticTaskContextRetriever:
         bank = TaskContextBank.load(bank_path)
         validate_behavior_bank(bank, expected)
         payload = torch.load(head_path, map_location="cpu", weights_only=False)
+        if bank.metadata.get("profile") == "main_observed":
+            from .main_data import validate_main_artifact
+            validate_main_artifact(payload, bank.metadata)
         if payload.get("format") != HEAD_FORMAT or int(payload.get("step", 0)) < 1:
             raise ValueError("static retrieval requires a trained FastWAM head checkpoint")
         if payload.get("bank_sha256") != checkpoint_sha256(bank_path):
@@ -157,6 +162,9 @@ class StaticTaskContextRetriever:
 
 def load_readout_cache(path, bank_path, bank: TaskContextBank) -> dict:
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    if bank.metadata.get("profile") == "main_observed":
+        from .main_data import validate_main_artifact
+        validate_main_artifact(payload, bank.metadata)
     if payload.get("format") != READOUT_FORMAT or payload.get("readout_kind") != READOUT_KIND:
         raise ValueError("unsupported FastWAM initial-readout cache")
     if payload.get("bank_sha256") != checkpoint_sha256(bank_path):
@@ -169,6 +177,16 @@ def load_readout_cache(path, bank_path, bank: TaskContextBank) -> dict:
         raise ValueError("readout cache must contain [N,input_dim]")
     if not bool(torch.isfinite(readouts).all()):
         raise ValueError("readout cache contains non-finite values")
+    if bank.metadata.get("profile") == "main_observed":
+        ids = payload.get("validation_episode_ids")
+        values = payload.get("validation_readouts")
+        tasks = payload.get("validation_task_ids")
+        expected = bank.metadata["episode_splits"]["validation"]
+        if (not isinstance(ids, list) or sorted(ids) != expected
+                or not isinstance(values, Tensor) or values.shape != (len(ids), readouts.shape[1])
+                or not bool(torch.isfinite(values).all()) or not isinstance(tasks, list) or len(tasks) != len(ids)
+                or not set(tasks) <= {str(entry["task_id"]) for entry in bank.entries}):
+            raise ValueError("main readout cache requires independent held-out initial observations and task IDs")
     return payload
 
 

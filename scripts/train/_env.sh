@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Shared defaults from the existing scripts/*.sh and configs/data/robotwin.yaml.
-# Override with exported variables, or a shell file selected by ICLWAM_TRAIN_ENV.
-# REPO_ROOT is resolved by _common.sh; no conda environment name is assumed.
-
+# Zeva-main observed-effect defaults. Override with environment variables or
+# ICLWAM_TRAIN_ENV=/absolute/user-owned/settings.sh. No environment is activated.
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-${DATA:-/data/share/1919650160032350208/foundation_model/datasets/robotwin2.0}}"
 DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-/data/share/1919650160032350208/zjj/fastwam/checkpoints}"
@@ -12,55 +10,65 @@ STATS_PATH="${STATS_PATH:-$DATA_ROOT/robotw_stats.json}"
 SEMANTIC_TASK_MAP="${SEMANTIC_TASK_MAP:-$DATA_ROOT/meta/semantic_task_map.json}"
 TEXT_CACHE="${TEXT_CACHE:-$DATA_ROOT/text_embeds_cache_new}"
 
-# New required inputs: these are suggested locations, NOT files found in the old
-# scripts. Supply the actual ordered task subset and real episode conditions.
-CTE_TASK_SUBSET="${CTE_TASK_SUBSET:-$DATA_ROOT/meta/cte_task_subset.json}"
-EPISODE_CONDITIONS="${EPISODE_CONDITIONS:-$DATA_ROOT/meta/episode_conditions.json}"
-
-# One stable experiment root for all stages. Change it for a new experiment;
-# never mix the old September CTE/VAE/static-retrieval artifacts into this run.
-RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/runs/zeva_ego_reference_v3}"
+# Suggested input location only. No launcher creates outcomes, labels unknown
+# data successful, or runs --declare-success-only on the user's behalf.
+SUCCESS_MANIFEST="${SUCCESS_MANIFEST:-$DATA_ROOT/meta/zeva_success_demonstrations.json}"
+VALIDATION_FRACTION="${VALIDATION_FRACTION:-0.1}"
+SPLIT_SEED="${SPLIT_SEED:-42}"
+TRAIN_SEED="${TRAIN_SEED:-42}"
+RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/runs/zeva_main_observed_v1}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-$RUN_ROOT/artifacts}"
+LATENT_CACHE="${LATENT_CACHE:-$ARTIFACT_ROOT/cte_latents}"
+LATENT_RESUME="${LATENT_RESUME:-0}"
 CTE_RUN_DIR="${CTE_RUN_DIR:-$RUN_ROOT/cte}"
-CTE_CKPT="${CTE_CKPT:-$CTE_RUN_DIR/cte_epoch_080.pt}"
-BOUNDARY_CACHE="${BOUNDARY_CACHE:-$ARTIFACT_ROOT/boundary_v2}"
-TASK_MEMORY_BANK="${TASK_MEMORY_BANK:-$ARTIFACT_ROOT/task_memory_bank.pt}"
-LANGUAGE_ENCODER="${LANGUAGE_ENCODER:-$ARTIFACT_ROOT/task_language_encoder.pt}"
-LANGUAGE_FEATURES="${LANGUAGE_FEATURES:-$ARTIFACT_ROOT/task_language_features.pt}"
-LANGUAGE_CLASSIFIER="${LANGUAGE_CLASSIFIER:-$ARTIFACT_ROOT/task_language_classifier.pt}"
-QUERY_CONTEXT_CACHE="${QUERY_CONTEXT_CACHE:-$ARTIFACT_ROOT/query_context_v2.pt}"
-PIM_TRAIN="${PIM_TRAIN:-$ARTIFACT_ROOT/pim_train_v4}"
-PIM_VALIDATION="${PIM_VALIDATION:-$ARTIFACT_ROOT/pim_validation_v4}"
+CTE_CKPT="${CTE_CKPT:-$CTE_RUN_DIR/cte.pt}"
+PHASE_CACHE="${PHASE_CACHE:-$ARTIFACT_ROOT/phase_effect}"
+BEHAVIOR_BANK="${BEHAVIOR_BANK:-$ARTIFACT_ROOT/behavior_bank.pt}"
+READOUT_CACHE="${READOUT_CACHE:-$ARTIFACT_ROOT/initial_readouts.pt}"
+RETRIEVAL_HEAD="${RETRIEVAL_HEAD:-$ARTIFACT_ROOT/static_retrieval.pt}"
+STATIC_CONTEXT_CACHE="${STATIC_CONTEXT_CACHE:-$ARTIFACT_ROOT/static_context.pt}"
+PIM_CACHE="${PIM_CACHE:-$ARTIFACT_ROOT/pim_retrieval}"
 
-# The stages are independent: freezing B does not select a different A parent.
-STAGE2A_FOUNDATION_MODE="${STAGE2A_FOUNDATION_MODE:-joint}"
-STAGE2B_FOUNDATION_MODE="${STAGE2B_FOUNDATION_MODE:-joint}"
+CTE_STEPS="${CTE_STEPS:-5000}"
+CTE_LEARNING_RATE="${CTE_LEARNING_RATE:-2.0e-4}"
+CTE_BATCH_SIZE="${CTE_BATCH_SIZE:-8}"
+CTE_TASKS_PER_BATCH="${CTE_TASKS_PER_BATCH:-4}"
+CTE_SAMPLES_PER_TASK="${CTE_SAMPLES_PER_TASK:-2}"
+CTE_RESUME="${CTE_RESUME:-}"
+RETRIEVAL_STEPS="${RETRIEVAL_STEPS:-2000}"
+RETRIEVAL_BATCH_SIZE="${RETRIEVAL_BATCH_SIZE:-32}"
+RETRIEVAL_LEARNING_RATE="${RETRIEVAL_LEARNING_RATE:-1.0e-4}"
+
+STAGE2A_FOUNDATION_MODE="${STAGE2A_FOUNDATION_MODE:-frozen}"
+STAGE2B_FOUNDATION_MODE="${STAGE2B_FOUNDATION_MODE:-frozen}"
 STAGE2A_STEPS="${STAGE2A_STEPS:-5000}"
-STAGE2B_STEPS="${STAGE2B_STEPS:-2000}"
+STAGE2B_STEPS="${STAGE2B_STEPS:-500}"
+STAGE2A_LEARNING_RATE="${STAGE2A_LEARNING_RATE:-2.0e-4}"
+STAGE2B_LEARNING_RATE="${STAGE2B_LEARNING_RATE:-5.0e-5}"
+STAGE2A_FOUNDATION_LEARNING_RATE="${STAGE2A_FOUNDATION_LEARNING_RATE:-5.0e-6}"
+STAGE2B_FOUNDATION_LEARNING_RATE="${STAGE2B_FOUNDATION_LEARNING_RATE:-1.0e-6}"
+STAGE2A_BATCH_SIZE="${STAGE2A_BATCH_SIZE:-1}"
+STAGE2B_BATCH_SIZE="${STAGE2B_BATCH_SIZE:-1}"
+STAGE2A_GLOBAL_BATCH_SIZE="${STAGE2A_GLOBAL_BATCH_SIZE:-128}"
+STAGE2B_GLOBAL_BATCH_SIZE="${STAGE2B_GLOBAL_BATCH_SIZE:-64}"
+STAGE2A_OPTIMIZER_SHARDING="${STAGE2A_OPTIMIZER_SHARDING:-${ZEVA_OPTIMIZER_SHARDING:-none}}"
+STAGE2B_OPTIMIZER_SHARDING="${STAGE2B_OPTIMIZER_SHARDING:-${ZEVA_OPTIMIZER_SHARDING:-none}}"
 STAGE2A_RUN_DIR="${STAGE2A_RUN_DIR:-$RUN_ROOT/stage2a_$STAGE2A_FOUNDATION_MODE}"
 STAGE2B_RUN_DIR="${STAGE2B_RUN_DIR:-$RUN_ROOT/stage2b_$STAGE2B_FOUNDATION_MODE}"
-# STAGE2A_CKPT is derived from STAGE2A_STEPS in _common.sh unless overridden.
-CTE_RESUME="${CTE_RESUME:-}"
 STAGE2A_RESUME="${STAGE2A_RESUME:-}"
 STAGE2B_RESUME="${STAGE2B_RESUME:-}"
 
-# GPU IDs are machine-local. Set GPU_IDS explicitly on an 8-GPU node, or inherit
-# an existing CUDA_VISIBLE_DEVICES allocation. CTE/boundary remain single rank.
 GPU_IDS="${GPU_IDS-${CUDA_VISIBLE_DEVICES-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}}"
 TEXT_GPU_IDS="${TEXT_GPU_IDS:-$GPU_IDS}"
-CTE_GPU_ID="${CTE_GPU_ID:-${GPU_IDS%%,*}}"
-BOUNDARY_GPU_ID="${BOUNDARY_GPU_ID:-$CTE_GPU_ID}"
-LANGUAGE_DEVICE="${LANGUAGE_DEVICE:-cpu}"
+PREP_GPU_IDS="${PREP_GPU_IDS:-$GPU_IDS}"
+CTE_GPU_IDS="${CTE_GPU_IDS:-$GPU_IDS}"
+RETRIEVAL_GPU_ID="${RETRIEVAL_GPU_ID:-${GPU_IDS%%,*}}"
 PRECOMPUTE_NUM_GPUS="${PRECOMPUTE_NUM_GPUS:-}"
 PRECOMPUTE_BATCH_SIZE="${PRECOMPUTE_BATCH_SIZE:-8}"
-CTE_BATCH_SIZE="${CTE_BATCH_SIZE:-8}"
+LATENT_BATCH_SIZE="${LATENT_BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 NNODES="${NNODES:-1}"
 NODE_RANK="${NODE_RANK:-0}"
 MASTER_ADDR="${MASTER_ADDR:-}"
 MASTER_PORT="${MASTER_PORT:-29500}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-256}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
-# NPROC_PER_NODE, GRAD_ACCUM_STEPS, ZEVA_OPTIMIZER_SHARDING are derived from the
-# actual topology in iclwam_stage2. An explicit override is validated there.
 CHECK_ENVIRONMENT="${CHECK_ENVIRONMENT:-1}"

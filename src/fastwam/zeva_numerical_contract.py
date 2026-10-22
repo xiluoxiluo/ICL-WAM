@@ -5,11 +5,13 @@ from collections.abc import Mapping
 
 LEGACY_NUMERICAL_CONTRACT = "legacy_v1"
 REFERENCE_NUMERICAL_CONTRACT = "zeva_ego_v1"
+MAIN_NUMERICAL_CONTRACT = "zeva_main_v1"
+FP32_NUMERICAL_CONTRACTS = frozenset({REFERENCE_NUMERICAL_CONTRACT, MAIN_NUMERICAL_CONTRACT})
 
 
 def _validated(value) -> str:
-    if value not in {LEGACY_NUMERICAL_CONTRACT, REFERENCE_NUMERICAL_CONTRACT}:
-        raise ValueError("numerical_contract must be legacy_v1 or zeva_ego_v1")
+    if value not in {LEGACY_NUMERICAL_CONTRACT, *FP32_NUMERICAL_CONTRACTS}:
+        raise ValueError("unsupported Zeva numerical_contract")
     return value
 
 
@@ -28,7 +30,7 @@ def checkpoint_numerical_contract(payload: Mapping) -> str:
     zeva = config.get("model", {}).get("zeva") if isinstance(config, Mapping) else None
     from_config = config_numerical_contract(zeva) if isinstance(zeva, Mapping) else None
     if recorded is None:
-        if from_config == REFERENCE_NUMERICAL_CONTRACT:
+        if from_config in FP32_NUMERICAL_CONTRACTS:
             raise ValueError("reference checkpoint is missing its numerical_contract marker")
         return LEGACY_NUMERICAL_CONTRACT
     recorded = _validated(recorded)

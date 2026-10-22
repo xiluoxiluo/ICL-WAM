@@ -138,6 +138,9 @@ class TaskContextBank:
             "entries": list(self.entries),
             "metadata": {**self.metadata, **dict(metadata or {})},
         }
+        from .main_data import inherit_main_artifact, validate_main_episode_ids
+        payload.update(inherit_main_artifact(payload["metadata"]))
+        validate_main_episode_ids(payload, (entry["episode_id"] for entry in self.entries))
         torch.save(payload, path)
 
     @classmethod
@@ -155,6 +158,10 @@ class TaskContextBank:
         entries = payload.get("entries")
         if not isinstance(entries, list):
             raise ValueError("task-context bank entries must be a list")
+        from .main_data import validate_main_artifact, validate_main_episode_ids
+        if payload.get("metadata", {}).get("profile") == "main_observed":
+            validate_main_artifact(payload, payload["metadata"])
+            validate_main_episode_ids(payload, (entry["episode_id"] for entry in entries))
         return cls(entries, key_dim=key_dim, value_dim=value_dim, temperature=float(config.get("temperature", 0.07)), metadata=payload.get("metadata", {}))
 
 

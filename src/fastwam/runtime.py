@@ -51,9 +51,15 @@ def _validate_zeva_foundation_config(zeva: dict) -> None:
     from .zeva_numerical_contract import config_numerical_contract
     config_numerical_contract(zeva)
     recipe = str(zeva.get("training_recipe", "frozen_parent"))
-    if recipe not in {"frozen_parent", "ego_joint_parent", "ego_adapter_warmup", "ego_joint_warmup"}:
+    from .zeva_main_contract import MAIN_PROFILE, MAIN_RECIPES, MAIN_JOINT_RECIPES, validate_main_model_config
+    main_profile = zeva.get("profile") == MAIN_PROFILE
+    if main_profile:
+        validate_main_model_config(zeva)
+    elif recipe in MAIN_RECIPES:
+        raise ValueError("main training recipes require profile=main_observed")
+    if recipe not in {"frozen_parent", "ego_joint_parent", "ego_adapter_warmup", "ego_joint_warmup", *MAIN_RECIPES}:
         raise ValueError("unsupported Zeva training_recipe")
-    expected_mode = "joint" if recipe in {"ego_joint_parent", "ego_joint_warmup"} else "frozen"
+    expected_mode = "joint" if recipe in {"ego_joint_parent", "ego_joint_warmup", *MAIN_JOINT_RECIPES} else "frozen"
     mode = str(zeva.get("foundation_mode", expected_mode))
     if mode not in {"frozen", "joint"}:
         raise ValueError("zeva.foundation_mode must be 'frozen' or 'joint'")
@@ -63,11 +69,15 @@ def _validate_zeva_foundation_config(zeva: dict) -> None:
     if not isinstance(freeze, bool) or freeze != (mode == "frozen"):
         raise ValueError("zeva.freeze_fastwam must agree with foundation_mode/training_recipe")
     if mode == "joint":
-        expected_stage = "policy_injection" if recipe == "ego_joint_parent" else "pim_adapter"
+        expected_stage = "policy_injection" if recipe in {"ego_joint_parent", "main_joint_parent"} else "pim_adapter"
         if zeva.get("training_stage", "policy_injection") != expected_stage:
             raise ValueError("joint foundation recipe and training_stage disagree")
-        if zeva.get("task_context", {}).get("mode", "static") != "task_language":
+        if not main_profile and zeva.get("task_context", {}).get("mode", "static") != "task_language":
             raise ValueError("joint foundation training requires frozen task_language retrieval independent of the changing foundation")
+    if main_profile:
+        expected_stage = "policy_injection" if recipe.endswith("parent") else "pim_adapter"
+        if zeva.get("training_stage", "policy_injection") != expected_stage:
+            raise ValueError("main training recipe and training_stage disagree")
 
 
 def create_wan22_model(
@@ -251,6 +261,7 @@ def create_fastwam(
             CausalPromptEncoder(CausalPromptConfig(**{k: v for k, v in prompt_cfg.items() if k in prompt_keys})),
             policy_adapter,
         )
+        model.zeva_profile = str(zeva.get("profile", "legacy"))
         model.zeva_task_context_mode = str(
             zeva.get("task_context", {}).get("mode", "static")
         )
