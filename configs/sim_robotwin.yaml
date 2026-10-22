@@ -29,6 +29,10 @@ EVALUATION:
   sigma_shift: null
   text_cfg_scale: 1.0
   negative_prompt: ""
+  # Keep the large policy text encoder off the action GPU. Cache entries are
+  # exact prompt embeddings on CPU, shared across replans/attempt resets.
+  policy_text_encoder_device: cpu
+  policy_text_cache_size: 16
   rand_device: cpu
   tiled: false
   timing_enabled: false

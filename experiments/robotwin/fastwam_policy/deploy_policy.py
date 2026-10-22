@@ -46,8 +46,21 @@ from fastwam.zeva.static_task_context import (
     StaticTaskContextRetriever, StaticTaskContextSession, task_context_identity,
 )
 from fastwam.zeva.task_language import TaskLanguageMemory, task_language_identity
+from fastwam.zeva.prompt_cache import load_policy_prompt_cache
 
 logger = logging.getLogger(__name__)
+
+
+def _inference_model_config(model_cfg: Any) -> DictConfig:
+    """Keep training memory options and the large text encoder out of policy init."""
+    config = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
+    config.load_text_encoder = False
+    config.mot_checkpoint_mixed_attn = False
+    config.compile_training_denoise = False
+    for name in ("video_dit_config", "action_dit_config"):
+        if name in config and config[name] is not None:
+            config[name].use_gradient_checkpointing = False
+    return config
 
 
 def _prefix_metadata(model: Any) -> dict[str, Any]:
@@ -59,6 +72,23 @@ def _prefix_metadata(model: Any) -> dict[str, Any]:
     return {
         "prefix_layout": layout,
         "effect_source": getattr(config, "effect_source", None) if layout == "zeva_ego" else None,
+    }
+
+
+def _cuda_memory_metadata(device: Any) -> dict[str, Any] | None:
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    free, total = torch.cuda.mem_get_info(device)
+    return {
+        "scope": "process_allocator_peak_since_start",
+        "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+        "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+        "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+        # Device-wide free space also reflects the simulator/renderer and
+        # other processes, which Torch's allocator counters cannot include.
+        "device_free_bytes": int(free), "device_total_bytes": int(total),
     }
 
 
@@ -226,13 +256,22 @@ class WorldActionRobotWinPolicy:
         model_rng_task_name: Optional[str] = None,
         model_rng_run_id: Optional[str] = None,
         skip_get_obs_within_replan: bool = False,
+        policy_text_encoder_device: str = "cpu",
+        policy_text_cache_size: int = 16,
     ) -> None:
-        model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
-        model_cfg_copy.load_text_encoder = True
-
+        model_cfg_copy = _inference_model_config(model_cfg)
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
-        self.model = self.model.to(device).eval()
+        self.model = self.model.to(device).eval().requires_grad_(False)
+        # Build UMT5 independently on CPU by default. It is never registered
+        # under self.model, so policy.to(cuda) cannot move it or create a peak
+        # GPU allocation before offloading. Only cached text features move.
+        self._policy_prompt_cache = load_policy_prompt_cache(
+            model_cfg_copy, encoder_device=policy_text_encoder_device,
+            dtype=model_dtype, max_entries=policy_text_cache_size,
+        )
+        self.policy_text_encoder_device = torch.device(policy_text_encoder_device).type
+        self.policy_text_cache_size = policy_text_cache_size
         requested_zeva_mode = str(zeva_mode)
         if requested_zeva_mode not in {
             "base",
@@ -350,7 +389,12 @@ class WorldActionRobotWinPolicy:
             "cte_sha256": checkpoint_sha256(cte_checkpoint) if cte_checkpoint else None,
             "addon_sha256": checkpoint_sha256(addon_checkpoint) if addon_checkpoint else None,
             "task_context": getattr(self.model, "zeva_task_context_identity", None),
-            "training_recipe": str(getattr(self.model, "zeva_training_recipe", "frozen_parent")),
+            "policy_text": self._policy_prompt_cache.identity,
+            # A base evaluation may reuse a joint Stage2B architecture config,
+            # but it loaded only the original base weights above. Bind the
+            # identity to those deployed weights, not that unused recipe.
+            "training_recipe": ("frozen_parent" if requested_zeva_mode == "base"
+                                else str(getattr(self.model, "zeva_training_recipe", "frozen_parent"))),
             **_prefix_metadata(self.model),
         }
         self.cte = None
@@ -458,7 +502,8 @@ class WorldActionRobotWinPolicy:
                 )
             if not self._ego_cte:
                 self.cte = CausalTransitionEncoder(cte_cfg).to(device).eval()
-                load_cte_checkpoint(str(cte_checkpoint), self.cte, map_location=device)
+                load_cte_checkpoint(str(cte_checkpoint), self.cte, map_location="cpu")
+            self.cte.requires_grad_(False)
             cte_input_type = str(cte_payload.get("cte_input_type", cte_values.get("input_type", "rgb_frame")))
             if self._ego_cte:
                 if cte_input_type != "rgb_multiview":
@@ -744,6 +789,9 @@ class WorldActionRobotWinPolicy:
         proprio = self._normalize_state(state_vector)
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
+        context, _context_mask = self._policy_prompt_cache.encode(
+            prompt, device=self.model.device, dtype=self.model.torch_dtype,
+        )
         noise_stream = getattr(self, "_model_noise_stream", None)
         initial_noise = None if noise_stream is None else noise_stream.next_noise((1, self.action_horizon, 14))
         request_seed = self._model_seed_stream.next_seed() if noise_stream is None else None
@@ -758,7 +806,6 @@ class WorldActionRobotWinPolicy:
                 self._cte_history.reset(image_tensor[0].float())
                 self._observed_effect_count = 0
             with torch.no_grad():
-                context, _context_mask = self.model.encode_prompt(prompt)
                 task_dim = int(self.model.zeva_prompt_encoder.config.global_dim)
                 if self.zeva_mode == "pim_shadow":
                     task_tokens = torch.zeros(
@@ -921,7 +968,9 @@ class WorldActionRobotWinPolicy:
             self._replan_index += 1
             return action_chunk
         infer_kwargs = {
-            "prompt": prompt,
+            "prompt": None,
+            "context": context,
+            "context_mask": _context_mask,
             "input_image": image_tensor,
             "action_horizon": self.action_horizon,
             "proprio": proprio,
@@ -1041,6 +1090,12 @@ class WorldActionRobotWinPolicy:
             "memory_semantics": "predicted_effect_trace" if getattr(self, "_ego_cte", False) else "completed_effect_trace",
             "checkpoint_identity": self.checkpoint_identity,
             "training_recipe": self.checkpoint_identity.get("training_recipe", "frozen_parent"),
+            "foundation_mode": ("joint" if self.checkpoint_identity.get("training_recipe") == "ego_joint_warmup" else "frozen"),
+            "policy_text_encoder_device": getattr(self, "policy_text_encoder_device", None),
+            "policy_text_cache_size": getattr(self, "policy_text_cache_size", None),
+            "policy_text_cache": (self._policy_prompt_cache.snapshot()
+                                  if getattr(self, "_policy_prompt_cache", None) is not None else None),
+            "cuda_memory": _cuda_memory_metadata(getattr(self.model, "device", "cpu")),
             "task_context_mode": getattr(self, "task_context_mode", "static"),
             "task_language_predictions": (getattr(getattr(self, "_task_language_memory", None), "last_diagnostics", [])
                                           if getattr(self, "_task_language_result", None) is not None else []),
@@ -1370,6 +1425,10 @@ def get_model(usr_args: Dict[str, Any]):
         model_rng_task_name=usr_args.get("model_rng_task_name"),
         model_rng_run_id=usr_args.get("model_rng_run_id"),
         skip_get_obs_within_replan=skip_observations,
+        policy_text_encoder_device=str(usr_args.get("policy_text_encoder_device")
+                                       or cfg.EVALUATION.get("policy_text_encoder_device", "cpu")),
+        policy_text_cache_size=int(usr_args.get("policy_text_cache_size",
+                                               cfg.EVALUATION.get("policy_text_cache_size", 16))),
     )
     return policy
 

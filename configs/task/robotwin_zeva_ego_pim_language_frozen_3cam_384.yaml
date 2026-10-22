@@ -1,0 +1,8 @@
+# @package _global_
+defaults:
+  - robotwin_zeva_ego_pim_3cam_384
+  - _self_
+
+# Identical task-language Stage2B protocol, with the foundation held fixed.
+# This is also selected by foundation_mode=frozen on the parent task.
+foundation_mode: frozen

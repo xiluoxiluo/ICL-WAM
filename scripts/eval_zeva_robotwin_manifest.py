@@ -27,7 +27,10 @@ from experiments.robotwin.multiattempt import (
 
 
 def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect_source: str,
-                     task_context_mode: str | None = None) -> dict:
+                     task_context_mode: str | None = None,
+                     foundation_mode: str | None = None,
+                     policy_text_encoder_device: str = "cpu",
+                     policy_text_cache_size: int = 16) -> dict:
     """Resolve reader capacity without importing or instantiating the policy."""
     from hydra import compose, initialize_config_dir
 
@@ -37,6 +40,7 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
             f"model.zeva.adapter.prefix_layout={prefix_layout}",
             f"model.zeva.adapter.effect_source={effect_source}",
             *([] if task_context_mode is None else [f"model.zeva.task_context.mode={task_context_mode}"]),
+            *([] if foundation_mode is None else [f"++foundation_mode={foundation_mode}"]),
         ])
     zeva = cfg.model.zeva
     top_k = int(zeva.memory.pim_top_k)
@@ -48,6 +52,13 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
     semantics = str(zeva.memory.get("memory_semantics", "completed_effect_trace"))
     prior = str(zeva.adapter.get("prior_variant", "legacy_bit"))
     recipe = str(zeva.get("training_recipe", "frozen_parent"))
+    resolved_foundation_mode = "joint" if recipe == "ego_joint_warmup" else "frozen"
+    if foundation_mode is not None and foundation_mode != resolved_foundation_mode:
+        raise ValueError("This task does not support the requested foundation_mode; select a predictive Stage2B task")
+    if (bool(zeva.get("freeze_fastwam", True)) != (resolved_foundation_mode == "frozen")):
+        raise ValueError("foundation mode, training recipe and freeze_fastwam disagree")
+    if policy_text_encoder_device not in {"cpu", "cuda"} or policy_text_cache_size < 0:
+        raise ValueError("Policy text encoder requires cpu/cuda and a nonnegative cache size")
     task_context_mode = str(zeva.task_context.get("mode", "static"))
     if recipe == "ego_joint_warmup":
         if bool(zeva.get("freeze_fastwam", True)) or task_context_mode != "task_language":
@@ -74,7 +85,10 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
         "memory_semantics": semantics,
         "prior_variant": prior,
         "training_recipe": recipe,
+        "foundation_mode": resolved_foundation_mode,
         "task_context_mode": task_context_mode,
+        "policy_text_encoder_device": policy_text_encoder_device,
+        "policy_text_cache_size": policy_text_cache_size,
         "skip_get_obs_within_replan": boundary_observations,
     }
 
@@ -84,8 +98,10 @@ def _foundation_artifact(addon_path: str, training_recipe: str) -> dict:
     import torch
     sys.path.insert(0, str(ROOT / "src"))
     from fastwam.zeva.checkpoint import resolve_joint_foundation_checkpoint
+    from fastwam.zeva.checkpoint import checkpoint_foundation_mode
 
     payload = torch.load(addon_path, map_location="cpu", weights_only=False)
+    checkpoint_foundation_mode(payload)  # Reject inconsistent explicit mode metadata.
     if payload.get("training_recipe", "frozen_parent") != training_recipe:
         raise ValueError("Addon training recipe differs from the selected task; use the matching joint/frozen task config")
     foundation = resolve_joint_foundation_checkpoint(addon_path, payload=payload, verify_hash=True)
@@ -167,6 +183,14 @@ def main() -> None:
     parser.add_argument("--robotwin-root", default=str(ROOT / "third_party/RoboTwin"))
     parser.add_argument("--old-task-config", default="robotwin_zeva_fastwam_cross_attempt_3cam_384")
     parser.add_argument("--new-task-config", default="robotwin_zeva_ego_pim_3cam_384")
+    parser.add_argument("--new-foundation-mode", choices=("frozen", "joint"),
+                        help="Training mode of new_on/new_off; must match the selected addon")
+    parser.add_argument("--old-foundation-mode", choices=("frozen", "joint"),
+                        help="Optional mode for a predictive old-condition task")
+    parser.add_argument("--policy-text-encoder-device", choices=("cpu", "cuda"), default="cpu",
+                        help="Independent policy text encoder placement shared by all conditions")
+    parser.add_argument("--policy-text-cache-size", type=int, default=16,
+                        help="CPU prompt embedding LRU capacity; 0 disables caching")
     parser.add_argument("--old-prefix-layout", choices=("legacy_merged", "zeva_ego"), default="zeva_ego")
     parser.add_argument("--new-prefix-layout", choices=("legacy_merged", "zeva_ego"), default="zeva_ego")
     parser.add_argument("--old-effect-source", choices=("latest_completed", "current_prediction"), default="latest_completed")
@@ -176,6 +200,8 @@ def main() -> None:
     args = parser.parse_args()
     if not 0 <= args.model_seed < 2**63 or args.slots < 1 or args.num_inference_steps < 1 or args.pim_diagnostic_interval < 0:
         parser.error("Invalid model seed, slot count, inference steps or diagnostic interval")
+    if args.policy_text_cache_size < 0:
+        parser.error("--policy-text-cache-size must be nonnegative")
     if len(args.conditions) != len(set(args.conditions)):
         parser.error("Conditions cannot be repeated")
     for override in args.override:
@@ -184,6 +210,8 @@ def main() -> None:
             parser.error("--override cannot change the frozen evaluation protocol")
         if key in {"model.zeva.adapter.prefix_layout", "model.zeva.adapter.effect_source"}:
             parser.error("Use --old/--new-prefix-layout and --old/--new-effect-source for prefix contracts")
+        if key in {"foundation_mode", "model.zeva.foundation_mode", "model.zeva.training_recipe", "model.zeva.freeze_fastwam"} or key.startswith("foundation_mode_settings."):
+            parser.error("Use --old/--new-foundation-mode for foundation mode contracts")
         if key in {f"model.zeva.task_context.{field}" for field in ("mode", "bank_path", "retrieval_checkpoint", "language_encoder_path", "top_k")}:
             parser.error("Use explicit task-context / task-language CLI options for retrieval artifacts")
     required = ["checkpoint", "dataset_stats"]
@@ -210,9 +238,16 @@ def main() -> None:
                 args.new_prefix_layout if new else args.old_prefix_layout,
                 args.new_effect_source if new else args.old_effect_source,
                 task_context_mode=context_mode,
+                foundation_mode=(None if condition == "base" else getattr(args, f"{family}_foundation_mode")),
+                policy_text_encoder_device=args.policy_text_encoder_device,
+                policy_text_cache_size=args.policy_text_cache_size,
             )
             if condition == "base":
                 contracts[condition]["skip_get_obs_within_replan"] = True
+                # Base disables Zeva and loads only the original foundation,
+                # even if old_task_config is the joint-default Stage2B task.
+                contracts[condition]["training_recipe"] = "frozen_parent"
+                contracts[condition]["foundation_mode"] = "frozen"
         except ValueError as exc:
             parser.error(f"Invalid {condition} policy configuration: {exc}")
     condition_assets = {}
@@ -331,6 +366,8 @@ def main() -> None:
                 setting("EVALUATION.replan_steps", manifest["replan_steps"]),
                 setting("EVALUATION.num_inference_steps", args.num_inference_steps),
                 setting("EVALUATION.pim_diagnostic_interval", args.pim_diagnostic_interval),
+                setting("EVALUATION.policy_text_encoder_device", args.policy_text_encoder_device),
+                setting("EVALUATION.policy_text_cache_size", args.policy_text_cache_size),
                 setting("EVALUATION.skip_get_obs_within_replan", contract["skip_get_obs_within_replan"]),
             ]
             if args.model_rng_protocol == CONTINUOUS_NOISE_PROTOCOL:
@@ -341,6 +378,9 @@ def main() -> None:
                 ])
             if condition != "base":
                 assets = condition_assets[condition]
+                selected_mode = getattr(args, "new_foundation_mode" if new else "old_foundation_mode")
+                if selected_mode is not None:
+                    command.append(setting("++foundation_mode", selected_mode))
                 command.extend([
                     setting("EVALUATION.cte_checkpoint", assets["cte_checkpoint"]),
                     setting("EVALUATION.addon_checkpoint", addon),

@@ -40,6 +40,33 @@ def _mixed_precision_to_model_dtype(mixed_precision: str) -> torch.dtype:
     return torch.bfloat16
 
 
+def _validate_zeva_foundation_config(zeva: dict) -> None:
+    """Reject inconsistent switches before loading the large base model.
+
+    Historical configurations without ``foundation_mode`` keep their recipe
+    semantics. New Stage2B presets derive both the recipe and freeze flag
+    from the same Hydra switch; an explicit contradictory override is an
+    error rather than a silently different experiment.
+    """
+    recipe = str(zeva.get("training_recipe", "frozen_parent"))
+    if recipe not in {"frozen_parent", "ego_adapter_warmup", "ego_joint_warmup"}:
+        raise ValueError("unsupported Zeva training_recipe")
+    expected_mode = "joint" if recipe == "ego_joint_warmup" else "frozen"
+    mode = str(zeva.get("foundation_mode", expected_mode))
+    if mode not in {"frozen", "joint"}:
+        raise ValueError("zeva.foundation_mode must be 'frozen' or 'joint'")
+    if mode != expected_mode:
+        raise ValueError("zeva.foundation_mode and training_recipe disagree")
+    freeze = zeva.get("freeze_fastwam", True)
+    if not isinstance(freeze, bool) or freeze != (mode == "frozen"):
+        raise ValueError("zeva.freeze_fastwam must agree with foundation_mode/training_recipe")
+    if mode == "joint":
+        if zeva.get("training_stage", "policy_injection") != "pim_adapter":
+            raise ValueError("joint foundation updates require predictive Stage2B")
+        if zeva.get("task_context", {}).get("mode", "static") != "task_language":
+            raise ValueError("ego_joint_warmup requires frozen task_language retrieval independent of the changing foundation")
+
+
 def create_wan22_model(
     model_id: str,
     tokenizer_model_id: str,
@@ -135,6 +162,11 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    if isinstance(zeva, DictConfig):
+        zeva = OmegaConf.to_container(zeva, resolve=True)
+    if zeva and bool(zeva.get("enabled", False)):
+        _validate_zeva_foundation_config(zeva)
+
     model = FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -159,8 +191,6 @@ def create_fastwam(
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         compile_training_denoise=bool(compile_training_denoise),
     )
-    if isinstance(zeva, DictConfig):
-        zeva = OmegaConf.to_container(zeva, resolve=True)
     if zeva and bool(zeva.get("enabled", False)):
         from .zeva import (
             BehaviorPrefixAdapter,
@@ -228,16 +258,10 @@ def create_fastwam(
             )
         model.set_zeva_training_stage(training_stage)
         model.zeva_training_recipe = str(zeva.get("training_recipe", "frozen_parent"))
-        if model.zeva_training_recipe not in {"frozen_parent", "ego_adapter_warmup", "ego_joint_warmup"}:
-            raise ValueError("unsupported Zeva training_recipe")
         if model.zeva_training_recipe in {"ego_adapter_warmup", "ego_joint_warmup"}:
             if (training_stage != "pim_adapter" or prompt_variant != "cross_attempt"
                     or getattr(policy_adapter.config, "effect_source", None) != "current_prediction"):
                 raise ValueError("ego warmup recipes require predictive cross-attempt Stage2B")
-        if model.zeva_training_recipe == "ego_joint_warmup" and bool(zeva.get("freeze_fastwam", True)):
-            raise ValueError("ego_joint_warmup requires zeva.freeze_fastwam=false")
-        if model.zeva_training_recipe == "ego_joint_warmup" and model.zeva_task_context_mode != "task_language":
-            raise ValueError("ego_joint_warmup requires frozen task_language retrieval independent of the changing foundation")
     return model
 
 

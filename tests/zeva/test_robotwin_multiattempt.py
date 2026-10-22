@@ -425,6 +425,8 @@ def test_runtime_memory_off_keeps_parent_injections_and_recomputes_prior():
         encode_prompt=lambda prompt: (torch.ones(1, 2, 4), torch.ones(1, 2, dtype=torch.bool)),
         infer_action_zeva=lambda **kwargs: inference.append(kwargs) or {"action": torch.zeros(1, 32, 14)},
     )
+    from fastwam.zeva.prompt_cache import PolicyPromptCache
+    policy._policy_prompt_cache = PolicyPromptCache(policy.model.encode_prompt)
     policy.zeva_mode, policy.cross_memory_enabled = "pim_on", False
     policy._static_task_context_session, policy.task_context_bank = None, None
     policy._cte_history = SimpleNamespace(forward=lambda: {"phase": torch.ones(1, 2, 3)})

@@ -9,6 +9,7 @@ zeva:
   pim_variant: cross_attempt
   training_stage: policy_injection
   training_recipe: frozen_parent
+  foundation_mode: frozen
   policy_checkpoint: null
   policy_warmstart_checkpoint: null
   action_only: true

@@ -274,6 +274,8 @@ def test_deployment_predicts_once_per_replan_reuses_noise_and_commits_no_termina
         zeva_behavior_prefix_adapter=Adapter(), zeva_prompt_encoder=Prompt(),
         encode_prompt=lambda _: (torch.ones(1, 2, 4), torch.ones(1, 2, dtype=torch.bool)),
         infer_action_zeva=lambda **kw: requests.append(kw) or {"action": torch.full((1, 32, 14), 2.)})
+    from fastwam.zeva.prompt_cache import PolicyPromptCache
+    policy._policy_prompt_cache = PolicyPromptCache(policy.model.encode_prompt)
     policy.cte, policy.lifecycle = _CausalCTE(), _lifecycle()
     # Policy inference may be bf16, but persisted CTE traces must retain the
     # original float32 features exported by the offline recurrent cache.

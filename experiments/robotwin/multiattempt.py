@@ -225,6 +225,31 @@ def audit_protocol_trace(manifest: dict[str, Any], rows: list[dict[str, Any]]) -
                 raise ValueError("Memory control differs from its frozen condition")
             if row.get("skip_get_obs_within_replan") is not contracts[condition]["skip_get_obs_within_replan"]:
                 raise ValueError("Observation schedule differs from its frozen condition")
+            contract = contracts[condition]
+            if "foundation_mode" in contract:
+                if row.get("foundation_mode") != contract["foundation_mode"]:
+                    raise ValueError("Runtime foundation_mode differs from the frozen policy contract")
+                expected_mode = "joint" if contract.get("training_recipe") == "ego_joint_warmup" else "frozen"
+                if contract["foundation_mode"] != expected_mode:
+                    raise ValueError("Frozen foundation mode and training recipe disagree")
+            if "policy_text_encoder_device" in contract:
+                for key in ("policy_text_encoder_device", "policy_text_cache_size"):
+                    if row.get(key) != contract[key]:
+                        raise ValueError(f"Runtime {key} differs from the frozen policy contract")
+                text_identity = hashes.get("policy_text")
+                if (not isinstance(text_identity, dict)
+                        or text_identity.get("schema") != "iclwam_policy_text_v1"
+                        or text_identity.get("prompt_semantics") != "wan_whitespace_special_tokens_zero_padding_visible_v1"):
+                    raise ValueError("Policy text encoder requires a versioned identity with Wan prompt semantics")
+                for key in ("encoder_sha256", "tokenizer_sha256"):
+                    _sha256(text_identity.get(key), f"policy text {key}")
+                if (str(text_identity.get("encoder_device", "")).split(":", 1)[0] != contract["policy_text_encoder_device"]
+                        or text_identity.get("cache_size") != contract["policy_text_cache_size"]
+                        or text_identity.get("cache_storage_device") != "cpu"):
+                    raise ValueError("Policy text encoder/cache identity differs from the frozen contract")
+                if text_identity.get("encoder_dtype") not in {"torch.float32", "torch.bfloat16", "torch.float16"}:
+                    raise ValueError("Policy text encoder identity requires its actual computation dtype")
+                _integer(text_identity.get("tokenizer_max_length"), "policy tokenizer maximum length", minimum=1)
             if condition != "base":
                 for key in ("prefix_layout", "effect_source", "memory_semantics", "prior_variant"):
                     if row.get(key) != contracts[condition][key]:

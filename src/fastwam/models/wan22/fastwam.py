@@ -205,6 +205,18 @@ class FastWAM(torch.nn.Module):
         return model
 
     def to(self, *args, **kwargs):
+        if getattr(self, "zeva_trainable_precision", None) == "float32":
+            requested_dtype = kwargs.get("dtype")
+            for value in args:
+                if isinstance(value, torch.dtype):
+                    requested_dtype = value
+                elif isinstance(value, torch.Tensor):
+                    requested_dtype = value.dtype
+            if requested_dtype is not None and requested_dtype != torch.float32:
+                raise ValueError(
+                    "prepared Zeva training parameters must remain FP32; "
+                    "use autocast for mixed-precision compute or load a separate inference model"
+                )
         super().to(*args, **kwargs)
         self.mot.to(*args, **kwargs)
         if self.text_encoder is not None:
@@ -1102,6 +1114,10 @@ class FastWAM(torch.nn.Module):
         return (self.zeva_training_stage == "pim_adapter"
                 and getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_joint_warmup")
 
+    @property
+    def zeva_foundation_mode(self) -> str:
+        return "joint" if self.zeva_joint_foundation else "frozen"
+
     def zeva_foundation_parameters(self):
         """Policy backbone only; VAE and the frozen language encoder stay out.
 
@@ -1115,20 +1131,34 @@ class FastWAM(torch.nn.Module):
             raise AssertionError("duplicate FastWAM foundation optimizer parameter")
         return parameters
 
-    def prepare_zeva_joint_training_precision(self) -> None:
+    def prepare_zeva_training_precision(self) -> None:
         """Keep FP32 trainable weights for small-LR updates under AMP.
 
-        Call before optimizer/DDP construction. Direct AdamW updates of bf16
-        weights can round away a 1e-6 foundation update; bf16 autocast still
-        controls compute while FP32 parameters retain accumulated updates.
+        Call after stage-specific freezing and before optimizer/DDP creation.
+        Predictive Stage2A, frozen Stage2B and joint Stage2B all use the same
+        parameter/moment precision. Direct AdamW updates of bf16 weights can
+        round away small updates; autocast still controls compute while FP32
+        parameters retain accumulated updates.
         Frozen VAE/text parameters retain their original inference dtype.
         """
-        if not self.zeva_joint_foundation:
-            raise ValueError("FP32 joint training preparation requires ego_joint_warmup")
+        config = getattr(self.zeva_behavior_prefix_adapter, "config", None)
+        if (not self.zeva_enabled
+                or getattr(config, "effect_source", None) != "current_prediction"
+                or self.zeva_training_stage not in {"policy_injection", "pim_adapter"}):
+            raise ValueError("FP32 Zeva training preparation requires predictive Stage2A or Stage2B")
         with torch.no_grad():
             for parameter in self.parameters():
                 if parameter.requires_grad:
                     parameter.data = parameter.data.float()
+                    if parameter.grad is not None:
+                        parameter.grad = parameter.grad.float()
+        self.zeva_trainable_precision = "float32"
+
+    def prepare_zeva_joint_training_precision(self) -> None:
+        """Compatibility alias for callers using the original joint recipe."""
+        if not self.zeva_joint_foundation:
+            raise ValueError("FP32 joint training preparation requires ego_joint_warmup")
+        self.prepare_zeva_training_precision()
 
     def configure_zeva_trainable_state(self) -> None:
         if not self.zeva_enabled:
@@ -1832,6 +1862,11 @@ class FastWAM(torch.nn.Module):
         zeva_current_effect_mask: Optional[torch.Tensor] = None,
         initial_action_noise: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
+        if float(text_cfg_scale) != 1.0 or negative_prompt not in {None, ""}:
+            raise ValueError(
+                "FastWAM.infer_action supports text_cfg_scale=1 and no negative_prompt; "
+                "classifier-free text guidance is not implemented for cached action inference"
+            )
         self.eval()
         if zeva_mode not in {"base", "zeva_stage2", "pim_shadow", "pim_on"}:
             raise ValueError(
@@ -2162,6 +2197,11 @@ class FastWAM(torch.nn.Module):
             raise RuntimeError("Cannot save a Zeva addon before attaching it")
         from fastwam.zeva.checkpoint import JOINT_FOUNDATION_SCHEMA, addon_layout_metadata, checkpoint_sha256
         path = Path(path)
+        training_metadata = {"foundation_mode": self.zeva_foundation_mode}
+        if getattr(self, "zeva_trainable_precision", None) == "float32":
+            if any(p.requires_grad and p.dtype != torch.float32 for p in self.parameters()):
+                raise ValueError("prepared Zeva training parameters no longer have FP32 precision")
+            training_metadata["trainable_precision"] = "float32"
         foundation_identity = None
         if self.zeva_joint_foundation:
             foundation_path = path.with_name(path.stem.removesuffix("_addon") + "_foundation.pt")
@@ -2170,6 +2210,7 @@ class FastWAM(torch.nn.Module):
             foundation = {
                 "schema": JOINT_FOUNDATION_SCHEMA,
                 "training_recipe": "ego_joint_warmup",
+                **training_metadata,
                 "step": int(step),
                 "base_checkpoint_sha256": base_checkpoint_sha256,
                 "cte_checkpoint_sha256": cte_checkpoint_sha256,
@@ -2193,6 +2234,7 @@ class FastWAM(torch.nn.Module):
             **addon_layout_metadata(self.zeva_behavior_prefix_adapter),
             "training_stage": self.zeva_training_stage,
             "training_recipe": getattr(self, "zeva_training_recipe", "frozen_parent"),
+            **training_metadata,
             "step": int(step), "config": config or {},
             "base_checkpoint_sha256": base_checkpoint_sha256,
             "cte_checkpoint_sha256": cte_checkpoint_sha256,
@@ -2205,8 +2247,9 @@ class FastWAM(torch.nn.Module):
         temporary.replace(path)
 
     def _load_zeva_joint_foundation(self, path: Path, addon_payload: dict) -> None:
-        from fastwam.zeva.checkpoint import JOINT_FOUNDATION_SCHEMA
+        from fastwam.zeva.checkpoint import JOINT_FOUNDATION_SCHEMA, checkpoint_foundation_mode
         payload = torch.load(path, map_location="cpu", weights_only=False)
+        checkpoint_foundation_mode(payload)
         expected = {
             "schema": JOINT_FOUNDATION_SCHEMA, "training_recipe": "ego_joint_warmup",
             "step": addon_payload["step"],
@@ -2214,6 +2257,9 @@ class FastWAM(torch.nn.Module):
             "cte_checkpoint_sha256": addon_payload["cte_checkpoint_sha256"],
             "task_context_identity": addon_payload.get("task_context_identity"),
         }
+        for name in ("foundation_mode", "trainable_precision"):
+            if name in addon_payload:
+                expected[name] = addon_payload[name]
         for name, value in expected.items():
             if payload.get(name) != value:
                 raise ValueError(f"joint foundation checkpoint lineage mismatch: {name}")
@@ -2283,6 +2329,9 @@ class FastWAM(torch.nn.Module):
             )
         return {
             "training_stage": stage,
+            "training_recipe": getattr(self, "zeva_training_recipe", "frozen_parent"),
+            "foundation_mode": self.zeva_foundation_mode,
+            "trainable_dtypes": sorted({str(self.get_parameter(n).dtype) for n in trainable}),
             "trainable_names": trainable,
             "trainable_count": sum(self.get_parameter(n).numel() for n in trainable),
             "frozen_count": sum(self.get_parameter(n).numel() for n in frozen),

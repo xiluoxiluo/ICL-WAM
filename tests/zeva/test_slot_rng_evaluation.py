@@ -254,7 +254,13 @@ def test_manifest_runner_exports_complete_only_after_all_task_handoffs_and_audit
         "--conditions", "base", "--output-dir", str(output),
     ])
     visited = []
-    identity = {"base_sha256": "a" * 64, "stats_sha256": "b" * 64}
+    identity = {"base_sha256": "a" * 64, "stats_sha256": "b" * 64,
+                "policy_text": {"schema": "iclwam_policy_text_v1",
+                                "prompt_semantics": "wan_whitespace_special_tokens_zero_padding_visible_v1",
+                                "encoder_device": "cpu", "encoder_dtype": "torch.float32",
+                                "encoder_sha256": "c" * 64, "tokenizer_sha256": "d" * 64,
+                                "tokenizer_max_length": 128, "cache_size": 16,
+                                "cache_storage_device": "cpu"}}
 
     def child(command, *, cwd, check):
         settings = {key: json.loads(value) for part in command if "=" in part for key, value in [part.split("=", 1)]}
@@ -287,6 +293,9 @@ def test_manifest_runner_exports_complete_only_after_all_task_handoffs_and_audit
                     "step_count": steps, "step_limit": 48, "model_seed": get("model_seed"), "num_inference_steps": 10,
                     "run_id": get("run_id"), "condition": "base", "zeva_mode": "base", "cross_memory_enabled": True,
                     "skip_get_obs_within_replan": get("skip_get_obs_within_replan"),
+                    "foundation_mode": "frozen",
+                    "policy_text_encoder_device": get("policy_text_encoder_device"),
+                    "policy_text_cache_size": get("policy_text_cache_size"),
                     "checkpoint_identity": identity, "reset_scope": "episode" if attempt == 1 else "attempt",
                     "pim_entries_before": 0, "evaluation_slot": {"index": get("evaluation_slot_index"), "count": 2},
                     "seed_stream_before": before, "seed_stream": stream.snapshot(), "video_path": str(video),

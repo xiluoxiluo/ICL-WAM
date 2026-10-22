@@ -5,11 +5,10 @@ defaults:
 
 # Reproduce the previous predictive addon-only recipe and initial-readout
 # retrieval. New experiments should use robotwin_zeva_ego_pim_3cam_384.
+foundation_mode: frozen
 model:
   mot_checkpoint_mixed_attn: false
   zeva:
-    training_recipe: ego_adapter_warmup
-    freeze_fastwam: true
     task_context:
       mode: static
       temperature: 0.07

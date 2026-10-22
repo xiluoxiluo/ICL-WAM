@@ -8,6 +8,7 @@ import torch
 
 from experiments.robotwin.fastwam_policy.deploy_policy import WorldActionRobotWinPolicy
 from fastwam.zeva.attempt_protocol import ModelSeedStream
+from fastwam.zeva.prompt_cache import PolicyPromptCache
 
 
 class _PrefixAdapter:
@@ -66,6 +67,7 @@ def _runtime_policy(memory, *, mode="pim_on", cross_memory=True):
         encode_prompt=lambda _: (torch.ones(1, 2, 4), torch.ones(1, 2, dtype=torch.bool)),
         infer_action_zeva=lambda **kwargs: requests.append(kwargs) or {"action": torch.zeros(1, 32, 14)},
     )
+    policy._policy_prompt_cache = PolicyPromptCache(policy.model.encode_prompt)
     policy.zeva_mode, policy.cross_memory_enabled = mode, cross_memory
     policy._static_task_context_session, policy.task_context_bank = None, None
     # This sentinel must never be mistaken for the completed effect used

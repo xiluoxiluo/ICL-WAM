@@ -21,7 +21,8 @@ def test_incomplete_predictive_state_never_falls_back_to_generic_accelerate(tmp_
 def test_interrupted_checkpoint_overwrite_invalidates_old_complete_before_weights(tmp_path):
     trainer = Wan22Trainer.__new__(Wan22Trainer)
     trainer.global_step, trainer.state_dir, trainer.predictive_zeva = 500, str(tmp_path), True
-    trainer.accelerator = SimpleNamespace(is_main_process=True, wait_for_everyone=lambda: None)
+    trainer.accelerator = SimpleNamespace(is_main_process=True, sync_gradients=True,
+                                         wait_for_everyone=lambda: None)
     state = tmp_path / "step_000500"
     state.mkdir()
     marker = state / "COMPLETE"

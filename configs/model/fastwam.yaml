@@ -27,7 +27,9 @@ video_dit_config:
   require_clip_embedding: false
   require_vae_embedding: false
   fuse_vae_embedding_in_latents: true
-  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  # Cached action training is checkpointed by MoT. The standalone Wan
+  # checkpoint path is incompatible with MoT's tensor interface.
+  use_gradient_checkpointing: false
   video_attention_mask_mode: "first_frame_causal" # default
   action_conditioned: false
   action_dim: ${data.train.processor.action_output_dim}
@@ -43,7 +45,7 @@ action_dit_config:
   text_dim: 4096
   freq_dim: 256
   eps: 1.0e-06
-  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+  use_gradient_checkpointing: false
 
 video_scheduler:
   train_shift: 5.0

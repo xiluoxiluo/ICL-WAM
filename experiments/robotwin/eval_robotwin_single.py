@@ -272,6 +272,7 @@ def main(cfg: DictConfig):
         "model_rng_protocol", "evaluation_slot_index", "evaluation_slot_count",
         "model_rng_state_path", "model_rng_task_name", "model_rng_run_id",
         "expected_manifest_sha256",
+        "policy_text_encoder_device", "policy_text_cache_size",
     ):
         value = cfg.EVALUATION.get(key)
         if key in {"episode_manifest", "attempt_log_path", "model_rng_state_path"}:

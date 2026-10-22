@@ -1,6 +1,6 @@
 # ICLWAM：把 Zeva 因果记忆接到 FastWAM
 
-## 当前推荐：Zeva-Ego 预测 CTE、语言检索与 foundation 联合训练
+## 当前推荐：预测 CTE、语言检索与可切换的 foundation 训练
 
 本次按 [Zeva `feature/zeva_ego` 的 README 与实际训练/评测代码](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101) 对齐了从 CTE 到 RoboTwin rollout 的完整语义。**新训练请使用 [预测 CTE / task memory / Stage2 / RoboTwin 运行指南](docs/zeva_ego_training_evaluation.md)**；其中包含完整命令、参考源码、适配差异及旧产物迁移边界。
 
@@ -12,6 +12,9 @@
 - **纯语言 task retrieval**：固定 tokenizer 与文本输入 embedding 表，对 task instruction 做 masked mean；冻结的分类器先预测 task，再用该 task 的平均 CTE key 在同任务 train bank 内做 top-5 检索。推理不接收真实 task label；检索不依赖联合训练中变化的 image/text hidden states。
 - **预测历史与split隔离**：当前attempt结束后才提交其预测trace；离线PIM训练缓存与task memory只使用train episodes作为历史源。Stage1、cache与Stage2共享episode split，validation轨迹不进入bank或离线PIM历史；在线PIM读取本评测episode此前attempt的trace。
 - **PIM阶段安排**：前500次更新只训PIM，之后联合更新 FastWAM foundation（LR1e-6）、EAP（1e-5）与PIM（5e-5）；CTE、VAE、文本编码器和语言检索保持冻结。修复 video 输入投影的梯度路径，启用逐层梯度检查点；可训练参数使用 FP32，计算可用 bf16 autocast，避免小学习率更新被参数舍入吞掉。
+- **Foundation 单开关**：新Stage2B使用 `foundation_mode=joint`（默认）或 `foundation_mode=frozen`，只改变foundation训练范围；两种模式保持相同语言检索、CTE、Stage2A parent和训练流程。Stage2A、冻结Stage2B与联合Stage2B的可训练参数均保留FP32。推理始终固定权重，在线变化的是CTE状态和PIM历史。
+- **16卡训练**：`robotwin_zeva_ego_pim_16gpu_3cam_384` 使用普通DDP加PyTorch ZeRO-1优化器状态分片，batch1×累积16×16卡=256；保存的部署权重仍可在单卡加载，完整state另用于恢复优化器与RNG。
+- **32GB部署路径**：policy的完整文本编码器默认独立放在CPU，按prompt缓存至多16份文本特征；action模型不再先在GPU构造完整文本编码器。评测记录文本权重/tokenizer身份、实际设备/精度和CUDA显存统计，GPU显存与速度仍需实机测量。
 - **RoboTwin评测**：冻结10×20场景、同seed/指令重试、成功即停、最多4次、固定200分母；8个逻辑slot的连续模型噪声跨task交接，并审计reset、视频、噪声消耗和artifact身份。新旧版本可指定各自完整CTE/bank/head组合。
 
 | 阶段 | 新入口 / task |
@@ -21,12 +24,15 @@
 | task memory / 语言特征 / 全query static context | `scripts/build_zeva_ego_task_memory.py`；中间用 `scripts/train_zeva_task_language.py` 重建本地分类器 |
 | PIM train/validation cache | `scripts/build_zeva_cross_attempt_cache.py`，自动识别新boundary schema |
 | Stage2A | `scripts/train_zeva_fastwam_prepared.py` / `robotwin_zeva_ego_policy_3cam_384` |
-| Stage2B | 同一prepared入口 / `robotwin_zeva_ego_pim_3cam_384`，默认 `ego_joint_warmup` |
+| Stage2B | 同一prepared入口 / `robotwin_zeva_ego_pim_3cam_384`，使用 `foundation_mode=frozen\|joint` |
+| 16卡 Stage2B | 同一prepared入口 / `robotwin_zeva_ego_pim_16gpu_3cam_384`，默认ZeRO-1、有效batch256 |
 | 正式评测 | `scripts/eval_zeva_robotwin_manifest.py`，默认新预测版；on/off使用同一Stage2B addon及其foundation权重 |
 
 新addon schema为 `zeva_ego_prediction_v1`。联合训练会另存配对的 `step_XXXXXX_foundation.pt`；部署自动加载并校验其 SHA256，不能只复制 addon 后回退到原始底座。
 
-**若已完成上一版预测 CTE（提交 `5344a78`）的训练，可以复用该 CTE、boundary 与 PIM 缓存；本轮重建语言 encoder/features/bank/classifier/static contexts，再重新训练 Stage2A、Stage2B。** 若仍使用更早的4-step / completed-effect CTE，须从新CTE开始重训。原FastWAM base、数据、stats、语义任务表和匹配的policy文本cache可复用；旧image+text retrieval head不能作为新语言分类器。上一版预测CTE但冻结foundation的对照配置为 `robotwin_zeva_ego_pim_frozen_3cam_384`；更早 `latest_completed` 版本见 [历史独立prefix指南](docs/zeva_ego_cross_attempt.md)。
+新同架构冻结对照可以直接在上述Stage2B命令中设置 `foundation_mode=frozen`，或使用别名任务 `robotwin_zeva_ego_pim_language_frozen_3cam_384`。正式评测用 `--new-foundation-mode frozen` / `joint` 匹配所选checkpoint；这个选项描述训练模式，不会在推理时解冻参数。`--policy-text-encoder-device cpu --policy-text-cache-size 16` 是单卡部署默认配置。
+
+**若已完成语言检索版本（提交 `68a6fa7`）的产物准备，本轮可复用CTE、boundary、PIM及语言检索产物，无需重训CTE或分类器。** 新FP32训练会检查旧完整state的数值与优化器兼容性，不能把旧BF16状态当作新配方的精确续训。若停留在预测CTE但仍使用image+text检索的 `5344a78`，可复用CTE、boundary与PIM缓存，须重建语言encoder/features/bank/classifier/static contexts并重训Stage2A、Stage2B；更早4-step / completed-effect版本须从新CTE开始重训。原FastWAM base、数据、stats、语义任务表和匹配的policy文本cache可复用；旧image+text retrieval head不能作为新语言分类器。上一版预测CTE但冻结foundation的对照配置为 `robotwin_zeva_ego_pim_frozen_3cam_384`；更早 `latest_completed` 版本见 [历史独立prefix指南](docs/zeva_ego_cross_attempt.md)。
 
 本次已加入CPU结构、梯度、因果性、缓存、部署生命周期和评测协议测试；**没有实际完成80epoch GPU训练或200episode RoboTwin仿真，因此尚无新版成功率结果**。FastWAM仍保持video/action experts、joint14、预测32步/执行24步；本项目没有改成pi0.5，也不直接加载参考pi0.5发布权重。
 

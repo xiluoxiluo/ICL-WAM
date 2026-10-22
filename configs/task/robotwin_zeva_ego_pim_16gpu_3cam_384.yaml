@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - robotwin_zeva_ego_pim_3cam_384
+  - _self_
+
+# 16 ranks x microbatch 1 x accumulation 16 = effective batch 256.
+# Works with either foundation_mode=joint or foundation_mode=frozen.
+# This is an optimizer-state sharding recipe, not FSDP/ZeRO-3.
+batch_size: 1
+gradient_accumulation_steps: 16
+zeva_optimizer_sharding: zero1

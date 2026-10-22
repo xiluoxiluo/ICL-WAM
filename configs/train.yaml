@@ -35,6 +35,11 @@ seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
+# Predictive Stage2 can shard Adam states while retaining ordinary DDP models.
+# zero1 requires at least two ranks; deployment never creates an optimizer.
+zeva_optimizer_sharding: none
+# null selects (0.9, 0.999) for predictive Stage2 and the legacy defaults otherwise.
+optimizer_betas: null
 
 # wandb
 wandb:

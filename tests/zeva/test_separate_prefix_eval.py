@@ -60,6 +60,7 @@ def test_manifest_uses_per_condition_layout_and_configured_reader_capacity(
         "pim_variant": "cross_attempt", "pim_top_k": 192,
         "memory_semantics": "predicted_effect_trace", "prior_variant": "zeva_ego",
         "training_recipe": "ego_joint_warmup", "task_context_mode": "task_language",
+        "foundation_mode": "joint", "policy_text_encoder_device": "cpu", "policy_text_cache_size": 16,
         "skip_get_obs_within_replan": True,
     }
     for item in plan["commands"]:

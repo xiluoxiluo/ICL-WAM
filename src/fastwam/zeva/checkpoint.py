@@ -12,6 +12,20 @@ from .schemas import CacheManifest
 JOINT_FOUNDATION_SCHEMA = "iclwam_joint_foundation_v1"
 
 
+def checkpoint_foundation_mode(payload: dict) -> str:
+    """Read the explicit mode, retaining recipe-based legacy compatibility."""
+    inferred = "joint" if payload.get("training_recipe") == "ego_joint_warmup" else "frozen"
+    mode = payload.get("foundation_mode", inferred)
+    if mode not in {"frozen", "joint"}:
+        raise ValueError("checkpoint foundation_mode must be 'frozen' or 'joint'")
+    if mode != inferred:
+        raise ValueError("checkpoint foundation_mode and training_recipe disagree")
+    precision = payload.get("trainable_precision")
+    if precision is not None and precision != "float32":
+        raise ValueError("unsupported checkpoint trainable_precision")
+    return mode
+
+
 def resolve_joint_foundation_checkpoint(
     addon_path: str | Path, payload: dict | None = None, *, verify_hash: bool = True,
 ) -> Path | None:
@@ -25,7 +39,7 @@ def resolve_joint_foundation_checkpoint(
     if payload is None:
         payload = torch.load(addon_path, map_location="cpu", weights_only=False)
     identity = payload.get("foundation_checkpoint")
-    joint = payload.get("training_recipe") == "ego_joint_warmup"
+    joint = checkpoint_foundation_mode(payload) == "joint"
     if not joint:
         if identity is not None:
             raise ValueError("foundation checkpoint metadata requires ego_joint_warmup")

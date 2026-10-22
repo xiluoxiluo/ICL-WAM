@@ -5,6 +5,16 @@ defaults:
 
 # Reference PIM steps/seed/group LRs; effective batch is explicitly reported
 # by the launcher. After warmup, update FastWAM foundation + EAP + PIM.
+# Change only foundation_mode to compare frozen/joint backbones with the
+# same language retrieval, Stage2A parent, precision and optimizer settings.
+foundation_mode: joint
+foundation_mode_settings:
+  frozen:
+    training_recipe: ego_adapter_warmup
+    freeze_fastwam: true
+  joint:
+    training_recipe: ego_joint_warmup
+    freeze_fastwam: false
 learning_rate: 5.0e-5
 gradient_accumulation_steps: 64  # batch1 x accumulation64 x 4 GPUs = reference256
 max_steps: 2000
@@ -18,6 +28,7 @@ model:
   mot_checkpoint_mixed_attn: true
   zeva:
     training_stage: pim_adapter
-    training_recipe: ego_joint_warmup
-    freeze_fastwam: false
+    foundation_mode: ${foundation_mode}
+    training_recipe: ${foundation_mode_settings.${foundation_mode}.training_recipe}
+    freeze_fastwam: ${foundation_mode_settings.${foundation_mode}.freeze_fastwam}
     policy_checkpoint: null  # required: new predictive Stage2A

@@ -26,6 +26,10 @@ from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 from .zeva.checkpoint import checkpoint_sha256
 from .zeva.ego_pim_schedule import HISTORY_KINDS, apply_history_kind, select_history_kind, eap_lr_factor
+from .zeva.distributed_training import (
+    collect_optimizer_checkpoint, create_training_optimizer, load_optimizer_checkpoint,
+    optimizer_betas, optimizer_sharding_mode, release_optimizer_checkpoint,
+)
 
 logger = get_logger(__name__)
 
@@ -75,6 +79,10 @@ class Wan22Trainer:
             getattr(getattr(self.model, "zeva_behavior_prefix_adapter", None), "config", None),
             "effect_source", "latest_completed",
         ) == "current_prediction"
+        self.zeva_optimizer_sharding = optimizer_sharding_mode(cfg.get("zeva_optimizer_sharding", "none"))
+        self.optimizer_betas = optimizer_betas(cfg.get("optimizer_betas"), predictive=self.predictive_zeva)
+        if self.zeva_optimizer_sharding != "none" and not self.predictive_zeva:
+            raise ValueError("zero1 is supported only for predictive Zeva Stage2 training")
         if self.predictive_zeva and self.mixed_precision == "fp16":
             raise ValueError("Predictive Stage2 supports bf16/no precision; fp16 scaler state is not part of its checkpoint contract")
         self._zeva_data_identity = {}
@@ -108,15 +116,17 @@ class Wan22Trainer:
             # final video post-attention branch. Discover those unused weights
             # while keeping a static trainable set across the LR-only warmup.
             kwargs_handlers=([DistributedDataParallelKwargs(
-                find_unused_parameters=True, broadcast_buffers=False,
-            )] if self.joint_foundation_training else []),
+                find_unused_parameters=True, broadcast_buffers=False, gradient_as_bucket_view=True,
+            )] if self.predictive_zeva else []),
         )
         
         deepspeed_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
         if self.predictive_zeva and self.accelerator.distributed_type not in {
             DistributedType.NO, DistributedType.MULTI_GPU, DistributedType.MULTI_CPU,
         }:
-            raise ValueError("Predictive addon checkpoints support a single process / ordinary DDP, not sharded DeepSpeed/FSDP state")
+            raise ValueError("Predictive checkpoints support ordinary DDP with none/zero1 Adam state, not DeepSpeed/FSDP")
+        if self.zeva_optimizer_sharding == "zero1" and self.accelerator.num_processes < 2:
+            raise ValueError("zero1 requires ordinary DDP with at least two processes; use none for one process")
         deepspeed_config = getattr(deepspeed_plugin, "deepspeed_config", {}) or {}
         zero_stage = deepspeed_config.get("zero_optimization", {}).get("stage", "none")
         logger.info(
@@ -138,15 +148,21 @@ class Wan22Trainer:
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         self._apply_dit_only_train_mode(self.model)
+        if self.predictive_zeva:
+            # Promote the destination before loading a FP32 Stage2A parent;
+            # loading into bf16 first would irreversibly round its updates.
+            self.model.prepare_zeva_training_precision()
+            logger.info("Predictive training uses FP32 trainable parameters/Adam states with %s autocast; frozen encoders retain their dtype",
+                        self.mixed_precision)
         if self.zeva_training:
             if self.zeva_training_stage == "policy_injection":
                 self._initialize_policy_stage_from_warmstart()
             elif self.zeva_training_stage == "pim_adapter":
                 self._initialize_pim_stage_from_policy_checkpoint()
-        if self.joint_foundation_training:
-            self.model.prepare_zeva_joint_training_precision()
-            logger.info("Joint training uses FP32 trainable parameters/Adam states with %s autocast; frozen encoders retain their dtype",
-                        self.mixed_precision)
+        if self.zeva_optimizer_sharding == "zero1":
+            # ZeRO caches its communication device at construction. Establish
+            # rank placement before constructing it, not later in prepare().
+            self.model.to(self.accelerator.device)
         if self.zeva_training:
             if self.zeva_training_stage == "policy_injection":
                 trainable_params = list(self.model.zeva_trainable_parameters())
@@ -225,12 +241,14 @@ class Wan22Trainer:
         )
         if len({id(parameter) for parameter in trainable_params}) != len(trainable_params):
             raise ValueError("optimizer groups contain duplicate trainable parameters")
-        self.optimizer = torch.optim.AdamW(
-            optimizer_params,
+        self.optimizer = create_training_optimizer(
+            optimizer_params, sharding=self.zeva_optimizer_sharding, predictive=self.predictive_zeva,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
-            betas=(0.9, 0.999) if self.joint_foundation_training else (0.9, 0.95),
+            betas=self.optimizer_betas,
         )
+        logger.info("AdamW optimizer state: sharding=%s betas=%s; DDP parameters/gradients remain replicated",
+                    self.zeva_optimizer_sharding, self.optimizer_betas)
         
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
@@ -312,7 +330,11 @@ class Wan22Trainer:
             set_global_seed(self.seed)
 
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
-            self.model, self.optimizer, self.train_loader, self.scheduler
+            self.model, self.optimizer, self.train_loader, self.scheduler,
+            # AcceleratedOptimizer's default placement calls state_dict() then
+            # load_state_dict(), which cannot run on unconsolidated ZeRO state.
+            **({"device_placement": [True, False, True, False]}
+               if self.zeva_optimizer_sharding == "zero1" else {}),
         )
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
@@ -602,9 +624,15 @@ class Wan22Trainer:
                         f"checkpoint={checkpoint_stage}, current={self.zeva_training_stage}"
                     )
                 self.addon_weights_path = str(addon_path)
-                payload = torch.load(resume_path / "optimizer_scheduler.pt", map_location="cpu")
-                self.optimizer.load_state_dict(payload["optimizer"])
-                self.scheduler.load_state_dict(payload["scheduler"])
+                if getattr(self, "predictive_zeva", False):
+                    load_optimizer_checkpoint(
+                        resume_path / "optimizer_scheduler.pt", self.optimizer, self.scheduler,
+                        world_size=self.accelerator.num_processes, predictive=True,
+                    )
+                else:
+                    payload = torch.load(resume_path / "optimizer_scheduler.pt", map_location="cpu")
+                    self.optimizer.load_state_dict(payload["optimizer"])
+                    self.scheduler.load_state_dict(payload["scheduler"])
                 state_file = resume_path / "trainer_state.json"
                 if state_file.is_file():
                     with state_file.open("r", encoding="utf-8") as handle:
@@ -685,6 +713,11 @@ class Wan22Trainer:
         for key in sorted(keys):
             if saved.get(key) != self.cfg.get(key):
                 raise ValueError(f"Predictive Stage2 resume curriculum/optimizer mismatch: {key}")
+        if getattr(self, "predictive_zeva", False):
+            if optimizer_sharding_mode(saved.get("zeva_optimizer_sharding")) != optimizer_sharding_mode(self.cfg.get("zeva_optimizer_sharding")):
+                raise ValueError("Predictive Stage2 resume curriculum/optimizer mismatch: zeva_optimizer_sharding")
+            if optimizer_betas(saved.get("optimizer_betas"), predictive=True) != optimizer_betas(self.cfg.get("optimizer_betas"), predictive=True):
+                raise ValueError("Predictive Stage2 resume curriculum/optimizer mismatch: optimizer_betas")
 
     def _rank_rng_state(self):
         device = torch.device(self.accelerator.device)
@@ -1141,6 +1174,8 @@ class Wan22Trainer:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
     def save_checkpoint(self):
+        if getattr(self, "predictive_zeva", False) and not self.accelerator.sync_gradients:
+            raise ValueError("Predictive Stage2 checkpoint must be saved at a completed optimizer boundary, not during gradient accumulation")
         step_tag = f"step_{self.global_step:06d}"
         state_path = os.path.join(self.state_dir, step_tag)
 
@@ -1160,14 +1195,22 @@ class Wan22Trainer:
             # Weights were saved above: addon-only for frozen recipes, or an
             # addon plus the complete policy-backbone sidecar for joint mode.
             # VAE/text/CTE stay frozen and are not duplicated here.
-            if self.accelerator.is_main_process:
-                torch.save(
-                    {
-                        "optimizer": self.optimizer.state_dict(),
-                        "scheduler": self.scheduler.state_dict(),
-                    },
-                    Path(state_path) / "optimizer_scheduler.pt",
-                )
+            # ZeRO-1 requires every rank to enter consolidation. Only rank
+            # zero receives the full CPU state; deployment weights stay in the
+            # independent addon/foundation bundle written above.
+            optimizer_payload = collect_optimizer_checkpoint(
+                self.optimizer, self.scheduler, world_size=self.accelerator.num_processes,
+                rank=self.accelerator.process_index,
+            )
+            try:
+                if self.accelerator.is_main_process:
+                    target = Path(state_path) / "optimizer_scheduler.pt"
+                    temporary = target.with_suffix(".tmp")
+                    torch.save(optimizer_payload, temporary)
+                    temporary.replace(target)
+            finally:
+                del optimizer_payload
+                release_optimizer_checkpoint(self.optimizer)
             if getattr(self, "predictive_zeva", False):
                 rng_path = Path(state_path) / f"rng_rank_{self.accelerator.process_index:04d}.pt"
                 temporary = rng_path.with_suffix(".tmp")
