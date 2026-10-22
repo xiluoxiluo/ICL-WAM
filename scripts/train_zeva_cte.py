@@ -32,6 +32,7 @@ from fastwam.zeva.checkpoint import load_cte_checkpoint, save_cte_checkpoint
 from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset
 from fastwam.zeva.cte_training import MainCTEEpisodeDataset, pad_cte_trajectories
 from fastwam.zeva.main_data import is_main_profile, main_split_rows, normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
+from fastwam.zeva.cte_windows import MAIN_CTE_WINDOW_SEMANTICS
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.semantic_tasks import parse_episode_index_from_id
 from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_vae
@@ -198,6 +199,7 @@ def main(cfg: DictConfig) -> None:
         model = CausalTransitionEncoder(
             CausalTransitionEncoderConfig(**{k: v for k, v in cte_values.items() if k in allowed})
         )
+        model.zeva_main_features = is_main_profile(cfg)
         cte_input_type = str(cte_values.get("input_type", "rgb_frame"))
         if cte_input_type not in {"rgb_frame", "wan_vae_latent"}:
             raise ValueError("zeva.cte.input_type must be rgb_frame or wan_vae_latent")
@@ -311,6 +313,7 @@ def main(cfg: DictConfig) -> None:
                 dataset,
                 source_window_actions=32,
                 sample_stride=sample_stride,
+                include_observed_tail=is_main_profile(cfg),
             )
             if not raw_training_index:
                 raise ValueError("Stage 1 contains no complete, non-overlapping CTE windows")
@@ -321,6 +324,7 @@ def main(cfg: DictConfig) -> None:
         validation_dataset = None
         validation_index = []
         if is_main_profile(cfg):
+            main_metadata["cte_window_semantics"] = MAIN_CTE_WINDOW_SEMANTICS
             if use_latent_cache:
                 validate_main_artifact(dataset.manifest, main_metadata)
             validation_dataset = MainCTEEpisodeDataset(

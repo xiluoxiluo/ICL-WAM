@@ -129,7 +129,7 @@ def test_every_generated_hydra_stage_composes_the_main_lineage(tmp_path):
         with initialize_config_dir(version_base="1.3", config_dir=str(ROOT / "configs")):
             cfg = compose(config_name="train", overrides=command[index + 1:])
         assert cfg.model.zeva.profile == "main_observed"
-        assert config_numerical_contract(cfg.model.zeva) == "zeva_main_v1"
+        assert config_numerical_contract(cfg.model.zeva) == "zeva_main_v2"
         assert cfg.model.zeva.offline.validation_fraction == .1 and cfg.model.zeva.offline.split_seed == 42
         assert cfg.data.train.val_set_proportion == 0 and cfg.data.val is None
         assert cfg.model.zeva.task_context.mode == "static"

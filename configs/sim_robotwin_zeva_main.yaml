@@ -6,6 +6,10 @@ defaults:
 
 EVALUATION:
   evaluation_profile: main_observed
+  model_rng_protocol: zeva_main_attempt_replan_seed_v1
+  model_rng_state_path: null
+  model_rng_task_name: null
+  model_rng_run_id: null
   attempt_protocol: stop_on_success
   cross_memory_enabled: true
   pim_top_k: 4

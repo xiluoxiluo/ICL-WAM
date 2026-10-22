@@ -15,15 +15,16 @@ import torch
 from torch.utils.data import Dataset
 
 from .stage1_sampling import CTETrainIndex
+from .cte_windows import observed_prefix_transitions
 
 
 class MainCTEEpisodeDataset(Dataset):
-    """Join complete 32-control windows without resetting recurrent context.
+    """Join real observed portions of H32 windows without resetting context.
 
     One training row represents the entire available contiguous episode prefix.
-    A trailing incomplete 32-control window is intentionally not invented or
-    padded into a valid observed effect. No future observation enters an
-    earlier phase because the CTE action stream is shifted and recurrent.
+    The final source window may contain storage padding. Keep every truly
+    completed four-control interval, including successful terminal segments,
+    and trim unobserved frames/actions before the CTE sees the trajectory.
     """
 
     def __init__(self, base: Dataset, rows: list[CTETrainIndex], *, preencoded: bool) -> None:
@@ -53,7 +54,7 @@ class MainCTEEpisodeDataset(Dataset):
         frames_list, actions_list, frame_valid_list, transition_valid_list = [], [], [], []
         first = None
         previous_boundary = None
-        for row in rows:
+        for position, row in enumerate(rows):
             sample = self.base[int(row.dataset_index)]
             episode = sample["episode"]
             if (str(episode.episode_id) != str(row.episode_id)
@@ -66,8 +67,14 @@ class MainCTEEpisodeDataset(Dataset):
                 frames = torch.cat((sample["before_frames"], sample["after_frames"][-1:]), dim=0)
             if frames.shape[0] != 9 or sample["transition_actions"].shape[:2] != (8, 4):
                 raise ValueError("main episode stitching requires 9 frames/32 controls per source window")
-            if not bool(sample["frame_valid"].all()) or not bool(sample["transition_valid"].all()):
-                raise ValueError("main CTE refuses incomplete source windows")
+            complete = observed_prefix_transitions(sample["frame_valid"], sample["transition_valid"])
+            if complete < 1:
+                raise ValueError("main CTE source window has no completed observed transition")
+            if complete != 8 and position != len(rows) - 1:
+                raise ValueError("only the final main CTE source window may have an incomplete tail")
+            frames = frames[:complete + 1]
+            frame_valid = sample["frame_valid"][:complete + 1]
+            transition_valid = sample["transition_valid"][:complete]
             # Frozen framewise VAE encoding must give the same shared boundary.
             # BF16 cache roundoff is already encoded in both values identically.
             if previous_boundary is not None and not torch.allclose(
@@ -75,9 +82,9 @@ class MainCTEEpisodeDataset(Dataset):
             ):
                 raise ValueError("adjacent main CTE windows disagree on their observed boundary")
             frames_list.append(frames if previous_boundary is None else frames[1:])
-            frame_valid_list.append(sample["frame_valid"] if previous_boundary is None else sample["frame_valid"][1:])
-            actions_list.append(sample["transition_actions"])
-            transition_valid_list.append(sample["transition_valid"])
+            frame_valid_list.append(frame_valid if previous_boundary is None else frame_valid[1:])
+            actions_list.append(sample["transition_actions"][:complete])
+            transition_valid_list.append(transition_valid)
             previous_boundary = frames[-1]
         assert first is not None
         result = dict(first)

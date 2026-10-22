@@ -2,11 +2,15 @@
 
 ## 当前默认：Zeva-main 观察式经验，推理时只更新记忆
 
-主线现在参考 [原 Zeva main `17ca9fa0c68dca1fc7915dd6433de70a100e93a1`](https://github.com/air-embodied-brain/Zeva/tree/17ca9fa0c68dca1fc7915dd6433de70a100e93a1)，使用 `main_observed` / `zeva_main_v1` 合同：成功示范离线训练，真实完成交互的 `effect_post` 在线写入 BIT/PIM；推理时 foundation、CTE 和 addon 全部冻结，不进行反向更新。MCE 采用 main 的 gated PIM/global 合并与 BIT action prior，再适配 FastWAM 的 video/action 路径。零 PIM gate 对应已经训练的 Stage2A parent，不是未加 EAP 的原始 FastWAM。
+主线参考 [原 Zeva main `17ca9fa0c68dca1fc7915dd6433de70a100e93a1`](https://github.com/air-embodied-brain/Zeva/tree/17ca9fa0c68dca1fc7915dd6433de70a100e93a1)，使用 `main_observed` / `zeva_main_v2` 合同：成功示范离线训练，真实完成交互的 `effect_post` 在线写入 BIT/PIM；推理时 foundation、CTE 和 addon 全部冻结，不进行反向更新。MCE 采用 main 的 gated PIM/global 合并与 BIT action prior，再适配 FastWAM 的 video/action 路径。零 PIM gate 对应已经训练的 Stage2A parent。机制、源码证据、数值对照与仍需实测的边界见 [Zeva main 复查记录](docs/zeva_main_alignment_audit.md)。
 
-**完整离线入口在 [`scripts/train/README.md`](scripts/train/README.md)。** `01`–`11` 按环境、文本、VAE latents、CTE、phase/effect、bank/readout、静态检索、static context、PIM cache、Stage2A/B 排序；`12_run_all.sh --dry-run` 只打印命令。默认复用旧脚本中的数据和 checkpoint 路径，新产物位于 `runs/zeva_main_observed_v1`。必须提供有真实采集来源的 success manifest，脚本不会自动将未知数据声明为成功。CTE 的 step-based 优化配方、10% episode holdout 和本地缓存构造属于工程选择；原 main 没有公开完整 CTE 训练 recipe，不能声称逐项复现作者数据与优化参数。
+**完整离线入口在 [`scripts/train/README.md`](scripts/train/README.md)。** `01`–`11` 按环境、文本、VAE latents、CTE、phase/effect、bank/readout、静态检索、static context、PIM cache、Stage2A/B 排序；`12_run_all.sh --dry-run` 只打印命令。默认复用旧脚本中的数据和 checkpoint 路径，新产物位于 `runs/zeva_main_observed_v2`。必须提供有真实采集来源的 success manifest，脚本不会自动将未知数据声明为成功。CTE 的 step-based 优化配方、10% episode holdout 和本地缓存构造属于工程选择；原 main 没有公开完整 CTE 训练 recipe，不能声称逐项复现作者数据与优化参数。
+
+本次复查修正了真实尾部交互遗漏、main/Ego 推理精度混用、PIM 容量淘汰和同分检索、配对重试种子，以及冻结基座训练的 activation checkpoint。main CTE 与静态检索头使用 FP32 权重 + CUDA BF16 autocast；EAP/MCE 在加载完成后显式转为 policy 推理精度，默认 BF16。训练仍保留 FP32 参数/优化器状态。旧 `main_v1` 的缓存、CTE、addon 和连续 RNG 评测日志不可重新贴标签使用；新主线需重新运行 **03–11**（含重训 CTE 与 Stage2A/B）并重新评测。原始数据、success manifest、base checkpoint、stats 和匹配的文本 cache 可以复用。
 
 A/B 默认 `foundation_mode=frozen`，分别使用 5000/500 steps、有效 batch 128/64；16 GPU 对应 batch1 × 累积8/4。各阶段可显式切换 joint 作为 WAM 实验；无论训练选择哪种，部署都不更新参数。RoboTwin 使用 [`scripts/eval_zeva_main_robotwin.py`](scripts/eval_zeva_main_robotwin.py)：独立单次 `SR@1`、成功即停的累计 `CSR@k`、固定 K 次的首成后稳定率分开报告。同权重 memory on/off 是恢复实验的基础；success replay 默认关闭，仅 fixed-attempt 稳定性实验显式启用，首次成功前不可用。
+
+主线重试按公开 main 协议使用 `base_seed + 1000 × attempt_id + replan_index`，每个真实请求写入日志。相同 attempt/replan 的种子与此前轨迹长短无关。`memory on/off` 实际切换 PIM 条件，两组均保留 global context、BIT 和 action prior。PIM 同时包含当前 attempt 和之前 attempt 中已完成的真实交互；比较两组累计成功率能够评估 PIM 增益，要单独归因于此前失败内容还需共享失败轨迹的对照。
 
 原 main benchmark 环境是 RoboCasa；本仓库是 FastWAM/RoboTwin 适配，不继承原论文或 Ego 的成功率数值。当前验证为 CPU、合同、mock rollout 和命令测试，没有据此宣称训练完成、真实 RoboTwin 成功率提升或单卡 32 GB 已实测可用。
 

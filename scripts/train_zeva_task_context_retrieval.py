@@ -48,7 +48,8 @@ def main(cfg: DictConfig):
     if is_main_profile(cfg):
         validation_kwargs = {"validation_readouts": cache["validation_readouts"],
             "validation_semantic_ids": torch.tensor([tasks[value] for value in cache["validation_task_ids"]])}
-    metrics = train_retrieval_head(head, readouts, keys, labels, seed=seed, **validation_kwargs, **dict(tc.training))
+    metrics = train_retrieval_head(head, readouts, keys, labels, seed=seed,
+        main_features=is_main_profile(cfg), **validation_kwargs, **dict(tc.training))
     path = Path(str(tc.retrieval_checkpoint))
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({

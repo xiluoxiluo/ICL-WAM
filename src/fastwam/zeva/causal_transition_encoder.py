@@ -214,6 +214,24 @@ class CausalTransitionEncoder(nn.Module):
         valid_mask: Tensor | None = None,
         transition_valid: Tensor | None = None,
     ) -> dict[str, Tensor]:
+        from .feature_precision import main_feature_autocast
+        # Original main serves FP32 CTE weights under CUDA BF16 autocast.
+        # Cover online history, offline caches and behavior prototypes at
+        # their common boundary. The training optimizer recipe is a local
+        # FP32 choice because the original full recipe is not released.
+        with main_feature_autocast(
+            frames.device,
+            enabled=bool(getattr(self, "zeva_main_features", False)) and not self.training,
+        ):
+            return self._forward(frames, transition_actions, valid_mask, transition_valid)
+
+    def _forward(
+        self,
+        frames: Tensor,
+        transition_actions: Tensor,
+        valid_mask: Tensor | None = None,
+        transition_valid: Tensor | None = None,
+    ) -> dict[str, Tensor]:
         cfg = self.cfg
         if frames.ndim != 5 or transition_actions.ndim != 4:
             raise ValueError("Expected frames [B,T,C,H,W] and transition_actions [B,T-1,4,A].")

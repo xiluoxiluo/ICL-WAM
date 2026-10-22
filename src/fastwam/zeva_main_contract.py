@@ -8,9 +8,10 @@ from collections.abc import Mapping
 
 MAIN_PROFILE = "main_observed"
 MAIN_REFERENCE_COMMIT = "17ca9fa0c68dca1fc7915dd6433de70a100e93a1"
-MAIN_ARTIFACT_LINEAGE = "zeva_main_observed_effect_v1"
-MAIN_NUMERICAL_CONTRACT = "zeva_main_v1"
-MAIN_ADDON_SCHEMA = "zeva_main_observed_policy_v1"
+MAIN_ARTIFACT_LINEAGE = "zeva_main_observed_effect_v2"
+MAIN_NUMERICAL_CONTRACT = "zeva_main_v2"
+MAIN_ADDON_SCHEMA = "zeva_main_observed_policy_v2"
+MAIN_FEATURE_PRECISION = "cuda_bf16_autocast_fp32_weights_v1"
 MAIN_JOINT_RECIPES = frozenset({"main_joint_parent", "main_joint_pim"})
 MAIN_RECIPES = MAIN_JOINT_RECIPES | {"main_frozen_parent", "main_frozen_pim"}
 
@@ -18,6 +19,8 @@ MAIN_RECIPES = MAIN_JOINT_RECIPES | {"main_frozen_parent", "main_frozen_pim"}
 def validate_main_model_config(zeva: Mapping) -> None:
     if zeva.get("profile") != MAIN_PROFILE:
         raise ValueError("Expected explicit main_observed profile")
+    if zeva.get("reference_commit") != MAIN_REFERENCE_COMMIT:
+        raise ValueError("main_observed requires the pinned, audited Zeva main reference_commit")
     cte, memory = zeva.get("cte", {}), zeva.get("memory", {})
     prompt, adapter = zeva.get("prompt", {}), zeva.get("adapter", {})
     if cte.get("variant", "window") == "zeva_ego":
@@ -45,5 +48,6 @@ def main_profile_metadata(success_data_identity: Mapping) -> dict:
         raise ValueError("main checkpoint requires success-only data identity")
     return {"profile": MAIN_PROFILE, "reference_commit": MAIN_REFERENCE_COMMIT,
             "artifact_lineage": MAIN_ARTIFACT_LINEAGE,
+            "feature_precision": MAIN_FEATURE_PRECISION,
             "memory_semantics": "completed_effect_trace",
             "success_data_identity": dict(success_data_identity)}

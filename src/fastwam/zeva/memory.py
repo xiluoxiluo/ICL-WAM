@@ -278,12 +278,16 @@ class PersistentInteractionMemory:
         phase = F.normalize(phase, dim=0)
         effect = F.normalize(effect, dim=0)
         best_index, best_score = -1, -float("inf")
-        denom = self.config.phase_merge_weight + self.config.effect_merge_weight
-        for index, entry in enumerate(self._entries):
-            score = self.config.phase_merge_weight * float(entry.phase @ phase) + self.config.effect_merge_weight * float(entry.effect @ effect)
-            score /= denom
-            if score > best_score:
-                best_index, best_score = index, score
+        if self._entries:
+            # Original main scores normalized prototype matrices in Torch;
+            # Python scalar accumulation can change near-threshold merges.
+            phases = F.normalize(torch.stack([entry.phase for entry in self._entries]), dim=-1)
+            effects = F.normalize(torch.stack([entry.effect for entry in self._entries]), dim=-1)
+            scores = (self.config.phase_merge_weight * (phases @ phase)
+                      + self.config.effect_merge_weight * (effects @ effect))
+            scores = scores / (self.config.phase_merge_weight + self.config.effect_merge_weight)
+            score, index = scores.max(dim=0)
+            best_index, best_score = int(index), float(score)
         if best_index >= 0 and best_score >= self.config.merge_threshold:
             entry = self._entries[best_index]
             count = entry.observation_count
@@ -297,7 +301,9 @@ class PersistentInteractionMemory:
             entry.metadata["last_merge_score"] = best_score
             return best_index, True
         if len(self._entries) >= self.config.capacity:
-            evict = min(range(len(self._entries)), key=lambda i: (self._entries[i].observation_count, self._entries[i].attempt_id, self._entries[i].transition_index, i))
+            evict = min(range(len(self._entries)), key=lambda i: (
+                self._entries[i].observation_count, self._entries[i].last_attempt_id, i,
+            ))
             self._entries.pop(evict)
         self._entries.append(
             PIMMemoryEntry(
@@ -330,16 +336,17 @@ class PersistentInteractionMemory:
             query = F.normalize(phase.detach().float().to(device=device), dim=0)
             if any(entry.phase.device != device for _, entry in candidates):
                 raise ValueError("PIM query must use the memory policy device")
-            scores_all = (
-                F.normalize(torch.stack([e.phase for _, e in candidates]), dim=-1) @ query
-                if self.config.storage_device == "policy" else
-                torch.tensor([float(F.normalize(e.phase, dim=0) @ query) for _, e in candidates], dtype=torch.float32)
-            )
-            order = (
-                torch.arange(len(candidates), device=device)
-                if self.config.cross_attempt_only
-                else torch.argsort(scores_all, descending=True, stable=True)[:k]
-            )
+            if self.config.cross_attempt_only:
+                scores_all = (
+                    F.normalize(torch.stack([e.phase for _, e in candidates]), dim=-1) @ query
+                    if self.config.storage_device == "policy" else
+                    torch.tensor([float(F.normalize(e.phase, dim=0) @ query) for _, e in candidates], dtype=torch.float32)
+                )
+                order = torch.arange(len(candidates), device=device)
+            else:
+                # Keep main's ranked top-k, including its tied-score ordering.
+                scores_all = F.normalize(torch.stack([e.phase for _, e in candidates]), dim=-1) @ query
+                _, order = torch.topk(scores_all, k=min(k, len(candidates)), largest=True, sorted=True)
             selected = [candidates[int(i)] for i in order]
             scores = scores_all[order]
         else:

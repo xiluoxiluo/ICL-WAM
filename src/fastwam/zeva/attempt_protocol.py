@@ -1,8 +1,8 @@
 """Sampling streams independent of RoboTwin scene/reset randomness.
 
-New evaluations use a continuous private Torch generator on the policy device.
-The old CPU stream and per-request seeds remain explicit replay protocols. The
-public Zeva-Ego adapter is external, so no cross-model bitwise claim is made.
+Zeva-Ego uses a continuous private Torch generator on the policy device.
+Zeva-main uses its published attempt/replan request-seed schedule. The old CPU
+stream and random request seeds remain explicit historical replay protocols.
 """
 
 from __future__ import annotations
@@ -13,8 +13,12 @@ import json
 import random
 from pathlib import Path
 
+from fastwam.zeva_main_protocol import (
+    ATTEMPT_SEED_STRIDE, MAIN_MODEL_RNG_PROTOCOL, MainAttemptSeedSchedule,
+    main_inference_seed,
+)
 
-ATTEMPT_SEED_STRIDE = 1_000
+
 CONTINUOUS_NOISE_PROTOCOL = "torch_continuous_slot_v1"
 DEVICE_CONTINUOUS_NOISE_PROTOCOL = "torch_device_continuous_slot_v1"
 CONTINUOUS_NOISE_PROTOCOLS = frozenset({CONTINUOUS_NOISE_PROTOCOL, DEVICE_CONTINUOUS_NOISE_PROTOCOL})
@@ -176,19 +180,10 @@ class ModelSeedStream:
 
 
 def inference_seed(base_seed: int | None, attempt_id: int, replan_index: int) -> int | None:
-    """Legacy deterministic schedule, retained for old experiment replay."""
+    """Compatibility wrapper for the published Zeva-main request schedule."""
     if base_seed is None:
         return None
     base_seed = int(base_seed)
     attempt_id = int(attempt_id)
     replan_index = int(replan_index)
-    if base_seed < 0 or attempt_id < 0 or replan_index < 0:
-        raise ValueError("base_seed, attempt_id and replan_index must be non-negative")
-    if replan_index >= ATTEMPT_SEED_STRIDE:
-        raise ValueError(
-            f"replan_index must be < {ATTEMPT_SEED_STRIDE} to avoid cross-attempt seed collisions"
-        )
-    value = base_seed + ATTEMPT_SEED_STRIDE * attempt_id + replan_index
-    if value >= 2**32:
-        raise ValueError("derived inference seed exceeds uint32")
-    return value
+    return main_inference_seed(base_seed, attempt_id, replan_index)

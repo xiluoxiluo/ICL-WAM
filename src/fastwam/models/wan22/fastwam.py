@@ -14,6 +14,7 @@ from fastwam.zeva.behavior_prefix_adapter import (
     ExactZevaPolicyInjectionAdapter,
     gaussian_prior_nll,
 )
+from fastwam.zeva_numerical_contract import MAIN_NUMERICAL_CONTRACT, REFERENCE_NUMERICAL_CONTRACTS
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
@@ -269,8 +270,9 @@ class FastWAM(torch.nn.Module):
     ) -> torch.Tensor:
         """Clean initial-image/text readout, with no action, proprio, or addon.
 
-        This is the legacy FastWAM image+text retrieval adaptation. The newer
-        task-language route does not call into the changing policy backbone.
+        Main uses this initial image/text readout from the frozen base policy
+        for global behavior retrieval. The optional Ego task-language route
+        uses its separate language classifier instead.
         """
         snapshot = getattr(self, "_main_frozen_readout_snapshot", None)
         with snapshot.activate(self.video_expert) if snapshot is not None else nullcontext():
@@ -305,6 +307,10 @@ class FastWAM(torch.nn.Module):
             video_context=video_context, video_context_mask=video_mask,
             video_attention_mask=mask, return_hidden=True,
         )
+        if getattr(self, "zeva_profile", None) == "main_observed":
+            # Main's extract_batch pools in the policy hidden dtype and only
+            # then widens the readout for the FP32 retrieval-head boundary.
+            return hidden.mean(dim=1).float().detach()
         return hidden.float().mean(dim=1).detach()
 
     def _append_proprio_to_context(
@@ -1090,7 +1096,7 @@ class FastWAM(torch.nn.Module):
         # Wan22Trainer: the pretrained FastWAM path is frozen before the addon
         # modules are attached, while the addon remains explicitly trainable.
         self.requires_grad_(False)
-        addon_dtype = torch.float32 if adapter_numerics in {"zeva_ego_v1", "zeva_main_v1"} else self.torch_dtype
+        addon_dtype = torch.float32 if adapter_numerics in REFERENCE_NUMERICAL_CONTRACTS else self.torch_dtype
         self.zeva_prompt_encoder = causal_prompt_encoder.to(device=self.device, dtype=addon_dtype)
         self.zeva_behavior_prefix_adapter = behavior_prefix_adapter.to(device=self.device, dtype=addon_dtype)
         self.zeva_prompt_encoder.requires_grad_(True)
@@ -1119,7 +1125,28 @@ class FastWAM(torch.nn.Module):
 
     @property
     def zeva_condition_dtype(self) -> torch.dtype:
-        return torch.float32 if self.zeva_numerical_contract in {"zeva_ego_v1", "zeva_main_v1"} else self.torch_dtype
+        adapter = getattr(self, "zeva_behavior_prefix_adapter", None)
+        return next(adapter.parameters()).dtype if adapter is not None else self.torch_dtype
+
+    def prepare_zeva_inference_precision(self) -> None:
+        """Use main's policy dtype for EAP/MCE on a deployment model.
+
+        New addon weights and training masters stay FP32 until this explicit
+        conversion. Original Zeva main casts these modules with its policy
+        network (BF16 in its released configuration); Ego serves them FP32.
+        Call after loading all foundation/addon checkpoints. A model holding
+        optimizer masters cannot be converted in place for deployment.
+        """
+        if not self.zeva_enabled:
+            raise RuntimeError("Zeva addon is not attached")
+        if getattr(self, "zeva_trainable_precision", None) == "float32":
+            raise ValueError("load a separate inference model to preserve FP32 training masters")
+        if self.zeva_numerical_contract == MAIN_NUMERICAL_CONTRACT:
+            for module in (self.zeva_prompt_encoder, self.zeva_behavior_prefix_adapter):
+                module._main_inference_precision = True
+                module.to(device=self.device, dtype=self.torch_dtype)
+            self.zeva_inference_precision = str(self.torch_dtype).removeprefix("torch.")
+        self.eval()
 
     def zeva_trainable_parameters(self):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
@@ -1181,9 +1208,11 @@ class FastWAM(torch.nn.Module):
         config = getattr(self.zeva_behavior_prefix_adapter, "config", None)
         if (not self.zeva_enabled
                 or (getattr(config, "effect_source", None) != "current_prediction"
-                    and getattr(config, "numerical_contract", None) != "zeva_main_v1")
+                    and getattr(config, "numerical_contract", None) != MAIN_NUMERICAL_CONTRACT)
                 or self.zeva_training_stage not in {"policy_injection", "pim_adapter"}):
             raise ValueError("FP32 Zeva training preparation requires a versioned main/Ego Stage2 recipe")
+        if getattr(self, "zeva_inference_precision", None) is not None:
+            raise ValueError("load a separate training model; inference conversion has rounded the main addon")
         with torch.no_grad():
             for parameter in self.parameters():
                 if parameter.requires_grad:
@@ -1414,10 +1443,13 @@ class FastWAM(torch.nn.Module):
         # Main-stream behavior conditions leave instruction/proprio inputs
         # unchanged. Their versioned layout controls independent positions.
         reference_numerics = self.zeva_numerical_contract == "zeva_ego_v1"
-        precise_numerics = reference_numerics or self.zeva_numerical_contract == "zeva_main_v1"
-        # EAP supervises the original normalized full-horizon target. The
-        # WAM flow targets retain the model dtype and native noise formula.
-        prior_target = clean_action.to(self.device, dtype=torch.float32) if precise_numerics else None
+        precise_numerics = self.zeva_numerical_contract in REFERENCE_NUMERICAL_CONTRACTS
+        # Main's _attach_stage2_behavior casts the normalized EAP target to
+        # policy precision. Ego instead retains the unrounded FP32 target.
+        # WAM flow matching keeps its native model dtype and noise formula.
+        prior_target = clean_action.to(
+            self.device, dtype=torch.float32 if reference_numerics else self.torch_dtype,
+        ) if precise_numerics else None
         clean_action = clean_action.to(self.device, dtype=self.torch_dtype)
         noise = torch.randn_like(clean_action) if noise is None else noise.to(clean_action)
         timestep = self.train_action_scheduler.sample_training_t(
@@ -1548,15 +1580,22 @@ class FastWAM(torch.nn.Module):
             getattr(self.zeva_behavior_prefix_adapter.config, "pim_variant", "legacy")
             == "cross_attempt"
         )
-        if exact_zeva and (self.zeva_training_stage == "policy_injection" or cross_attempt):
+        # Original-main computes the EAP NLL in both Stage 2 phases. In its
+        # PIM phase the prior and its cached global/phase/BIT inputs are fixed,
+        # so this remains a diagnostic constant even for a joint WAM backbone.
+        # Keeping it in the total also preserves comparable held-out metrics.
+        main_observed = getattr(self, "zeva_profile", None) == "main_observed"
+        if exact_zeva and (
+            self.zeva_training_stage == "policy_injection" or cross_attempt or main_observed
+        ):
             if zeva_prior_mean is None or zeva_prior_std is None:
                 raise ValueError("exact Zeva training requires action-prior outputs")
             prior_target = prior_target if precise_numerics else clean_action.float()
             prior_valid = None if reference_numerics else action_valid
             prior_loss = gaussian_prior_nll(
                 prior_target,
-                zeva_prior_mean if reference_numerics else zeva_prior_mean.float(),
-                zeva_prior_std if reference_numerics else zeva_prior_std.float(),
+                zeva_prior_mean if precise_numerics else zeva_prior_mean.float(),
+                zeva_prior_std if precise_numerics else zeva_prior_std.float(),
                 prior_valid,
                 reference_reduction=(self.zeva_behavior_prefix_adapter.config.prior_variant == "zeva_ego"),
             )

@@ -1,7 +1,7 @@
 """Real observed boundaries, terminal flushes, and guarded first-success replay."""
 
 from collections import deque
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -234,6 +234,95 @@ def test_deployment_flushes_terminal_before_retry_and_replay_keeps_sampling():
     policy.reset()
     assert not policy.evaluation_metadata()["pim_success_replay_eligible"]
     assert policy.evaluation_metadata()["pim_entries"] == 0
+
+
+def test_real_execute24_loop_reads_phase24_and_terminal_window_keeps_its_phase16():
+    policy, env = _policy(), _Environment()
+    infer, reads = policy._infer_action_chunk, []
+
+    def inspect_read(**kwargs):
+        reads.append((policy.step_count, policy._main_runtime.current_phase().clone(), len(policy.lifecycle.pim)))
+        return infer(**kwargs)
+
+    policy._infer_action_chunk = inspect_read
+    for _ in range(32):
+        policy.step(env, env.get_obs())
+    assert [step for step, _, _ in reads] == [0, 24]
+    torch.testing.assert_close(reads[1][1], torch.tensor([[1., 24.]]))
+    assert [count for _, _, count in reads] == [0, 1]
+    # The last post-action frame is not observed until explicit finalization.
+    assert policy._main_runtime.observed_steps == 28
+    policy.finalize_attempt(env, success=True)
+    entries = policy.lifecycle.pim.entries
+    assert [entry.metadata["phase_source_step"] for entry in entries] == [0, 16]
+    assert [entry.metadata["effect_end_step"] for entry in entries] == [16, 32]
+    torch.testing.assert_close(entries[1].phase, F.normalize(torch.tensor([1., 16.]), dim=0))
+    assert policy._main_runtime.snapshot()["terminal_observed"] is True
+
+
+def test_main_warmup_executes_model_once_without_controls_memory_or_replay_and_survives_resets():
+    from experiments.robotwin.fastwam_policy.deploy_policy import WorldActionRobotWinPolicy
+    from fastwam.zeva_main_protocol import MainAttemptSeedSchedule
+
+    class _Prompt(nn.Module):
+        config = SimpleNamespace(global_dim=2, hidden_dim=2)
+
+        def forward(self, **kwargs):
+            return torch.zeros(1, 2)
+
+    policy, env = _policy(replay_enabled=True), _Environment()
+    policy._main_seed_schedule = MainAttemptSeedSchedule(12)
+    policy._main_warmup_requests = 0
+    policy.model.torch_dtype = torch.float32
+    policy.model.zeva_prompt_encoder = _Prompt().eval()
+    policy.model.zeva_behavior_prefix_adapter = SimpleNamespace(
+        config=SimpleNamespace(pim_variant="legacy"), pim_gate=torch.zeros(()),
+    )
+    policy._policy_prompt_cache = SimpleNamespace(
+        encode=lambda *args, **kwargs: (torch.zeros(1, 2, 2), None), snapshot=lambda: {},
+    )
+    policy._task_language_memory = policy.task_context_bank = None
+    policy._normalize_state = lambda state: torch.as_tensor(state).unsqueeze(0)
+    policy._denormalize_action = lambda action: action.numpy()
+    policy.negative_prompt, policy.text_cfg_scale = "", 1.
+    policy.sigma_shift, policy.rand_device, policy.tiled = None, "cpu", False
+    policy.pim_diagnostic_interval = 0
+    forwards = []
+
+    def infer_action_zeva(**kwargs):
+        forwards.append({
+            "seed": kwargs["seed"], "replans": policy._replan_index,
+            "seed_requests": policy._main_seed_schedule.snapshot()["draws"],
+            "controls": len(env.actions), "pim": len(policy.lifecycle.pim),
+            "bit": int(policy.lifecycle.bit.tensors().valid.sum()),
+        })
+        return {"action": torch.randn(1, 32, 14, generator=torch.Generator().manual_seed(kwargs["seed"]))}
+
+    policy.model.infer_action_zeva = infer_action_zeva
+    policy._infer_action_chunk = MethodType(WorldActionRobotWinPolicy._infer_action_chunk, policy)
+    policy.step(env, env.get_obs())
+    assert forwards == [{"seed": 12, "replans": 0, "seed_requests": 1, "controls": 0, "pim": 0, "bit": 0}] * 2
+    expected_first = torch.randn(1, 32, 14, generator=torch.Generator().manual_seed(12))[0, 0].numpy()
+    np.testing.assert_array_equal(env.actions[0], expected_first)
+    assert len(env.actions) == policy.step_count == policy._replan_index == 1
+    assert policy._main_seed_schedule.snapshot()["request_seeds"] == [12]
+    assert policy._model_seed_stream.draws == 0
+    policy.finalize_attempt(env, success=True)
+    assert policy._success_replay.snapshot()["pim_success_trace_chunks"] == 1
+
+    policy.begin_attempt(1)
+    env = _Environment()
+    policy.step(env, env.get_obs())
+    assert len(forwards) == 3 and forwards[-1]["seed"] == 1012
+    policy.finalize_attempt(env, success=False)
+    policy.reset()
+    env = _Environment()
+    policy.step(env, env.get_obs())
+    assert len(forwards) == 4 and forwards[-1]["seed"] == 12
+    metadata = policy.evaluation_metadata()
+    assert metadata["discarded_warmup_requests"] == 1
+    assert metadata["discarded_warmup_scope"] == "policy_instance"
+    assert metadata["discarded_warmup_inference_seed"] == 12
 
 
 def test_deployment_rejects_missing_boundaries_and_failed_normalization_before_acting():

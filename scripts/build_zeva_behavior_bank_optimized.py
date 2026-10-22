@@ -56,7 +56,8 @@ from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset  # noqa: 
 from fastwam.runtime import _mixed_precision_to_model_dtype  # noqa: E402
 from fastwam.zeva import CausalTransitionEncoder, CausalTransitionEncoderConfig  # noqa: E402
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint  # noqa: E402
-from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact  # noqa: E402
+from fastwam.zeva.main_data import is_main_profile, normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact  # noqa: E402
+from fastwam.zeva.cte_windows import MAIN_CTE_WINDOW_SEMANTICS  # noqa: E402
 from fastwam.zeva.task_context_data import split_main_behavior_artifacts  # noqa: E402
 from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset  # noqa: E402
 from fastwam.zeva.schemas import sha256_file  # noqa: E402
@@ -320,7 +321,9 @@ def main(cfg: DictConfig) -> None:
             expected_transition_steps=4,
             expected_latent_channels=48,
         )
-        latent_cache.validate_storage_layout(require_complete_windows=True)
+        latent_cache.validate_storage_layout(
+            require_complete_windows=latent_cache.manifest.get("profile") != "main_observed",
+        )
         if str(latent_cache.semantic_task_identity.get("sha256")) != semantic_sha:
             raise ValueError("latent cache semantic-task identity differs from current map")
 
@@ -339,11 +342,13 @@ def main(cfg: DictConfig) -> None:
             transition_steps=cte.cfg.transition_steps,
             source_window_actions=32,
             show_progress=info.rank == 0,
+            include_observed_tail=is_main_profile(cfg),
         )
         plans, main_metadata = select_main_success_rows(plans, cfg)
         if main_metadata:
             validate_main_artifact(payload, main_metadata)
             validate_main_artifact(latent_cache.manifest, main_metadata)
+            main_metadata["cte_window_semantics"] = MAIN_CTE_WINDOW_SEMANTICS
         plans = _canonicalize_plans(plans, latent_cache)
         _validate_plan_alignment(plans, latent_cache)
         buckets, loads = _partition_episode_plans(plans, info.world_size)

@@ -6,6 +6,7 @@ import torch
 from torch.nn import functional as F
 
 from .static_task_context import bidirectional_supervised_contrastive_loss
+from .feature_precision import main_feature_autocast
 
 
 def split_retrieval_episodes(semantic_ids, *, validation_fraction=0.2, seed=42):
@@ -32,6 +33,7 @@ def train_retrieval_head(
     learning_rate=1e-4, temperature=0.07, validation_fraction=0.2,
     seed=42, eval_every=50,
     validation_readouts=None, validation_semantic_ids=None,
+    main_features=False,
 ):
     if steps < 1 or batch_size < 2 or eval_every < 1:
         raise ValueError("steps/eval_every must be positive and batch_size >= 2")
@@ -89,7 +91,10 @@ def train_retrieval_head(
         if step == 1 or step % eval_every == 0 or step == steps:
             head.eval()
             with torch.no_grad():
-                queries = head(validation_readouts if external_validation else readouts[val_device])
+                with main_feature_autocast(device, enabled=main_features):
+                    queries = head(validation_readouts if external_validation else readouts[val_device])
+                if main_features:
+                    queries = F.normalize(queries.float(), dim=-1)
                 target_labels = validation_semantic_ids if external_validation else labels[val_device]
                 # Validation queries cannot retrieve their own held-out trajectory.
                 scores = queries @ F.normalize(keys[train_device], dim=-1).T

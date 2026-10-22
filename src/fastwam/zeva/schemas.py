@@ -55,11 +55,14 @@ class CacheManifest:
     # Legacy files remain readable, but selecting main_observed requires the
     # explicit success-only/observed-effect lineage in every derived artifact.
     profile: str | None = None
+    reference_commit: str | None = None
+    feature_precision: str | None = None
     artifact_lineage: str | None = None
     memory_semantics: str | None = None
     success_data_identity: dict[str, object] = field(default_factory=dict)
     episode_splits: dict[str, object] = field(default_factory=dict)
     data_role: str | None = None
+    cte_window_semantics: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "camera_keys", tuple(self.camera_keys))
@@ -68,7 +71,9 @@ class CacheManifest:
         object.__setattr__(self, "episode_splits", dict(self.episode_splits))
         if self.profile == "main_observed":
             from .main_data import validate_main_artifact
+            from .cte_windows import validate_main_cte_window_semantics
             validate_main_artifact(self.to_dict())
+            validate_main_cte_window_semantics(self.to_dict())
         if self.cte_vae_input_size is not None:
             size = tuple(int(value) for value in self.cte_vae_input_size)
             if len(size) != 2 or min(size) < 1:

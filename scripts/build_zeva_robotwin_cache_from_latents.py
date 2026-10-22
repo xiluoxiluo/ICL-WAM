@@ -57,7 +57,6 @@ from scripts.build_zeva_robotwin_cache import (  # noqa: E402
     _resolve_device,
     _video_size_hw,
 )
-from fastwam.datasets.lerobot.base_lerobot_dataset import BaseLerobotDataset  # noqa: E402
 from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset  # noqa: E402
 from fastwam.zeva import (  # noqa: E402
     CausalTransitionEncoder,
@@ -69,7 +68,8 @@ from fastwam.zeva import (  # noqa: E402
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint  # noqa: E402
 from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset  # noqa: E402
 from fastwam.zeva.schemas import sha256_file  # noqa: E402
-from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact  # noqa: E402
+from fastwam.zeva.main_data import is_main_profile, normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact  # noqa: E402
+from fastwam.zeva.cte_windows import MAIN_CTE_WINDOW_SEMANTICS, observed_prefix_transitions  # noqa: E402
 
 
 def _cfg_dict(value: Any) -> dict[str, Any]:
@@ -130,6 +130,8 @@ def _validate_plan_alignment(
             raise ValueError(
                 f"latent cache has missing/non-contiguous 32-action windows for {episode_id}: {starts[:12]}"
             )
+        if plan.observed_end_raw_step is not None and starts != plan.coverage_starts():
+            raise ValueError(f"main latent cache omits real terminal boundaries for {episode_id}; rebuild it")
         for row in rows:
             episode_step = int(row["episode_step"])
             expected_index = int(plan.dataset_start) + episode_step
@@ -143,7 +145,7 @@ def _validate_plan_alignment(
 
 
 def _expected_effect_count(plan: EpisodePlan, effect_window_transitions: int) -> int:
-    required_end = int(plan.max_query_start) + int(plan.source_window_actions)
+    required_end = plan.history_end_raw_step
     transition_count = required_end // int(plan.query_stride)
     return transition_count // int(effect_window_transitions)
 
@@ -262,15 +264,21 @@ def _cached_end_raw_step(
     rows = latent_cache.rows_by_episode.get(str(episode_id), [])
     if not rows:
         return -1
-    # Every Stage-1 row spans exactly 32 raw actions and has 9 boundaries.
+    if latent_cache.manifest.get("profile") == "main_observed":
+        last = rows[-1]
+        complete = latent_cache.observed_transition_count(last)
+        return int(last["episode_step"]) + complete * 4
     return max(int(row["episode_step"]) + 32 for row in rows)
 
 
 def _tail_required(plan: EpisodePlan, latent_cache: CachedCTELatentWindowDataset) -> bool:
     # Existing cache-v4 builder's coverage_starts() extends the reconstructed
     # prefix to last_query_start + 32. Match it exactly.
-    required_end = int(plan.max_query_start) + int(plan.source_window_actions)
-    return _cached_end_raw_step(latent_cache, plan.episode_id) < required_end
+    required_end = plan.history_end_raw_step
+    missing = _cached_end_raw_step(latent_cache, plan.episode_id) < required_end
+    if missing and plan.observed_end_raw_step is not None:
+        raise ValueError("main latent cache is missing the real observed tail; rebuild it")
+    return missing
 
 
 class _TailSourceDataset(Dataset):
@@ -436,7 +444,14 @@ def _materialize_episode(
     for row in rows:
         sample = latent_cache.get_row(row)
         start = int(row["episode_step"])
-        for local, frame in enumerate(sample["cte_frames"]):
+        frames, actions = sample["cte_frames"], sample["transition_actions"]
+        if plan.observed_end_raw_step is not None:
+            complete = observed_prefix_transitions(sample["frame_valid"], sample["transition_valid"])
+            expected = min(plan.source_window_actions, plan.history_end_raw_step - start) // plan.query_stride
+            if complete != expected or complete < 1:
+                raise ValueError("main latent masks disagree with the episode's real observed boundaries")
+            frames, actions = frames[:complete + 1], actions[:complete]
+        for local, frame in enumerate(frames):
             _insert_consistent(
                 boundary_frames,
                 start + 4 * local,
@@ -444,7 +459,7 @@ def _materialize_episode(
                 episode_id=plan.episode_id,
                 kind="latent boundary",
             )
-        for local, action in enumerate(sample["transition_actions"]):
+        for local, action in enumerate(actions):
             _insert_consistent(
                 action_groups,
                 start + 4 * local,
@@ -472,7 +487,7 @@ def _materialize_episode(
                 kind="tail action group",
             )
 
-    required_end = int(plan.max_query_start) + int(plan.source_window_actions)
+    required_end = plan.history_end_raw_step
     required_steps = list(range(0, required_end + 1, int(plan.query_stride)))
     missing_frames = [step for step in required_steps if step not in boundary_frames]
     missing_actions = [step for step in required_steps[:-1] if step not in action_groups]
@@ -508,6 +523,7 @@ def _materialize_episode(
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
 def main(cfg: DictConfig) -> None:
+    from fastwam.datasets.lerobot.base_lerobot_dataset import BaseLerobotDataset
     normalize_main_dataset_paths(cfg)
     info = _init_distributed()
     try:
@@ -613,7 +629,9 @@ def main(cfg: DictConfig) -> None:
             raise ValueError(
                 f"latent cache / checkpoint VAE input size mismatch: cache={latent_cache.cte_vae_input_size}, checkpoint={checkpoint_input_size}"
             )
-        layout_stats = latent_cache.validate_storage_layout(require_complete_windows=True)
+        layout_stats = latent_cache.validate_storage_layout(
+            require_complete_windows=latent_cache.manifest.get("profile") != "main_observed",
+        )
         if info.rank == 0:
             print(
                 f"[preflight] latent mmap layout PASSED: rows={layout_stats['rows']:,}, "
@@ -646,11 +664,13 @@ def main(cfg: DictConfig) -> None:
             transition_steps=model.cfg.transition_steps,
             source_window_actions=model.cfg.transition_steps * 8,
             show_progress=(info.rank == 0),
+            include_observed_tail=is_main_profile(cfg),
         )
         plans, main_metadata = select_main_success_rows(plans, cfg)
         if main_metadata:
             validate_main_artifact(payload, main_metadata)
             validate_main_artifact(latent_cache.manifest, main_metadata)
+            main_metadata["cte_window_semantics"] = MAIN_CTE_WINDOW_SEMANTICS
         if not plans:
             raise RuntimeError("cache planner found no complete episodes")
         plans = _canonicalize_plans(plans, latent_cache)
@@ -688,7 +708,7 @@ def main(cfg: DictConfig) -> None:
         model_dtype = next(model.parameters()).dtype
         if model_dtype != torch.float32:
             raise RuntimeError(
-                f"formal Stage-1 CTE checkpoint must execute in float32; got model dtype {model_dtype}"
+                f"formal CTE weights must remain float32 (main CUDA compute uses BF16 autocast); got {model_dtype}"
             )
 
         # Remove stale rank-local output before any expensive work.  The final
@@ -733,12 +753,8 @@ def main(cfg: DictConfig) -> None:
                 probe_out = model(
                     probe_frames,
                     probe_actions,
-                    valid_mask=torch.ones((1, probe_frames.shape[1]), dtype=torch.bool, device=cte_device),
-                    transition_valid=torch.ones(
-                        (1, probe_actions.shape[1], probe_actions.shape[2]),
-                        dtype=torch.bool,
-                        device=cte_device,
-                    ),
+                    valid_mask=probe_sample["frame_valid"].unsqueeze(0).to(cte_device),
+                    transition_valid=probe_sample["transition_valid"].unsqueeze(0).to(cte_device),
                 )
             if not torch.isfinite(probe_out["phase"]).all():
                 raise RuntimeError("preflight produced non-finite CTE phase")

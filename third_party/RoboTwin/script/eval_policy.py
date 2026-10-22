@@ -165,7 +165,8 @@ def main(usr_args):
         if evaluation_profile == "main_observed":
             if manifest["attempt_protocol"] != attempt_protocol:
                 raise ValueError("Main manifest attempt protocol differs from runtime")
-            for name in ("pim_success_replay_enabled", "pim_success_replay_phase_threshold", "pim_success_replay_blend"):
+            for name in ("pim_success_replay_enabled", "pim_success_replay_phase_threshold", "pim_success_replay_blend",
+                         "model_rng_protocol", "model_seed", "num_inference_steps"):
                 if usr_args.get(name) != manifest[name]:
                     raise ValueError(f"Main manifest {name} differs from runtime")
         manifest_episodes = [row for row in manifest["episodes"] if row["task"] == task_name]
@@ -591,7 +592,10 @@ def eval_policy(task_name,
                             "attempt_protocol": attempt_protocol,
                             "scene_reset": True,
                             "memory_reset": attempt_id == 0,
-                            "model_rng_reset": False,
+                            # Main keys each request by attempt/replan rather
+                            # than inheriting Ego's continuous generator.
+                            "model_rng_reset": True,
+                            "discarded_warmup_requests_before": before.get("discarded_warmup_requests"),
                             "first_success_attempt_before": first_success_before,
                             "first_success_attempt": first_success_attempt,
                             "post_success_attempt": first_success_before is not None,

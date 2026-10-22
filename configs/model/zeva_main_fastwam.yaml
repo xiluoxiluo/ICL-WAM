@@ -29,14 +29,14 @@ zeva:
     beta_effect: 0.5
   prompt:
     pim_variant: legacy
-    numerical_contract: zeva_main_v1
+    numerical_contract: zeva_main_v2
     # The public main MCE has no internal dropout. Prepared-data regularization
     # below consumes the declared context/support rates once, before the MCE.
     pim_context_dropout: 0.0
     pim_support_dropout: 0.0
   adapter:
     pim_variant: legacy
-    numerical_contract: zeva_main_v1
+    numerical_contract: zeva_main_v2
     prefix_layout: legacy_merged
     effect_source: latest_completed
     prior_variant: legacy_bit

@@ -88,7 +88,10 @@ def main(cfg: DictConfig) -> None:
 
     keys = torch.stack([entry["retrieval_key"] for entry in bank.entries]).float().to(device)
     values = torch.stack([entry["behavior_value"] for entry in bank.entries]).float().to(device)
-    keys = F.normalize(keys, dim=-1)
+    # TaskContextBank already normalizes stored keys. Keep exactly the same
+    # values as its serving path instead of introducing a second rounding.
+    if not is_main_profile(cfg):
+        keys = F.normalize(keys, dim=-1)
     top_k = int(tc.top_k)
     if not 1 <= top_k < len(bank):
         raise ValueError("leave-one-out static retrieval requires 1 <= top_k < bank size")
@@ -102,7 +105,9 @@ def main(cfg: DictConfig) -> None:
     with torch.inference_mode():
         for start in progress:
             end = min(num_queries, start + batch_size)
-            q = retriever.head(readouts[start:end].to(device))
+            q = retriever.query(readouts[start:end])
+            if is_main_profile(cfg):
+                q = F.normalize(q.float(), dim=-1)
             scores = q @ keys.T
             local_rows = torch.arange(end - start, device=device)
             global_rows = torch.arange(start, end, device=device)

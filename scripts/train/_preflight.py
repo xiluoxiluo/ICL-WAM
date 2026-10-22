@@ -44,6 +44,10 @@ def main(argv=None) -> int:
     parser.add_argument("--check-environment", action="store_true")
     args = parser.parse_args(argv)
     sys.dont_write_bytecode = True
+    # Isolated `python -I -S` must still resolve the shared, stdlib-only main
+    # contract. Importing fastwam itself is lightweight; zeva's package init
+    # remains bypassed by _source_module below.
+    sys.path.insert(0, str(ROOT / "src"))
     errors = []
     paths = {}
     for name in ("dataset_root", "stats", "semantic_map", "success_manifest", "base_checkpoint", "action_dit_checkpoint", "assets_root"):

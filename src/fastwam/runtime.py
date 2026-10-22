@@ -204,6 +204,11 @@ def create_fastwam(
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         compile_training_denoise=bool(compile_training_denoise),
     )
+    # Frozen bank/readout builders intentionally disable addon construction,
+    # but must retain main's feature-reduction semantics. Serving and offline
+    # extraction then use the same initial-image/text readout implementation.
+    if zeva and zeva.get("profile") == "main_observed":
+        model.zeva_profile = "main_observed"
     if zeva and bool(zeva.get("enabled", False)):
         from .zeva import (
             BehaviorPrefixAdapter,

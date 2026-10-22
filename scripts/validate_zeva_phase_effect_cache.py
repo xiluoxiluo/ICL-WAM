@@ -55,6 +55,7 @@ from fastwam.zeva import (  # noqa: E402
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint  # noqa: E402
 from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset  # noqa: E402
 from fastwam.zeva.schemas import CacheManifest, sha256_file  # noqa: E402
+from fastwam.zeva.main_data import is_main_profile, select_main_success_rows  # noqa: E402
 from scripts.build_zeva_robotwin_cache import (  # noqa: E402
     _build_episode_plans_metadata_only,
     _compute_episode,
@@ -533,7 +534,9 @@ def _deep_recompute(
         transition_steps=model.cfg.transition_steps,
         source_window_actions=model.cfg.transition_steps * 8,
         show_progress=False,
+        include_observed_tail=is_main_profile(cfg),
     )
+    plans, _ = select_main_success_rows(plans, cfg)
     plans = _canonicalize_plans(plans, latent_cache)
     _validate_plan_alignment(plans, latent_cache)
 
@@ -739,7 +742,9 @@ def main(cfg: DictConfig) -> None:
         transition_steps=4,
         source_window_actions=32,
         show_progress=False,
+        include_observed_tail=is_main_profile(cfg),
     )
+    plans, _ = select_main_success_rows(plans, cfg)
     plans = _canonicalize_plans(plans, latent_cache)
     _validate_plan_alignment(plans, latent_cache)
     expected_phase = sum(plan.query_count for plan in plans)

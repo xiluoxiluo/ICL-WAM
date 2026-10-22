@@ -18,6 +18,7 @@ from torch.utils.data import Dataset
 
 from fastwam.datasets.zeva_robotwin_dataset import EpisodeMetadata
 from fastwam.zeva.stage1_sampling import CTETrainIndex
+from fastwam.zeva.cte_windows import observed_prefix_transitions, validate_main_cte_window_semantics
 
 
 CACHE_FORMAT = "zeva_cte_window_latent_cache_v1"
@@ -74,6 +75,7 @@ class CachedCTELatentWindowDataset(Dataset):
         if self.manifest.get("profile") == "main_observed":
             from .main_data import validate_main_artifact
             validate_main_artifact(self.manifest)
+            validate_main_cte_window_semantics(self.manifest)
         self.rows: list[dict[str, Any]] = json.loads(index_path.read_text(encoding="utf-8"))
         from .main_data import validate_main_episode_ids
         validate_main_episode_ids(self.manifest, (row["episode_id"] for row in self.rows))
@@ -249,6 +251,16 @@ class CachedCTELatentWindowDataset(Dataset):
                 if slot in seen_slots:
                     raise ValueError(f"duplicate latent cache rank/offset slot: {slot}")
                 seen_slots.add(slot)
+                if self.manifest.get("profile") == "main_observed":
+                    observed = observed_prefix_transitions(
+                        torch.as_tensor(np.array(frame_valid[offset], copy=True)),
+                        torch.as_tensor(np.array(transition_valid[offset], copy=True)),
+                    )
+                    if observed < 1:
+                        raise ValueError("main latent window has no real completed transition")
+                    episode_rows = self.rows_by_episode[str(row["episode_id"])]
+                    if observed != expected_t - 1 and row is not episode_rows[-1]:
+                        raise ValueError("only a main episode's last window may contain padding")
             total_slots += len(rank_rows)
 
             if require_complete_windows:
@@ -296,6 +308,15 @@ class CachedCTELatentWindowDataset(Dataset):
             raise IndexError(
                 f"latent cache has no Stage-1 window for dataset_index={dataset_index}"
             ) from exc
+
+    def observed_transition_count(self, row: dict[str, Any]) -> int:
+        """Read only tiny validity arrays when planning terminal coverage."""
+        arrays = self._arrays(int(row["rank"]))
+        offset = int(row["offset"])
+        return observed_prefix_transitions(
+            torch.as_tensor(np.array(arrays["frame_valid"][offset], copy=True)),
+            torch.as_tensor(np.array(arrays["transition_valid"][offset], copy=True)),
+        )
 
     def get_row(self, row: dict[str, Any]) -> dict[str, Any]:
         rank = int(row["rank"])

@@ -14,7 +14,8 @@ from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.static_task_context import READOUT_FORMAT, READOUT_KIND
 from fastwam.zeva.task_context_data import build_behavior_bank, split_main_behavior_artifacts
 from fastwam.zeva.stage1_sampling import build_cte_training_index
-from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
+from fastwam.zeva.main_data import is_main_profile, normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
+from fastwam.zeva.cte_windows import MAIN_CTE_WINDOW_SEMANTICS
 
 
 @hydra.main(config_path="../configs", config_name="train", version_base="1.3")
@@ -78,9 +79,12 @@ def main(cfg: DictConfig):
     elif input_type != "rgb_frame" or cte.cfg.image_channels != 3:
         raise ValueError("unsupported CTE input representation")
     dataset = ZevaRobotWinDataset(instantiate(cfg.data.train))
-    indices, main_metadata = select_main_success_rows(build_cte_training_index(dataset), cfg)
+    indices, main_metadata = select_main_success_rows(
+        build_cte_training_index(dataset, include_observed_tail=is_main_profile(cfg)), cfg,
+    )
     if main_metadata:
         validate_main_artifact(payload, main_metadata)
+        main_metadata["cte_window_semantics"] = MAIN_CTE_WINDOW_SEMANTICS
     bank, readouts = build_behavior_bank(
         dataset, cte, policy,
         frame_encoder=frame_encoder, temperature=float(tc.temperature),

@@ -16,7 +16,7 @@ python -m torch.distributed.run \
 Design:
 - force PyAV; TorchCodec is never attempted;
 - use the exact RobotVideoDataset preprocessing used by Stage-1;
-- use only the non-overlapping 32-action Stage-1 windows;
+- keep non-overlapping H32 storage windows, including main's masked real tail;
 - assign whole episodes to ranks: episode_index % world_size;
 - store latent values losslessly as raw BF16 bits in mmap .npy files;
 - also cache normalized actions/masks, so Stage-1 training needs neither RGB
@@ -53,7 +53,10 @@ from fastwam.zeva.cte_latent_cache import (
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.semantic_tasks import parse_episode_index_from_id
 from fastwam.zeva.stage1_sampling import CTETrainIndex, build_cte_training_index
-from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
+from fastwam.zeva.main_data import is_main_profile, normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
+from fastwam.zeva.cte_windows import (
+    MAIN_CTE_WINDOW_SEMANTICS, observed_prefix_transitions, validate_main_cte_window_semantics,
+)
 from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_vae
 
 
@@ -236,6 +239,8 @@ class _WindowSourceDataset(Dataset):
                 "precompute source must be RGB [9,3,H,W]; "
                 f"got {tuple(frames.shape)}"
             )
+        if observed_prefix_transitions(sample["frame_valid"], sample["transition_valid"]) < 1:
+            raise ValueError("CTE latent cache source has no real completed control interval")
 
         return _BuildItem(
             dataset_index=int(row.dataset_index),
@@ -384,8 +389,11 @@ def main(cfg: DictConfig) -> None:
             dataset,
             source_window_actions=32,
             sample_stride=sample_stride,
+            include_observed_tail=is_main_profile(cfg),
         )
         all_rows, main_metadata = select_main_success_rows(all_rows, cfg)
+        if main_metadata:
+            main_metadata["cte_window_semantics"] = MAIN_CTE_WINDOW_SEMANTICS
         if not all_rows:
             raise RuntimeError("no Stage-1 CTE windows found")
 
@@ -395,7 +403,9 @@ def main(cfg: DictConfig) -> None:
         if main_metadata:
             if is_main:
                 if provenance_path.exists():
-                    validate_main_artifact(json.loads(provenance_path.read_text()), main_metadata)
+                    previous = json.loads(provenance_path.read_text())
+                    validate_main_artifact(previous, main_metadata)
+                    validate_main_cte_window_semantics(previous)
                 elif any(cache_root.glob("rank_*/progress.json")):
                     raise ValueError("cannot resume a legacy latent cache as main_observed; rebuild in a new path")
                 else:
@@ -417,6 +427,7 @@ def main(cfg: DictConfig) -> None:
             rank_meta = json.loads((rank_dir / "rank_meta.json").read_text(encoding="utf-8"))
             if main_metadata:
                 validate_main_artifact(rank_meta, main_metadata)
+                validate_main_cte_window_semantics(rank_meta)
             if int(rank_meta.get("num_windows", -1)) != local_count:
                 raise ValueError(
                     f"rank {rank} DONE cache count mismatch: "
@@ -438,6 +449,9 @@ def main(cfg: DictConfig) -> None:
                         f"resume progress exists but rank_meta.json is missing: {rank_dir}"
                     )
                 rank_meta = json.loads(existing_meta_path.read_text(encoding="utf-8"))
+                if main_metadata:
+                    validate_main_artifact(rank_meta, main_metadata)
+                    validate_main_cte_window_semantics(rank_meta)
                 latent_shape = tuple(int(v) for v in rank_meta["latent_shape"])
                 arrays = _open_existing_arrays(rank_dir)
                 if arrays["latents"].shape[0] != local_count:
@@ -593,6 +607,9 @@ def main(cfg: DictConfig) -> None:
                 rank_metas.append(
                     json.loads((rank_dir / "rank_meta.json").read_text(encoding="utf-8"))
                 )
+                if main_metadata:
+                    validate_main_artifact(rank_metas[-1], main_metadata)
+                    validate_main_cte_window_semantics(rank_metas[-1])
 
             nonempty_shapes = {
                 tuple(int(v) for v in meta["latent_shape"])

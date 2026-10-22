@@ -16,13 +16,15 @@ from pathlib import Path
 import random
 from typing import Any
 
+from fastwam.zeva_main_protocol import MAIN_MODEL_RNG_PROTOCOL, main_inference_seed
+
 
 PROFILE = "main_observed"
-MANIFEST_SCHEMA = "iclwam-zeva-main-robotwin-manifest-v1"
-ATTEMPT_SCHEMA = "iclwam-zeva-main-robotwin-attempt-v1"
-REPORT_SCHEMA = "iclwam-zeva-main-robotwin-report-v1"
+MANIFEST_SCHEMA = "iclwam-zeva-main-robotwin-manifest-v2"
+ATTEMPT_SCHEMA = "iclwam-zeva-main-robotwin-attempt-v2"
+REPORT_SCHEMA = "iclwam-zeva-main-robotwin-report-v2"
 PROTOCOLS = ("single_attempt", "stop_on_success", "fixed_attempts")
-NOISE_PROTOCOL = "torch_device_continuous_slot_v1"
+NOISE_PROTOCOL = MAIN_MODEL_RNG_PROTOCOL
 REFERENCE_REVISION = "17ca9fa"
 
 
@@ -61,9 +63,10 @@ def validate_manifest(manifest: dict) -> None:
         if not isinstance(manifest.get(name), str) or not manifest[name]:
             raise ValueError(f"Missing manifest {name}")
     if manifest.get("model_rng_protocol") != NOISE_PROTOCOL:
-        raise ValueError("Main evaluator requires a continuous private policy-device model RNG")
-    if _integer(manifest.get("model_seed"), "model_seed") >= 2**63:
-        raise ValueError("model_seed must be < 2**63")
+        raise ValueError("Main evaluator requires the published attempt/replan request-seed schedule")
+    main_inference_seed(_integer(manifest.get("model_seed"), "model_seed"), attempts - 1, 999)
+    if manifest.get("discarded_warmup_requests") != 1 or manifest.get("discarded_warmup_scope") != "policy_instance":
+        raise ValueError("Main requires one discarded model warmup per policy instance")
     _integer(manifest.get("num_inference_steps"), "num_inference_steps", 1)
     replay = _boolean(manifest.get("pim_success_replay_enabled"), "pim_success_replay_enabled")
     if replay and protocol != "fixed_attempts":
@@ -122,6 +125,10 @@ def make_manifest(source: dict, *, source_sha256: str, protocol: str,
         "reference_repository": "air-embodied-brain/Zeva", "reference_revision": REFERENCE_REVISION,
         "reference_benchmark_reproduction": False,
         "model_rng_protocol": NOISE_PROTOCOL, "model_seed": model_seed,
+        "model_seed_formula": "base_seed + 1000 * zero_based_attempt_id + replan_index",
+        "discarded_warmup_requests": 1,
+        "discarded_warmup_scope": "policy_instance",
+        "reference_discarded_warmup_requests": 1,
         "num_inference_steps": num_inference_steps,
         "pim_success_replay_enabled": success_replay,
         "pim_success_replay_phase_threshold": replay_phase_threshold,
@@ -161,14 +168,17 @@ def append_attempt(path: str | Path, row: dict) -> None:
         stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
 
-def _noise_snapshot(snapshot: Any, manifest: dict) -> dict:
+def _noise_snapshot(snapshot: Any, manifest: dict, *, attempt_id: int, replans: int) -> dict:
     if not isinstance(snapshot, dict):
-        raise ValueError("Each attempt must log its actual model RNG snapshots")
+        raise ValueError("Each attempt must log its actual request-seed schedule")
     for key, expected in (("protocol", manifest["model_rng_protocol"]), ("seed", manifest["model_seed"]), ("dtype", "float32")):
         if snapshot.get(key) != expected:
             raise ValueError(f"Model RNG {key} differs from manifest")
-    _integer(snapshot.get("draws"), "model RNG draw count")
-    _digest(snapshot.get("state_sha256"), "model RNG state")
+    if snapshot.get("attempt_id") != attempt_id or snapshot.get("draws") != replans:
+        raise ValueError("Request seeds do not match the actual attempt/replan count")
+    expected_seeds = [main_inference_seed(manifest["model_seed"], attempt_id, index) for index in range(replans)]
+    if snapshot.get("request_seeds") != expected_seeds:
+        raise ValueError("Actual inference seeds differ from base + 1000 * attempt + replan")
     if not isinstance(snapshot.get("device"), str) or not snapshot["device"]:
         raise ValueError("Model RNG must record its device")
     return snapshot
@@ -190,7 +200,10 @@ def validate_attempts(manifest: dict, sha: str, rows: list[dict]) -> dict[str, l
     _boolean(enabled, "cross_memory_enabled")
     if not isinstance(condition, str) or not condition or not isinstance(run_id, str) or not run_id:
         raise ValueError("Each log needs one condition and run_id")
-    previous_noise = None
+    noise_device = None
+    # The delegated runner starts a new policy process per condition and task.
+    # Its one warmup survives both attempt resets and new scenes in that task.
+    warmup_seed_by_task: dict[str, int] = {}
     closed_scenes: set[str] = set()
     previous_scene = None
     for row in rows:
@@ -217,7 +230,9 @@ def validate_attempts(manifest: dict, sha: str, rows: list[dict]) -> dict[str, l
             "pim_success_replay_phase_threshold": manifest["pim_success_replay_phase_threshold"],
             "pim_success_replay_blend": manifest["pim_success_replay_blend"],
             "inference_parameters_frozen": True, "observed_effect_source": "observed_post",
-            "scene_reset": True, "model_rng_reset": False,
+            "scene_reset": True, "model_rng_reset": True,
+            "discarded_warmup_requests": manifest["discarded_warmup_requests"],
+            "discarded_warmup_scope": manifest["discarded_warmup_scope"],
         }
         for key, value in expected.items():
             if row.get(key) != value:
@@ -236,13 +251,28 @@ def validate_attempts(manifest: dict, sha: str, rows: list[dict]) -> dict[str, l
             "terminal_observation_step": steps, "terminal_observed": True, "finalized": True,
         }.items()):
             raise ValueError("Completed attempts must include fresh terminal feedback and all observed four-action boundaries")
-        before = _noise_snapshot(row.get("seed_stream_before"), manifest)
-        after = _noise_snapshot(row.get("seed_stream"), manifest)
-        if after["device"] != before["device"] or after["draws"] - before["draws"] != _integer(row.get("replans"), "replans", 1):
-            raise ValueError("Model RNG must advance exactly once per policy replan, including replay")
-        if previous_noise is not None and before != previous_noise:
-            raise ValueError("Model RNG was reset or changed between attempts/scenes/tasks")
-        previous_noise = after
+        attempt_id = _integer(row.get("attempt"), "attempt", 1) - 1
+        replans = _integer(row.get("replans"), "replans", 1)
+        if replans != (steps + 23) // 24:
+            raise ValueError("Policy replans must follow the actual execute24 action cadence")
+        before = _noise_snapshot(row.get("seed_stream_before"), manifest, attempt_id=attempt_id, replans=0)
+        after = _noise_snapshot(row.get("seed_stream"), manifest, attempt_id=attempt_id, replans=replans)
+        warmup_before = _integer(row.get("discarded_warmup_requests_before"), "warmup count before attempt")
+        if warmup_before not in {0, 1}:
+            raise ValueError("Only one discarded warmup may occur within a policy instance")
+        warmup_seed = _integer(row.get("discarded_warmup_inference_seed"), "warmup inference seed")
+        task = scene["task"]
+        if task not in warmup_seed_by_task:
+            if warmup_before != 0:
+                raise ValueError("Each task policy instance must start with zero completed warmup requests")
+            if warmup_seed != after["request_seeds"][0]:
+                raise ValueError("The warmup must reuse the first actual inference request seed")
+            warmup_seed_by_task[task] = warmup_seed
+        elif warmup_before != 1 or warmup_seed != warmup_seed_by_task[task]:
+            raise ValueError("The task policy instance must retain its single warmup and original inference seed across resets")
+        if after["device"] != before["device"] or (noise_device is not None and after["device"] != noise_device):
+            raise ValueError("Model request-noise device changed within the run")
+        noise_device = after["device"]
         grouped[scene_id].append(row)
     if set(grouped) != set(scenes):
         raise ValueError("Partial evaluation: every selected scene must finish")
@@ -351,13 +381,18 @@ def summarize_attempts(manifest: dict, sha: str, rows: list[dict]) -> dict:
         "macro": {"SR@1": sum(value["SR@1"] for value in per_task.values()) / len(per_task),
                   "CSR": {f"CSR@{n}": sum(value["CSR"][f"CSR@{n}"] for value in per_task.values()) / len(per_task) for n in range(1, k + 1)}},
         "per_task": per_task,
-        "reset_audit": {"episode_resets": total, "attempt_resets": len(rows) - total, "same_scene_retries": True, "memory_cleared_between_scenes": True, "model_rng_continuous": True},
+        "reset_audit": {"episode_resets": total, "attempt_resets": len(rows) - total, "same_scene_retries": True,
+                        "memory_cleared_between_scenes": True, "model_rng_continuous": False,
+                        "model_rng_protocol": NOISE_PROTOCOL, "request_seed_formula_verified": True,
+                        "discarded_warmup_requests": manifest["discarded_warmup_requests"],
+                        "discarded_warmup_scope": manifest["discarded_warmup_scope"]},
         "limitations": [
             "CSR@k is the probability of any success within k tries, not independent single-attempt SR.",
             "Resampling alone can increase CSR; same-weight memory on/off is required to assess memory benefit.",
             "Main memory also updates within an attempt; on/off gain alone does not isolate failed-attempt memory.",
             "Later per-attempt rates under stop_on_success use only surviving failures; fixed_attempts keeps the original scene denominator.",
-            "Identical initial model seeds do not guarantee matching later noise offsets after trajectory lengths diverge.",
+            "The same attempt/replan indices use the same seeds on both conditions; different states or control times are not thereby matched.",
+            "One same-seed discarded warmup runs per policy instance without controls or memory writes. This local scope/timing is explicit because the original RoboCasa client is not published.",
             "This is an ICL-WAM RoboTwin adaptation, not reproduction of Zeva main's RoboCasa or Zeva-Ego's published scores.",
         ],
     }
@@ -375,6 +410,13 @@ def paired_comparison(manifest: dict, sha: str, on: list[dict], off: list[dict],
     for key in on_group:
         if on_group[key][0]["step_limit"] != off_group[key][0]["step_limit"]:
             raise ValueError("Paired scene step budgets differ")
+        for on_row, off_row in zip(on_group[key], off_group[key]):
+            on_noise, off_noise = on_row["seed_stream"], off_row["seed_stream"]
+            if on_noise["device"] != off_noise["device"] or on_noise["dtype"] != off_noise["dtype"]:
+                raise ValueError("Paired request noise must use the same device and dtype")
+            shared = min(on_noise["draws"], off_noise["draws"])
+            if on_noise["request_seeds"][:shared] != off_noise["request_seeds"][:shared]:
+                raise ValueError("Paired conditions did not use matching attempt/replan seeds")
     _integer(bootstrap_samples, "bootstrap_samples", 1)
     delta_first = [int(on_group[key][0]["success"]) - int(off_group[key][0]["success"]) for key in on_group]
     delta_any = [int(any(row["success"] for row in on_group[key])) - int(any(row["success"] for row in off_group[key])) for key in on_group]
@@ -389,10 +431,11 @@ def paired_comparison(manifest: dict, sha: str, on: list[dict], off: list[dict],
         f"paired_delta_CSR@{k}": sum(delta_any) / len(delta_any),
         f"paired_delta_CSR@{k}_bootstrap_95pct": [draws[int(.025 * (bootstrap_samples - 1))], draws[int(.975 * (bootstrap_samples - 1))]],
         "bootstrap_unit": "paired scene; micro average over the frozen manifest",
-        "same_initial_noise_state_scenes": sum(on_group[key][0]["seed_stream_before"] == off_group[key][0]["seed_stream_before"] for key in on_group),
+        "same_initial_request_seed_schedule_scenes": sum(on_group[key][0]["seed_stream_before"] == off_group[key][0]["seed_stream_before"] for key in on_group),
+        "matching_attempt_replan_seed_schedule": True,
         "success_replay_contaminates_pre_first_success": False,
         "pure_failed_attempt_memory_effect_identified": False,
-        "interpretation": "SR/CSR contrasts include in-attempt observed-effect conditioning. Fixed-attempt stability can additionally include success replay. A shared first-failure trace and matched retry noise are needed to isolate failed-memory content.",
+        "interpretation": "SR/CSR contrasts include in-attempt observed-effect conditioning. Fixed-attempt stability can additionally include success replay. Request seeds are paired by attempt/replan despite earlier trajectory lengths; a shared first-failure trace is still needed to isolate failed-memory content.",
         "on": on_summary, "off": off_summary,
     }
 

@@ -7,10 +7,10 @@ Checks:
 - effect non-collapse and paired-vs-shuffled alignment;
 - local-window versus reconstructed full-prefix representation drift.
 
-The local/full comparison is diagnostic by default because the Stage-1 model is
-trained on reset 32-action windows while cache-v4 intentionally runs a full
-episode prefix. Use ``+cte_readiness.strict_local_full=true`` only after you
-have chosen a project-specific acceptance threshold.
+The local/full comparison measures the effect of artificially resetting CTE
+history. Main Stage-1 and cache-v4 both use the complete observed prefix; older
+local recipes trained on reset H32 windows. Use
+``+cte_readiness.strict_local_full=true`` only with an explicit threshold.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from fastwam.zeva.causal_transition_encoder import (
 )
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.cte_latent_cache import CachedCTELatentWindowDataset
+from fastwam.zeva.cte_windows import observed_prefix_transitions
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.vae_adapter import validate_vae_metadata
 
@@ -169,7 +170,10 @@ def _reconstruct_episode(
     for row in rows:
         sample = cache.get_row(row)
         start = int(row["episode_step"])
-        for local, frame in enumerate(sample["cte_frames"]):
+        complete = observed_prefix_transitions(sample["frame_valid"], sample["transition_valid"])
+        if complete < 1:
+            raise ValueError("cached CTE source has no real completed transition")
+        for local, frame in enumerate(sample["cte_frames"][:complete + 1]):
             _insert_consistent(
                 boundaries,
                 start + 4 * local,
@@ -177,7 +181,7 @@ def _reconstruct_episode(
                 episode_id=episode_id,
                 kind="latent boundary",
             )
-        for local, action in enumerate(sample["transition_actions"]):
+        for local, action in enumerate(sample["transition_actions"][:complete]):
             _insert_consistent(
                 actions,
                 start + 4 * local,

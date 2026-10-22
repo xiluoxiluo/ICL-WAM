@@ -10,6 +10,7 @@ cosmos_framework/model/zeva/static_task_context_retrieval.py.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from contextlib import nullcontext
 import math
 
 import torch
@@ -17,6 +18,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .checkpoint import checkpoint_sha256
+from .feature_precision import main_feature_autocast
 from .task_context import TaskContextBank, TaskContextRetrievalResult
 
 
@@ -75,10 +77,11 @@ def bidirectional_supervised_contrastive_loss(
     positive = semantic_ids[:, None].eq(semantic_ids[None, :])
 
     def direction(scores, mask):
-        return (
-            torch.logsumexp(scores, dim=1)
-            - torch.logsumexp(scores.masked_fill(~mask, -torch.inf), dim=1)
-        ).mean()
+        # Keep the reference graph construction order as well as its formula;
+        # changing branch order can change FP32 gradient accumulation rounding.
+        positive_logsumexp = torch.logsumexp(scores.masked_fill(~mask, -torch.inf), dim=1)
+        all_logsumexp = torch.logsumexp(scores, dim=1)
+        return (all_logsumexp - positive_logsumexp).mean()
 
     return 0.5 * (direction(logits, positive) + direction(logits.T, positive.T))
 
@@ -130,15 +133,28 @@ class StaticTaskContextRetriever:
         self.top_k = min(int(top_k), len(bank))
 
     @torch.no_grad()
-    def retrieve(self, readout: Tensor, *, exclude_episode_ids=None) -> TaskContextRetrievalResult:
+    def query(self, readout: Tensor) -> Tensor:
+        """One shared query computation for offline contexts and online actions."""
         parameter = next(self.head.parameters())
-        query = self.head(readout.to(device=parameter.device, dtype=parameter.dtype))
+        # Original-main serving runs the frozen FP32 query head under CUDA
+        # BF16 autocast. Caches must use this same query computation as deploy.
+        with main_feature_autocast(parameter.device, enabled=self.bank.metadata.get("profile") == "main_observed"):
+            query = self.head(readout.to(device=parameter.device, dtype=parameter.dtype))
+        return query
+
+    @torch.no_grad()
+    def retrieve(self, readout: Tensor, *, exclude_episode_ids=None) -> TaskContextRetrievalResult:
+        query = self.query(readout)
         top_k = self.top_k
         if exclude_episode_ids is not None:
             top_k = min(top_k, len(self.bank) - 1)
             if top_k < 1:
                 raise ValueError("leave-one-episode-out retrieval needs at least two demonstrations")
-        return self.bank.retrieve(query, top_k=top_k, exclude_episode_ids=exclude_episode_ids)
+        # The public server leaves autocast before cosine/softmax retrieval.
+        context = (torch.autocast(device_type=query.device.type, enabled=False)
+                   if self.bank.metadata.get("profile") == "main_observed" else nullcontext())
+        with context:
+            return self.bank.retrieve(query, top_k=top_k, exclude_episode_ids=exclude_episode_ids)
 
     @classmethod
     def load(cls, bank_path, head_path, *, top_k=5, device="cpu", expected=None):

@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, TypeVar
 
 
-MAIN_PROFILE = "main_observed"
-MAIN_ARTIFACT_LINEAGE = "zeva_main_observed_effect_v1"
+from fastwam.zeva_main_contract import (
+    MAIN_PROFILE, MAIN_ARTIFACT_LINEAGE, MAIN_REFERENCE_COMMIT, MAIN_FEATURE_PRECISION,
+)
+
 MAIN_MEMORY_SEMANTICS = "completed_effect_trace"
 SUCCESS_MANIFEST_FORMAT = "zeva_success_demonstrations_v1"
-MAIN_REFERENCE_COMMIT = "17ca9fa0c68dca1fc7915dd6433de70a100e93a1"
 _IDENTITY_KEYS = (
     "manifest_sha256", "source_fingerprint", "success_episode_ids_sha256",
     "selected_episode_ids_sha256", "dataset_stats_sha256", "semantic_task_map_sha256",
@@ -250,6 +251,7 @@ def select_main_success_rows(rows: Iterable[T], cfg: Any) -> tuple[list[T], dict
     identity["split_sha256"] = _digest(splits)
     metadata = {
         "profile": MAIN_PROFILE, "artifact_lineage": MAIN_ARTIFACT_LINEAGE,
+        "reference_commit": MAIN_REFERENCE_COMMIT, "feature_precision": MAIN_FEATURE_PRECISION,
         "memory_semantics": MAIN_MEMORY_SEMANTICS, "success_data_identity": identity,
         "episode_splits": splits, "data_role": "all",
     }
@@ -260,6 +262,7 @@ def select_main_success_rows(rows: Iterable[T], cfg: Any) -> tuple[list[T], dict
 def validate_main_artifact(payload: Mapping[str, Any], expected: Mapping[str, Any] | None = None) -> None:
     """Reject predictive/legacy artifacts when selecting the observed main path."""
     required = {"profile": MAIN_PROFILE, "artifact_lineage": MAIN_ARTIFACT_LINEAGE,
+                "reference_commit": MAIN_REFERENCE_COMMIT, "feature_precision": MAIN_FEATURE_PRECISION,
                 "memory_semantics": MAIN_MEMORY_SEMANTICS}
     for key, value in required.items():
         if payload.get(key) != value:
@@ -304,7 +307,8 @@ def inherit_main_artifact(payload: Mapping[str, Any]) -> dict[str, Any]:
         return {}
     validate_main_artifact(payload)
     return {key: payload[key] for key in (
-        "profile", "artifact_lineage", "memory_semantics", "success_data_identity", "episode_splits", "data_role",
+        "profile", "artifact_lineage", "reference_commit", "feature_precision", "memory_semantics",
+        "success_data_identity", "episode_splits", "data_role",
     )}
 
 

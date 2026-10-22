@@ -19,9 +19,9 @@ from test_separate_prefix_integration import _model, _sample
 
 def main_model(stage="pim_adapter", *, joint=False, metadata=None):
     model = _model(stage="policy_injection")
-    reader = replace(model.zeva_prompt_encoder.config, numerical_contract="zeva_main_v1")
+    reader = replace(model.zeva_prompt_encoder.config, numerical_contract="zeva_main_v2")
     adapter = replace(model.zeva_behavior_prefix_adapter.config,
-                      numerical_contract="zeva_main_v1", prefix_layout="legacy_merged")
+                      numerical_contract="zeva_main_v2", prefix_layout="legacy_merged")
     model.attach_zeva_addon(CausalPromptEncoder(reader), ExactZevaPolicyInjectionAdapter(adapter))
     model.zeva_profile = "main_observed"
     model.zeva_training_recipe = f"main_{'joint' if joint else 'frozen'}_{'parent' if stage == 'policy_injection' else 'pim'}"
@@ -151,7 +151,7 @@ def test_main_prior_initialization_resets_attention_before_position_parameters(m
     assert events == ["progress_attention", "effect_attention", "anchor_position", "effect_position", "bos_effect"]
 
 
-def test_main_fp32_parameters_and_eval_survive_dtype_moves_while_training_uses_amp():
+def test_main_keeps_training_masters_but_explicit_inference_uses_policy_dtype():
     model, sample = main_model().eval(), _sample()
     reader, adapter = model.zeva_prompt_encoder, model.zeva_behavior_prefix_adapter
     with torch.no_grad():
@@ -165,18 +165,13 @@ def test_main_fp32_parameters_and_eval_survive_dtype_moves_while_training_uses_a
     assert all(parameter.dtype == torch.bfloat16 for parameter in model.mot.parameters())
     for name, value in adapter.state_dict().items():
         torch.testing.assert_close(value, original[name], rtol=0, atol=0)
-    def compute():
-        prompt = _prompt(reader, sample)
-        mean, std = _prior(adapter, sample, prompt)
-        residual = adapter.action_prior_residual(mean, training=False)
-        tokens, _ = adapter.behavior_prefix_tokens(sample["task_context"], prompt, sample["pim_mask"])
-        return prompt, mean, std, residual, tokens
-    expected = compute()
+    assert model.zeva_condition_dtype == torch.float32
+    # Main does not inherit Ego's forced-FP32 eval wrapper. The caller's
+    # autocast remains effective on held-out training forwards as upstream.
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        actual = compute()
-    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
-        assert actual_tensor.dtype == torch.float32
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+        prompt = _prompt(reader, sample)
+        mean, _ = _prior(adapter, sample, prompt)
+    assert prompt.dtype == mean.dtype == torch.bfloat16
     model.configure_zeva_trainable_state()
     assert not adapter.prior.training and reader.training
     with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -184,8 +179,32 @@ def test_main_fp32_parameters_and_eval_survive_dtype_moves_while_training_uses_a
         mean, _ = _prior(adapter, sample, prompt)
     assert prompt.dtype == mean.dtype == torch.bfloat16
 
+    serving = deepcopy(model)
+    serving.prepare_zeva_inference_precision()
+    serving_reader, serving_adapter = serving.zeva_prompt_encoder, serving.zeva_behavior_prefix_adapter
+    assert not serving.training and not serving_reader.training and not serving_adapter.training
+    assert serving.zeva_condition_dtype == torch.bfloat16
+    assert all(parameter.dtype == torch.bfloat16 for parameter in (
+        *serving_reader.parameters(), *serving_adapter.parameters()))
+    for name, value in serving_adapter.state_dict().items():
+        torch.testing.assert_close(value, original[name].bfloat16(), rtol=0, atol=0)
+    # No autocast is needed: original main constructs the full policy,
+    # including EAP/MCE, in its configured serving dtype.
+    with torch.no_grad():
+        prompt = _prompt(serving_reader, sample)
+        mean, std = _prior(serving_adapter, sample, prompt)
+        residual = serving_adapter.action_prior_residual(mean, training=False)
+        tokens, _ = serving_adapter.behavior_prefix_tokens(sample["task_context"], prompt, sample["pim_mask"])
+    assert all(value.dtype == torch.bfloat16 and torch.isfinite(value).all()
+               for value in (prompt, mean, std, residual, tokens))
+    with pytest.raises(ValueError, match="separate training model"):
+        serving.prepare_zeva_training_precision()
+    model.prepare_zeva_training_precision()
+    with pytest.raises(ValueError, match="separate inference model"):
+        model.prepare_zeva_inference_precision()
 
-def test_main_nll_retains_original_coordinate_mean_and_valid_action_mask(monkeypatch):
+
+def test_main_nll_uses_policy_target_dtype_original_coordinate_mean_and_valid_mask(monkeypatch):
     from fastwam.models.wan22 import fastwam as implementation
     model, sample = main_model("policy_injection"), _sample()
     model.bfloat16()
@@ -203,10 +222,13 @@ def test_main_nll_retains_original_coordinate_mean_and_valid_action_mask(monkeyp
         loss, metrics = model(sample)
     loss.backward()
     target, mean, std, valid, options = captured[0]
-    torch.testing.assert_close(target, sample["action"], rtol=0, atol=0)
-    assert target.dtype == torch.float32 and options["reference_reduction"] is False
+    torch.testing.assert_close(target, sample["action"].bfloat16(), rtol=0, atol=0)
+    assert not torch.equal(target.float(), sample["action"])
+    assert target.dtype == mean.dtype == std.dtype == torch.bfloat16
+    assert options["reference_reduction"] is False
     assert torch.equal(valid, sample["action_valid"])
-    expected = (0.5 * (((target - mean) / std).square() + 2 * std.log()).mean(-1))[valid].mean()
+    per_action = 0.5 * (((target - mean) / std).square() + 2 * std.log()).mean(-1)
+    expected = (per_action * valid.to(per_action.dtype)).sum() / valid.sum().clamp_min(1)
     assert metrics["behavior_prior_nll"] == pytest.approx(expected.item(), abs=1e-6)
     assert model.zeva_behavior_prefix_adapter.prior.distribution_head[-1].weight.grad.norm() > 0
 

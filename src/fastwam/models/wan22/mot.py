@@ -533,7 +533,11 @@ class MoT(nn.Module):
         return x
 
     def _run_cached_tensor_layer(self, function, *args):
-        if self.mot_checkpoint_mixed_attn and self.training and torch.is_grad_enabled():
+        # Frozen-policy training keeps MoT in eval mode but still needs the
+        # prefix -> video K/V -> action graph. Checkpoint that graph without
+        # enabling foundation dropout or changing which weights train.
+        needs_input_grad = any(isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args)
+        if self.mot_checkpoint_mixed_attn and torch.is_grad_enabled() and (self.training or needs_input_grad):
             if self.compile_training_layers:
                 raise ValueError("cached-action gradient checkpointing cannot be combined with compiled training layers")
             # Non-reentrant checkpointing records the autograd graph, supports

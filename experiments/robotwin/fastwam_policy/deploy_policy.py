@@ -40,7 +40,8 @@ from fastwam.zeva import (
     retrieve_task_context,
 )
 from fastwam.zeva.attempt_protocol import (ModelSeedStream, ContinuousModelNoiseStream,
-    CONTINUOUS_NOISE_PROTOCOL, DEVICE_CONTINUOUS_NOISE_PROTOCOL, CONTINUOUS_NOISE_PROTOCOLS)
+    CONTINUOUS_NOISE_PROTOCOL, DEVICE_CONTINUOUS_NOISE_PROTOCOL, CONTINUOUS_NOISE_PROTOCOLS,
+    MAIN_MODEL_RNG_PROTOCOL, MainAttemptSeedSchedule)
 from fastwam.zeva.ego_episode_data import prepare_ego_rgb_views
 from fastwam.zeva_memory_contract import pim_memory_contract, validate_checkpoint_pim_memory_contract
 from fastwam.zeva_numerical_contract import config_numerical_contract, validate_checkpoint_numerical_contract
@@ -270,6 +271,10 @@ class WorldActionRobotWinPolicy:
         model_cfg_copy = _inference_model_config(model_cfg)
         self.zeva_profile = str(model_cfg_copy.get("zeva", {}).get("profile", "legacy"))
         self._main_observed = self.zeva_profile == "main_observed"
+        # The published main protocol declares one discarded model request.
+        # Our local client scopes it to this model instance, across all resets.
+        self._main_warmup_requests = 0
+        self._main_warmup_seed: int | None = None
         if pim_success_replay_enabled and not self._main_observed:
             raise ValueError("successful-action replay requires the explicit main_observed profile")
         self._success_replay = PhaseMatchedSuccessReplay(
@@ -651,6 +656,8 @@ class WorldActionRobotWinPolicy:
             # Loading a joint checkpoint can restore trainability. Inference
             # updates only runtime memory, never foundation/addon parameters.
             self.model.eval().requires_grad_(False)
+            if self._main_observed:
+                self.model.prepare_zeva_inference_precision()
             pim = PersistentInteractionMemory(
                 PersistentInteractionMemoryConfig(
                     phase_dim=cte_cfg.phase_dim,
@@ -704,10 +711,17 @@ class WorldActionRobotWinPolicy:
         self.seed = seed
         self._model_seed_stream = ModelSeedStream(seed)
         self._model_noise_stream = None
+        self._main_seed_schedule = None
         self.evaluation_slot_index, self.evaluation_slot_count = int(evaluation_slot_index), int(evaluation_slot_count)
         if not 0 <= self.evaluation_slot_index < self.evaluation_slot_count:
             raise ValueError("evaluation slot index must be within slot count")
-        if model_rng_protocol in CONTINUOUS_NOISE_PROTOCOLS:
+        if self._main_observed:
+            if model_rng_protocol != MAIN_MODEL_RNG_PROTOCOL:
+                raise ValueError("main_observed requires Zeva-main attempt/replan request seeds")
+            if any(value is not None for value in (model_rng_state_path, model_rng_task_name, model_rng_run_id)):
+                raise ValueError("Zeva-main request seeds do not use a continuous RNG handoff")
+            self._main_seed_schedule = MainAttemptSeedSchedule(seed, device=str(torch.device(rand_device)))
+        elif model_rng_protocol in CONTINUOUS_NOISE_PROTOCOLS:
             if seed is None:
                 raise ValueError("continuous model RNG requires an explicit model seed")
             self._model_noise_stream = ContinuousModelNoiseStream(seed, slot_index=self.evaluation_slot_index,
@@ -824,7 +838,15 @@ class WorldActionRobotWinPolicy:
         bottom = np.concatenate([left, right], axis=1)
         image = np.concatenate([head, bottom], axis=0)
 
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(
+        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
+        if getattr(self, "_main_observed", False):
+            # Dataset preprocessing and original main normalize RGB in FP32
+            # before the VAE/policy dtype conversion. Casting [0,1] to BF16
+            # first introduces a second rounding, especially around grey .5.
+            return (image_tensor.float() * 2.0 - 1.0).to(
+                device=self.model.device, dtype=self.model.torch_dtype,
+            )
+        image_tensor = image_tensor.to(
             device=self.model.device,
             dtype=self.model.torch_dtype,
         )
@@ -884,7 +906,9 @@ class WorldActionRobotWinPolicy:
         )
         noise_stream = getattr(self, "_model_noise_stream", None)
         initial_noise = None if noise_stream is None else noise_stream.next_noise((1, self.action_horizon, 14))
-        request_seed = self._model_seed_stream.next_seed() if noise_stream is None else None
+        main_seeds = getattr(self, "_main_seed_schedule", None)
+        request_seed = (main_seeds.next_seed(self._attempt_id, self._replan_index) if main_seeds is not None
+                        else self._model_seed_stream.next_seed() if noise_stream is None else None)
         noise_kwargs = {} if initial_noise is None else {"initial_action_noise": initial_noise}
         self._last_inference_seed = request_seed
         if self.zeva_mode != "base":
@@ -1022,6 +1046,7 @@ class WorldActionRobotWinPolicy:
                 infer_kwargs.update(zeva_current_effect=current_effect, zeva_current_effect_mask=current_effect_mask)
             infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
             with torch.no_grad():
+                self._warmup_main_model(self.model.infer_action_zeva, infer_kwargs)
                 pred = self.model.infer_action_zeva(**infer_kwargs)
                 if (
                     self.zeva_mode == "pim_on" and self.cross_memory_enabled
@@ -1080,6 +1105,7 @@ class WorldActionRobotWinPolicy:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
+            self._warmup_main_model(self.model.infer_action, infer_kwargs)
             pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
@@ -1088,6 +1114,24 @@ class WorldActionRobotWinPolicy:
         action_chunk = self._denormalize_action(action_tensor)[0]
         self._replan_index += 1
         return action_chunk
+
+    @torch.no_grad()
+    def _warmup_main_model(self, infer, infer_kwargs: dict[str, Any]) -> None:
+        """Discard one same-seed forward without a control or memory request.
+
+        Conditions and the actual request seed have already been prepared.
+        Calling only the frozen model avoids action execution, lifecycle
+        writes, replay bookkeeping, or an extra seed/replan counter update.
+        The once-only flag deliberately survives episode and attempt resets.
+        """
+        if not getattr(self, "_main_observed", False) or getattr(self, "_main_warmup_requests", 0):
+            return
+        if infer_kwargs.get("seed") is None or "initial_action_noise" in infer_kwargs:
+            raise ValueError("main warmup requires the actual deterministic request seed")
+        discarded = infer(**infer_kwargs)
+        del discarded
+        self._main_warmup_seed = int(infer_kwargs["seed"])
+        self._main_warmup_requests = 1
 
     @torch.no_grad()
     def _measure_pim_effect(self, infer_kwargs, pred, task_tokens, phase, memory, causal_prompt, pim_mask):
@@ -1181,7 +1225,11 @@ class WorldActionRobotWinPolicy:
             "zeva_profile": getattr(self, "zeva_profile", "legacy"),
             "inference_parameters_frozen": self._inference_parameters_frozen(),
             "model_seed": self.seed,
-            "seed_stream": (getattr(self, "_model_noise_stream", None) or self._model_seed_stream).snapshot(),
+            "seed_stream": (getattr(self, "_main_seed_schedule", None)
+                            or getattr(self, "_model_noise_stream", None) or self._model_seed_stream).snapshot(),
+            "discarded_warmup_requests": int(getattr(self, "_main_warmup_requests", 0)),
+            "discarded_warmup_scope": "policy_instance" if getattr(self, "_main_observed", False) else None,
+            "discarded_warmup_inference_seed": getattr(self, "_main_warmup_seed", None),
             "evaluation_slot": {"index": getattr(self, "evaluation_slot_index", 0), "count": getattr(self, "evaluation_slot_count", 1)},
             "memory_semantics": "predicted_effect_trace" if getattr(self, "_ego_cte", False) else "completed_effect_trace",
             "observed_effect_source": "observed_post" if getattr(self, "_main_observed", False) else None,
@@ -1353,6 +1401,8 @@ class WorldActionRobotWinPolicy:
         }
 
     def reset(self) -> None:
+        if getattr(self, "_main_seed_schedule", None) is not None:
+            self._main_seed_schedule.reset_episode()
         self._main_runtime = None
         self._main_episode_instruction = None
         if getattr(self, "_success_replay", None) is not None:
@@ -1397,6 +1447,8 @@ class WorldActionRobotWinPolicy:
                 self._success_replay.begin_attempt(attempt_id)
             self._main_runtime = None
             self._pending_replay_actions.clear()
+        if getattr(self, "_main_seed_schedule", None) is not None:
+            self._main_seed_schedule.begin_attempt(attempt_id)
         if getattr(self, "_static_task_context_session", None) is not None:
             self._static_task_context_session.reset()
         self._task_language_instruction = self._task_language_result = None

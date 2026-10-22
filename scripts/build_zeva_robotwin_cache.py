@@ -60,7 +60,8 @@ from fastwam.zeva import (
 )
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.schemas import CacheManifest, sha256_file
-from fastwam.zeva.main_data import normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
+from fastwam.zeva.main_data import is_main_profile, normalize_main_dataset_paths, select_main_success_rows, validate_main_artifact
+from fastwam.zeva.cte_windows import MAIN_CTE_WINDOW_SEMANTICS, observed_prefix_transitions
 
 
 # -----------------------------------------------------------------------------
@@ -230,6 +231,14 @@ class EpisodePlan:
     max_query_start: int
     query_stride: int
     source_window_actions: int
+    # Main's effect history includes all real terminal control groups, even
+    # when the native H32 policy has fewer eligible complete target windows.
+    observed_end_raw_step: int | None = None
+
+    @property
+    def history_end_raw_step(self) -> int:
+        return (self.max_query_start + self.source_window_actions
+                if self.observed_end_raw_step is None else self.observed_end_raw_step)
 
     @property
     def query_count(self) -> int:
@@ -249,6 +258,8 @@ class EpisodePlan:
         that prefix to exactly ``last_query + 32`` -- the same final boundary the
         previous all-overlapping-window implementation produced.
         """
+        if self.observed_end_raw_step is not None:
+            return list(range(0, self.observed_end_raw_step, self.source_window_actions))
         starts = list(
             range(
                 0,
@@ -298,6 +309,7 @@ def _build_episode_plans_metadata_only(
     transition_steps: int,
     source_window_actions: int = 32,
     show_progress: bool = True,
+    include_observed_tail: bool = False,
 ) -> list[EpisodePlan]:
     """Build every valid cache-v4 query position without decoding RGB/video."""
     if sample_stride != 1:
@@ -363,11 +375,15 @@ def _build_episode_plans_metadata_only(
 
             # A Zeva source sample uses 32 actions + 33 raw observations.
             max_start = episode_length - (source_window_actions + 1)
-            if max_start < 0:
+            observed_end = ((episode_length - 1) // query_stride) * query_stride
+            if (observed_end < query_stride if include_observed_tail else max_start < 0):
                 continue
 
             # Cache queries must coincide with grouped CTE boundaries: 0,4,8,...
-            max_query_start = (max_start // query_stride) * query_stride
+            # A short successful demonstration still supplies query zero with
+            # a real target prefix; the native action validity mask hides its
+            # H32 padding. Never add an all-padding terminal action query.
+            max_query_start = max(0, (max_start // query_stride) * query_stride)
             
             task_id = robot_video_dataset.resolve_semantic_task_id(
                 episode_index=episode_id,
@@ -384,6 +400,7 @@ def _build_episode_plans_metadata_only(
                     max_query_start=max_query_start,
                     query_stride=query_stride,
                     source_window_actions=source_window_actions,
+                    observed_end_raw_step=observed_end if include_observed_tail else None,
                 )
             )
 
@@ -751,6 +768,13 @@ def _decode_episode(
 
         frames, preencoded = _source_frames(sample)
         encoded_flags.append(preencoded)
+        actions = sample["transition_actions"]
+        if getattr(plan, "observed_end_raw_step", None) is not None:
+            complete = observed_prefix_transitions(sample["frame_valid"], sample["transition_valid"])
+            expected = min(plan.source_window_actions, plan.history_end_raw_step - episode_step) // transition_steps
+            if complete != expected or complete < 1:
+                raise ValueError("main cache masks disagree with the episode's real observed boundaries")
+            frames, actions = frames[:complete + 1], actions[:complete]
 
         for local_index, frame in enumerate(frames):
             raw_step = episode_step + local_index * transition_steps * sample_stride
@@ -762,7 +786,7 @@ def _decode_episode(
                 episode_id=plan.episode_id,
             )
 
-        for local_index, action_group in enumerate(sample["transition_actions"]):
+        for local_index, action_group in enumerate(actions):
             raw_step = episode_step + local_index * transition_steps * sample_stride
             _insert_consistent(
                 action_groups,
@@ -1304,10 +1328,12 @@ def main(cfg: DictConfig) -> None:
             transition_steps=model.cfg.transition_steps,
             source_window_actions=model.cfg.transition_steps * 8,
             show_progress=(info.rank == 0),
+            include_observed_tail=is_main_profile(cfg),
         )
         plans, main_metadata = select_main_success_rows(plans, cfg)
         if main_metadata:
             validate_main_artifact(payload, main_metadata)
+            main_metadata["cte_window_semantics"] = MAIN_CTE_WINDOW_SEMANTICS
         if not plans:
             raise RuntimeError("cache metadata planner found no complete RoboTwin episodes")
 

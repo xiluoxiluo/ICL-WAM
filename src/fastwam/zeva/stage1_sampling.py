@@ -47,8 +47,14 @@ def build_cte_training_index(
     dataset: Sequence[dict[str, Any]],
     source_window_actions: int = 32,
     sample_stride: int = 1,
+    *,
+    include_observed_tail: bool = False,
+    transition_steps: int = 4,
 ) -> list[CTETrainIndex]:
-    """Build non-overlapping CTE windows from LeRobot episode metadata.
+    """Build non-overlapping CTE storage windows from episode metadata.
+
+    Main opts into observed tails: the final H32 row need only contain one
+    completed four-control interval, and downstream readers trim its padding.
 
     Fast path for ZevaRobotWinDataset:
       - does NOT call dataset[index]
@@ -61,11 +67,16 @@ def build_cte_training_index(
 
     source_window_actions = int(source_window_actions)
     sample_stride = int(sample_stride)
+    transition_steps = int(transition_steps)
 
     if source_window_actions < 1 or sample_stride < 1:
         raise ValueError(
             "source_window_actions and sample_stride must be positive"
         )
+    if transition_steps < 1 or source_window_actions % transition_steps:
+        raise ValueError("source windows must contain complete control groups")
+    if include_observed_tail and (transition_steps != 4 or sample_stride != 1):
+        raise ValueError("main observed tails require four controls per transition and stride one")
 
     # ------------------------------------------------------------------
     # Fast metadata-only path for:
@@ -134,7 +145,8 @@ def build_cte_training_index(
                 )
 
             # ----------------------------------------------------------
-            # First determine all non-overlapping COMPLETE windows.
+            # Determine non-overlapping windows. Legacy requires complete
+            # H32 targets; main additionally retains its masked real tail.
             #
             # A CTE source window contains:
             #   32 actions
@@ -166,8 +178,11 @@ def build_cte_training_index(
                 ep_end = int(episode_to[episode_pos])
                 episode_length = ep_end - ep_start
 
-                # Need 33 frames for 32 actions.
-                max_start = episode_length - (source_window_actions + 1)
+                # Main also keeps the last H32 storage window when it has at
+                # least one real four-control interval and its end image.
+                # Its remaining padding is masked and trimmed by the reader.
+                required_actions = transition_steps if include_observed_tail else source_window_actions
+                max_start = episode_length - (required_actions + 1)
 
                 if max_start < 0:
                     continue
@@ -300,7 +315,18 @@ def build_cte_training_index(
             if episode_step != expected:
                 next_valid_step.pop(episode_id, None)
 
-        if not _is_valid_window(sample):
+        if include_observed_tail:
+            from .cte_windows import observed_prefix_transitions
+            # Select the same starts as the metadata path; never reset the
+            # episode origin after an incomplete tail window.
+            if episode_step % (source_window_actions * sample_stride):
+                continue
+            valid_window = observed_prefix_transitions(
+                sample["frame_valid"], sample["transition_valid"],
+            ) > 0
+        else:
+            valid_window = _is_valid_window(sample)
+        if not valid_window:
             next_valid_step.pop(episode_id, None)
             continue
 

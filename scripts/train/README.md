@@ -36,7 +36,7 @@ python scripts/build_zeva_success_manifest.py \
 | `ACTION_DIT_CKPT` | 仓库 `checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt` |
 | `STATS_PATH` / `SEMANTIC_TASK_MAP` | `$DATA_ROOT/robotw_stats.json` / `$DATA_ROOT/meta/semantic_task_map.json`；可以显式换成实际文件 |
 | `TEXT_CACHE` | `$DATA_ROOT/text_embeds_cache_new`；匹配的旧文本 cache 可以复用 |
-| `RUN_ROOT` | 仓库 `runs/zeva_main_observed_v1`；新 CTE、cache、bank、readout、检索头和 Stage2 统一放这里 |
+| `RUN_ROOT` | 仓库 `runs/zeva_main_observed_v2`；新 CTE、cache、bank、readout、检索头和 Stage2 统一放这里 |
 | `PYTHON_BIN` | `python`；使用已经激活并安装本仓库依赖的环境，不猜测或自动切换 conda 环境 |
 | `GPU_IDS` | 优先继承 `CUDA_VISIBLE_DEVICES`，否则 `0,1,...,15` |
 
@@ -68,6 +68,14 @@ bash scripts/train/12_run_all.sh --from 02 --to 11
 | 12 | [`12_run_all.sh`](12_run_all.sh) | 顺序运行 01–11，支持 `--from`、`--to`、`--dry-run` |
 
 03、05、06、09 在单节点的 `PREP_GPU_IDS` 上使用 torchrun；04 使用 `CTE_GPU_IDS`，默认同样为全部分配 GPU。07/08 使用 `RETRIEVAL_GPU_ID` 的一个设备；07 可设 `RETRIEVAL_DEVICE=cpu`。02 的 Python 入口自行按 `TEXT_GPU_IDS` 启动文本预计算进程。不要把这些 shell 再包一层 torchrun。
+
+### 本次 main-v2 复查后的重建要求
+
+`numerical_contract=zeva_main_v2`、`artifact_lineage=zeva_main_observed_effect_v2`、`addon_schema=zeva_main_observed_policy_v2` 是本次审计后的主线。CTE 文件和缓存还记录 `cte_window_semantics=full_observed_prefix_masked_tail_v1`：磁盘保留原 H32 存储形状，但 CTE 实际历史包含末尾已经完成的四步交互，严格按真实 mask 截断；不把重复 padding 当观察。少于 32 步但已有完整四步交互的成功 episode 也会保留。
+
+此前 `3991c47` 的 main-v1 产物需要重新运行 **03–11**，包括重训 CTE 与 Stage2A/B。匹配的 base/action checkpoint、原始数据、统计文件、semantic map、success manifest 和文本 cache 可以复用。新默认输出目录独立；不要给旧文件补版本字段来绕过检查。旧完整 trainer state 只能在原代码/原合同下恢复，不能用于 main-v2 精确续训。
+
+CUDA 部署时，CTE 和静态检索头保持 FP32 权重、用 BF16 autocast 计算，特征/检索分数再按参考路径转 FP32；EAP/MCE 则在加载完成后随 policy 的推理精度转换，默认 BF16。CPU 开发测试的 CTE/检索特征使用 FP32。这里保留的是不同模块在原 main 中不同的精度路径；训练中的 FP32 master 参数不会为了部署测试原地舍入。完整证据见 [复查记录](../../docs/zeva_main_alignment_audit.md)。
 
 ## 训练设置与 foundation 开关
 
@@ -107,6 +115,10 @@ STAGE2A_FOUNDATION_MODE=joint STAGE2B_FOUNDATION_MODE=frozen \
 | `--protocol fixed_attempts --max-attempts 6` | 所有场景均试满 K 次，报告逐次成功与首次成功后的稳定率 |
 | `--success-replay` | 仅 fixed 模式显式启用；只有首次确认成功后的匹配 phase/action trace 可以回放，相关稳定收益不能称为纯失败学习 |
 
-主实验应比较相同 checkpoint 的 memory on/off。`CSR@4` 表示四次以内至少成功一次，不能写成单次 `SR=...`。重复抽样本身也会提高累计成功率；main PIM 还在当前 attempt 内积累 observed effects，因此进一步隔离“此前失败轨迹内容”的贡献需要共享第一次失败与匹配 retry noise 的对照。连续 RNG 不等于两组在轨迹长度分叉后每一步噪声仍完全相同。
+主实验应比较相同 checkpoint 的 memory on/off。这里实际切换 PIM 条件，两组均保留 global context、当前 attempt 的 BIT 和 action prior。`CSR@4` 表示四次以内至少成功一次，不能写成单次 `SR=...`。主线使用原 main 已公开的 `base_seed + 1000 * attempt_id + replan_index` 请求种子公式，attempt_id 从 0 开始；两组相同 attempt/replan 的种子不因前次提前成功或轨迹长短而错位。每次真实请求的种子写入 attempt 日志，报表检查完整序列；旧 Ego 的连续 RNG 仅保留在独立 Ego 入口，旧主线 v1 连续 RNG 日志不能当作新 v2 结果使用。
+
+重复抽样本身也会提高累计成功率；main PIM 还在当前 attempt 内积累 observed effects，因此进一步隔离“此前失败轨迹内容”的贡献仍需要共享第一次失败的对照。匹配请求种子不保证两组访问相同状态，也不声称与不同主干/硬件的原 Zeva 产生逐元素相同噪声。
+
+原 main 的公开 `attempt_protocol` 要求一次丢弃 warmup。当前每个 policy 实例在首次真实请求的冻结条件准备完毕后，以相同 request seed 做一次只计算模型的 warmup，再正常推理；不执行环境动作、不写 BIT/PIM/replay，也不推进请求种子或 replan 计数。attempt/episode reset 不重复 warmup。日志记录真实 warmup 次数与 seed。其 `policy_instance` 作用域和调用时点是本地客户端的明确实现，未公开的原 RoboCasa client 不作逐调用复现声明。
 
 部署始终是固定参数的前向计算与记忆写入。单卡顺序评测不加载两个并行 foundation，但 32 GB 显存、速度、成功率仍需在真实机器上测量；本目录的 CPU/dry-run 测试不代表已经完成离线训练或 RoboTwin rollout。

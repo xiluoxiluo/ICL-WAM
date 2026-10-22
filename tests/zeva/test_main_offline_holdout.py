@@ -85,6 +85,7 @@ def test_main_offline_builders_join_prepared_train_validation_views_on_cpu(tmp_p
     from fastwam.zeva.main_prepared import split_main_prepared_dataset
     from fastwam.zeva.prepared_stage2 import PreparedPIMCache, PreparedZevaStage2Dataset, StaticEpisodeContextCache
     from fastwam.zeva.schemas import CacheManifest
+    from fastwam.zeva.cte_windows import MAIN_CTE_WINDOW_SEMANTICS
     from scripts.build_zeva_pim_retrieval_cache import main as build_pim
     from scripts.build_zeva_static_episode_context_cache import main
 
@@ -131,6 +132,7 @@ def test_main_offline_builders_join_prepared_train_validation_views_on_cpu(tmp_p
         "sha256": checkpoint_sha256(root / "meta/tasks.jsonl")}}, cte_path)
     phase_root, pim_root = tmp_path / "phase", tmp_path / "pim"
     phase_manifest = CacheManifest(**metadata,
+        cte_window_semantics=MAIN_CTE_WINDOW_SEMANTICS,
         schema_version="zeva_fastwam_robotwin_cache_v4", history_semantics="full_episode_prefix",
         query_step_unit="raw_action_step", dataset_path=str(root), phase_dim=4, effect_dim=16,
         cte_checkpoint_sha256=checkpoint_sha256(cte_path),

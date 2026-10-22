@@ -18,6 +18,7 @@ from fastwam.zeva_main_evaluation import (
     ATTEMPT_SCHEMA, MANIFEST_SCHEMA, NOISE_PROTOCOL, load_manifest, make_manifest,
     paired_comparison, read_attempts, summarize_attempts, validate_attempts,
 )
+from fastwam.zeva_main_protocol import MainAttemptSeedSchedule
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -71,33 +72,48 @@ class _Policy:
     def __init__(self, outcomes, enabled=True, replay=False):
         self.outcomes, self.enabled, self.replay = outcomes, enabled, replay
         self.draws = 0
+        self.seed_schedule = MainAttemptSeedSchedule(123)
+        self.model_requests = []
+        self.warmup_requests = 0
+        self.warmup_seed = None
         self.reset_calls = 0
         self.attempt_calls = []
         self.finalized = []
         self.entries = 0
         self.first_success = None
         self.eligible = False
-        self.step_count = self.replans = self.replay_chunks = 0
+        self.step_count = self.replans = self.replay_chunks = self.replay_actions = 0
 
     def reset(self):
         self.reset_calls += 1
         self.entries = 0
         self.first_success = None
+        self.seed_schedule.reset_episode()
 
     def begin_attempt(self, attempt_id):
         self.attempt_id = attempt_id
+        self.seed_schedule.begin_attempt(attempt_id)
         self.attempt_calls.append(attempt_id)
-        self.step_count = self.replans = self.replay_chunks = 0
+        self.step_count = self.replans = self.replay_chunks = self.replay_actions = 0
         self.eligible = self.first_success is not None
 
     def step(self, env, obs):
         assert obs["seed"] == env.seed
-        self.draws += 1
-        self.replans += 1
+        if self.step_count % 24 == 0:
+            seed = self.seed_schedule.next_seed(self.attempt_id, self.replans)
+            if not self.warmup_requests:
+                self.model_requests.append(seed)  # discarded model-only call
+                self.warmup_requests += 1
+                self.warmup_seed = seed
+            self.model_requests.append(seed)
+            self.draws += 1
+            self.replans += 1
+            if self.eligible and self.replay and self.enabled:
+                self.replay_chunks += 1
         self.step_count += 1
         self.entries += 1
         if self.eligible and self.replay and self.enabled:
-            self.replay_chunks += 1
+            self.replay_actions += 1
         env.take_action_cnt += 1
         env.eval_success = self.outcomes[env.seed][self.attempt_id]
 
@@ -113,11 +129,12 @@ class _Policy:
             "model_seed": 123, "num_inference_steps": 10, "action_horizon": 32, "replan_steps": 24,
             "zeva_mode": "pim_on", "cross_memory_enabled": self.enabled,
             "checkpoint_identity": {key: _hash(key) for key in ("base_sha256", "addon_sha256", "cte_sha256", "stats_sha256")},
-            "seed_stream": {"protocol": NOISE_PROTOCOL, "seed": 123, "dtype": "float32", "device": "cpu", "draws": self.draws, "state_sha256": _hash(self.draws)},
+            "seed_stream": self.seed_schedule.snapshot(), "discarded_warmup_requests": self.warmup_requests,
+            "discarded_warmup_scope": "policy_instance", "discarded_warmup_inference_seed": self.warmup_seed,
             "replans": self.replans, "pim_entries": self.entries,
             "pim_success_replay_enabled": self.replay, "pim_success_replay_eligible": self.eligible,
             "pim_success_replay_applied_count": self.replay_chunks,
-            "pim_success_replay_action_count": self.replay_chunks,
+            "pim_success_replay_action_count": self.replay_actions,
             "pim_success_replay_phase_threshold": .80, "pim_success_replay_blend": 1.0,
             "pim_success_replay_source_attempts": [self.first_success] if self.replay_chunks else [],
             "main_observed_runtime": {
@@ -141,9 +158,10 @@ def _actual_loop():
     return namespace["eval_policy"]
 
 
-def _run(tmp_path, manifest, sha, outcomes, enabled=True):
+def _run(tmp_path, manifest, sha, outcomes, enabled=True, step_limit=2):
     policy = _Policy(outcomes, enabled=enabled, replay=manifest["pim_success_replay_enabled"])
     env = _Environment()
+    env.step_lim = step_limit
     log = tmp_path / ("on.jsonl" if enabled else "off.jsonl")
     args = {"task_name": "task", "policy_name": "mock", "task_config": "demo_randomized", "ckpt_setting": "mock", "clear_cache_freq": 1, "render_freq": 0}
     _, successes = _actual_loop()(
@@ -192,7 +210,10 @@ def test_single_attempt_resets_memory_between_randomized_scenes(tmp_path):
     policy, _, rows, successes, _ = _run(tmp_path, manifest, sha, {7: [True], 8: [False]})
     assert policy.reset_calls == 2 and policy.attempt_calls == [0, 0]
     assert [row["pim_entries_before"] for row in rows] == [0, 0]
-    assert rows[1]["seed_stream_before"] == rows[0]["seed_stream"]
+    assert rows[1]["seed_stream_before"] == rows[0]["seed_stream_before"]
+    assert rows[1]["seed_stream"]["request_seeds"] == rows[0]["seed_stream"]["request_seeds"] == [123]
+    assert [row["discarded_warmup_requests_before"] for row in rows] == [0, 1]
+    assert policy.warmup_requests == 1 and policy.model_requests == [123, 123, 123]
     summary = summarize_attempts(manifest, sha, rows)
     assert successes == 1 and summary["primary_metric"] == "SR@1"
     assert summary["micro"]["SR@1"] == .5
@@ -254,6 +275,64 @@ def test_paired_comparison_matches_weights_and_labels_replay(tmp_path):
         paired_comparison(manifest, sha, on, off)
 
 
+def test_request_seeds_stay_paired_after_different_trajectory_lengths(tmp_path):
+    manifest, sha, _ = _manifest(tmp_path)
+    _, _, on, _, _ = _run(tmp_path, manifest, sha, {7: [True, False, True, False]}, enabled=True, step_limit=50)
+    _, _, off, _, _ = _run(tmp_path, manifest, sha, {7: [False, False, False, False]}, enabled=False, step_limit=50)
+    assert on[0]["seed_stream"]["request_seeds"] == [123]
+    assert off[0]["seed_stream"]["request_seeds"] == [123, 124, 125]
+    assert on[1]["seed_stream"]["request_seeds"] == off[1]["seed_stream"]["request_seeds"] == [1123, 1124, 1125]
+    result = paired_comparison(manifest, sha, on, off, bootstrap_samples=30)
+    assert result["matching_attempt_replan_seed_schedule"] is True
+    assert result["same_initial_request_seed_schedule_scenes"] == 1
+    assert not result["on"]["reset_audit"]["model_rng_continuous"]
+    off[1]["seed_stream"]["request_seeds"][0] += 3
+    with pytest.raises(ValueError, match="inference seeds"):
+        paired_comparison(manifest, sha, on, off)
+
+
+def test_report_rejects_old_continuous_main_logs_and_unrecorded_extra_requests(tmp_path):
+    manifest, sha, _ = _manifest(tmp_path, protocol="single_attempt", attempts=1)
+    _, _, rows, _, _ = _run(tmp_path, manifest, sha, {7: [True]})
+    old = deepcopy(rows)
+    old[0]["seed_stream"]["protocol"] = "torch_device_continuous_slot_v1"
+    with pytest.raises(ValueError, match="protocol"):
+        summarize_attempts(manifest, sha, old)
+    rows[0]["replans"] += 1
+    with pytest.raises(ValueError, match="execute24"):
+        summarize_attempts(manifest, sha, rows)
+
+
+@pytest.mark.parametrize("field,value", [("discarded_warmup_requests", 0), ("discarded_warmup_requests", 2),
+                                        ("discarded_warmup_scope", "attempt"), ("discarded_warmup_inference_seed", 124)])
+def test_report_requires_a_single_same_seed_model_warmup(tmp_path, field, value):
+    manifest, sha, _ = _manifest(tmp_path, protocol="single_attempt", attempts=1)
+    _, _, rows, _, _ = _run(tmp_path, manifest, sha, {7: [True]})
+    rows[0][field] = value
+    with pytest.raises(ValueError):
+        summarize_attempts(manifest, sha, rows)
+
+
+@pytest.mark.parametrize("problem", ["repeat_attempt", "repeat_scene", "change_seed", "already_warm_first_row"])
+def test_report_validates_one_warmup_for_the_entire_task_policy_instance(tmp_path, problem):
+    if problem == "repeat_scene":
+        manifest, sha, _ = _manifest(tmp_path, protocol="single_attempt", attempts=1, seeds=(7, 8))
+        _, _, rows, _, _ = _run(tmp_path, manifest, sha, {7: [True], 8: [False]})
+    else:
+        manifest, sha, _ = _manifest(tmp_path)
+        _, _, rows, _, _ = _run(tmp_path, manifest, sha, {7: [False, True, False, True]})
+    validate_attempts(manifest, sha, rows)
+    if problem.startswith("repeat_"):
+        rows[1]["discarded_warmup_requests_before"] = 0
+        rows[1]["discarded_warmup_inference_seed"] = rows[1]["seed_stream"]["request_seeds"][0]
+    elif problem == "change_seed":
+        rows[1]["discarded_warmup_inference_seed"] += 1
+    else:
+        rows[0]["discarded_warmup_requests_before"] = 1
+    with pytest.raises(ValueError, match="warmup"):
+        validate_attempts(manifest, sha, rows)
+
+
 def _dry_command(output):
     command = [sys.executable, "-S", str(ROOT / "scripts/eval_zeva_main_robotwin.py"), "--output-dir", str(output), "--dry-run"]
     for name in ("checkpoint", "cte-checkpoint", "addon-checkpoint", "dataset-stats", "success-manifest", "task-context-bank", "task-context-retrieval-checkpoint"):
@@ -276,6 +355,7 @@ def test_stdlib_only_dry_run_is_wired_to_real_simulator_entrypoint(tmp_path, pro
     manifest, _ = load_manifest(output / "manifest.json")
     assert manifest["schema"] == MANIFEST_SCHEMA and manifest["max_attempts"] == attempts
     assert manifest["reference_benchmark_reproduction"] is False
+    assert manifest["discarded_warmup_requests"] == 1 and manifest["discarded_warmup_scope"] == "policy_instance"
     for item in plan["commands"]:
         assert item["command"][1].endswith("experiments/robotwin/eval_robotwin_single.py")
         settings = {key.lstrip("+"): json.loads(value) for entry in item["command"][4:] for key, value in [entry.split("=", 1)]}
@@ -285,6 +365,9 @@ def test_stdlib_only_dry_run_is_wired_to_real_simulator_entrypoint(tmp_path, pro
         assert settings["EVALUATION.cross_memory_enabled"] is (item["condition"] == "memory_on")
         assert settings["model.zeva.task_context.mode"] == "static"
         assert settings["EVALUATION.skip_get_obs_within_replan"] is False
+        assert settings["EVALUATION.model_rng_protocol"] == NOISE_PROTOCOL
+        assert settings["EVALUATION.model_rng_state_path"] is None
+        assert "rng_state_path" not in item
     repeated = subprocess.run(command, text=True, capture_output=True)
     assert repeated.returncode != 0 and "fresh" in repeated.stderr
 
@@ -305,7 +388,7 @@ def test_main_dry_commands_compose_the_actual_main_model_contract(tmp_path, foun
         zeva = OmegaConf.to_container(cfg.model.zeva, resolve=True)
         evaluation = OmegaConf.to_container(cfg.EVALUATION, resolve=True)
         assert delegated[3] == "sim_robotwin_zeva_main"
-        assert zeva["profile"] == "main_observed" and config_numerical_contract(zeva) == "zeva_main_v1"
+        assert zeva["profile"] == "main_observed" and config_numerical_contract(zeva) == "zeva_main_v2"
         assert zeva["foundation_mode"] == foundation and zeva["freeze_fastwam"] is (foundation == "frozen")
         assert zeva["task_context"]["mode"] == "static"
         assert zeva["memory"]["memory_semantics"] == "completed_effect_trace"
@@ -313,6 +396,7 @@ def test_main_dry_commands_compose_the_actual_main_model_contract(tmp_path, foun
         assert zeva["memory"]["pim_top_k"] == evaluation["pim_top_k"] == 4
         assert evaluation["attempt_protocol"] == "fixed_attempts" and evaluation["max_attempts"] == 6
         assert evaluation["pim_success_replay_enabled"] is True
+        assert evaluation["model_rng_protocol"] == NOISE_PROTOCOL
         assert evaluation["cross_memory_enabled"] is (item["condition"] == "memory_on")
 
 

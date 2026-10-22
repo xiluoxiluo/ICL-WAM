@@ -8,7 +8,6 @@ it does not claim that checkpoint compatibility or a rollout was validated.
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 from pathlib import Path
@@ -20,7 +19,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from fastwam.zeva_main_evaluation import (
     NOISE_PROTOCOL, PROFILE, PROTOCOLS, audit_attempt_videos, load_manifest,
-    make_manifest, paired_comparison, read_attempts, summarize_attempts,
+    make_manifest, paired_comparison, read_attempts, summarize_attempts, validate_attempts,
 )
 
 
@@ -36,20 +35,13 @@ def _write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def _verify_handoff(path: Path, *, log: Path, manifest: dict, run_id: str, tasks: list[str]) -> None:
-    """A successful child must commit the matching continuous RNG tail."""
-    payload = json.loads(path.read_text())
-    tail = read_attempts(log)[-1]
-    expected = {"protocol": NOISE_PROTOCOL, "seed": manifest["model_seed"], "slot_index": 0,
-                "slot_count": 1, "run_id": run_id, "completed_tasks": tasks,
-                "checkpoint_identity": tail["checkpoint_identity"], "noise_shape": [1, 32, 14]}
-    if any(payload.get(key) != value for key, value in expected.items()) or tail["task"] != tasks[-1]:
-        raise ValueError("Main model RNG handoff has the wrong task, weights, or run identity")
-    raw = base64.b64decode(payload["generator_state"], validate=True)
-    if hashlib.sha256(raw).hexdigest() != payload.get("state_sha256"):
-        raise ValueError("Main model RNG handoff checksum mismatch")
-    if any(payload.get(key) != value for key, value in tail["seed_stream"].items()):
-        raise ValueError("Main model RNG handoff differs from the last completed attempt")
+def _verify_completed_task(*, log: Path, manifest: dict, manifest_sha: str, task: str) -> None:
+    """Fail before launching another task if a child omitted or corrupted rows."""
+    rows = read_attempts(log)
+    if not rows or rows[-1].get("task") != task:
+        raise ValueError("Completed child did not record the expected task")
+    subset = {**manifest, "episodes": [scene for scene in manifest["episodes"] if scene["task"] == task]}
+    validate_attempts(subset, manifest_sha, [row for row in rows if row.get("task") == task])
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -143,8 +135,6 @@ def main(argv: list[str] | None = None) -> None:
     commands = []
     for condition in args.conditions:
         for task in tasks:
-            rng_id = f"{output.name}:{condition}"
-            rng_path = output / condition / "model_rng.json"
             settings = {
                 "task": args.task_config, "ckpt": assets["checkpoint"], "gpu_id": args.gpu_id,
                 "++foundation_mode": args.foundation_mode,
@@ -162,8 +152,8 @@ def main(argv: list[str] | None = None) -> None:
                 "EVALUATION.num_inference_steps": args.num_inference_steps,
                 "EVALUATION.model_seed": args.model_seed, "EVALUATION.model_rng_protocol": NOISE_PROTOCOL,
                 "EVALUATION.evaluation_slot_index": 0, "EVALUATION.evaluation_slot_count": 1,
-                "EVALUATION.model_rng_state_path": str(rng_path), "EVALUATION.model_rng_task_name": task,
-                "EVALUATION.model_rng_run_id": rng_id,
+                "EVALUATION.model_rng_state_path": None, "EVALUATION.model_rng_task_name": None,
+                "EVALUATION.model_rng_run_id": None,
                 "EVALUATION.episode_manifest": str(frozen_path), "EVALUATION.expected_manifest_sha256": manifest_sha,
                 "EVALUATION.attempt_log_path": str(output / f"{condition}.jsonl"),
                 "EVALUATION.condition": condition, "EVALUATION.run_id": output.name,
@@ -178,14 +168,15 @@ def main(argv: list[str] | None = None) -> None:
             }
             command = [sys.executable, str(ROOT / "experiments/robotwin/eval_robotwin_single.py"),
                        "--config-name", "sim_robotwin_zeva_main", *(_setting(key, value) for key, value in settings.items()), *args.override]
-            commands.append({"condition": condition, "task": task, "command": command,
-                             "rng_state_path": str(rng_path), "rng_run_id": rng_id})
+            commands.append({"condition": condition, "task": task, "command": command})
     plan = {
         "evaluation_profile": PROFILE, "attempt_protocol": args.protocol, "manifest_sha256": manifest_sha,
         "source_manifest_sha256": source_sha, "episodes_per_condition": len(manifest["episodes"]),
         "max_attempts": attempts, "conditions": args.conditions, "policy_artifacts": assets,
         "foundation_training_mode": args.foundation_mode, "inference_parameter_updates": False,
         "pim_success_replay_enabled": args.success_replay, "model_rng_protocol": NOISE_PROTOCOL,
+        "model_seed_formula": manifest["model_seed_formula"], "discarded_warmup_requests": 1,
+        "discarded_warmup_scope": "policy_instance",
         "gpu_execution": "sequential conditions/tasks; one model resident; no guarantee of 32GB fit without measurement",
         "metric_contract": {"single_attempt": "independently reset randomized scenes: SR@1",
                             "stop_on_success": "same scene retries: CSR@k with all original scenes as denominator",
@@ -197,17 +188,14 @@ def main(argv: list[str] | None = None) -> None:
     if args.dry_run:
         print(json.dumps(plan, indent=2, ensure_ascii=False))
         return
-    completed: dict[str, list[str]] = {}
     for item in commands:
         print(f"Evaluating main {args.protocol}: {item['condition']} / {item['task']}", flush=True)
         result = subprocess.run(item["command"], cwd=ROOT, check=False)
         if result.returncode:
             _write_json(output / "run_failure.json", {"condition": item["condition"], "task": item["task"], "returncode": result.returncode})
             raise SystemExit("Rollout failed; partial logs are not a completed evaluation")
-        done = completed.setdefault(item["condition"], [])
-        done.append(item["task"])
-        _verify_handoff(Path(item["rng_state_path"]), log=output / f"{item['condition']}.jsonl",
-                        manifest=manifest, run_id=item["rng_run_id"], tasks=done)
+        _verify_completed_task(log=output / f"{item['condition']}.jsonl", manifest=manifest,
+                               manifest_sha=manifest_sha, task=item["task"])
     rows = {condition: read_attempts(output / f"{condition}.jsonl") for condition in args.conditions}
     video_audit = audit_attempt_videos([row for condition_rows in rows.values() for row in condition_rows])
     for condition, condition_rows in rows.items():

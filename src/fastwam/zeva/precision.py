@@ -1,4 +1,4 @@
-"""Keep reference addon weights/inference FP32 without changing WAM precision."""
+"""Separate FP32 training masters from each reference's serving precision."""
 
 from contextvars import ContextVar
 from functools import wraps
@@ -6,22 +6,29 @@ from functools import wraps
 import torch
 from torch import nn
 
-from fastwam.zeva_numerical_contract import FP32_NUMERICAL_CONTRACTS
+from fastwam.zeva_numerical_contract import FP32_NUMERICAL_CONTRACTS, MAIN_NUMERICAL_CONTRACT
 
 
 _reference_training = ContextVar("zeva_reference_training", default=None)
 
 
 class ReferenceFloat32Module(nn.Module):
-    """Preserve FP32 values through whole-model device/dtype moves.
+    """Preserve FP32 values until an explicit main inference conversion.
 
     Calling the original conversion and then .float() would already round
     the weights. Device selection is taken from the converted tensor, while
     the actual FP32 copy is made from the original tensor instead.
+    Ego also serves in FP32. Original main serves in the policy dtype, so
+    FastWAM.prepare_zeva_inference_precision explicitly releases its master
+    weight protection only on a separate deployment model.
     """
 
     def _apply(self, fn, recurse=True):
-        strict = getattr(getattr(self, "config", None), "numerical_contract", None) in FP32_NUMERICAL_CONTRACTS
+        contract = getattr(getattr(self, "config", None), "numerical_contract", None)
+        strict = contract in FP32_NUMERICAL_CONTRACTS or (
+            contract == MAIN_NUMERICAL_CONTRACT
+            and not getattr(self, "_main_inference_precision", False)
+        )
         if not strict:
             return super()._apply(fn, recurse=recurse)
 
@@ -35,7 +42,7 @@ class ReferenceFloat32Module(nn.Module):
 
 
 def reference_inference_precision(method):
-    """Match reference FP32 eval while retaining its training AMP behavior."""
+    """Keep Ego eval FP32; main follows its weights and caller's autocast."""
     @wraps(method)
     def wrapped(self, *args, **kwargs):
         strict = getattr(getattr(self, "config", None), "numerical_contract", None) in FP32_NUMERICAL_CONTRACTS

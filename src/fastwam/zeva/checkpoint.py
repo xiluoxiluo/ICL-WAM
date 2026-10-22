@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from .schemas import CacheManifest
+from fastwam.zeva_main_contract import MAIN_ADDON_SCHEMA, MAIN_NUMERICAL_CONTRACT
 
 JOINT_FOUNDATION_SCHEMA = "iclwam_joint_foundation_v1"
 FOUNDATION_CONTRACT_SCHEMA = "iclwam_foundation_contract_v1"
@@ -82,7 +83,7 @@ def checkpoint_requires_foundation(payload: dict) -> bool:
     if main:
         valid = ((stage == "policy_injection" and recipe == "main_joint_parent")
                  or (stage == "pim_adapter" and recipe in {"main_joint_pim", "main_frozen_pim"}))
-    expected_schema = "zeva_main_observed_policy_v1" if main else "zeva_ego_prediction_v1"
+    expected_schema = MAIN_ADDON_SCHEMA if main else "zeva_ego_prediction_v1"
     if payload.get("addon_schema") != expected_schema or not valid:
         raise ValueError("foundation bundle requires a predictive joint Stage2A/Stage2B or inherited frozen Stage2B")
     if mode == "frozen":
@@ -206,6 +207,10 @@ def save_cte_checkpoint(
         payload["cte_vae_input_size"] = list(cte_vae_input_size)
     from .main_data import inherit_main_artifact
     payload.update(inherit_main_artifact(config or {}))
+    if payload.get("profile") == "main_observed":
+        from .cte_windows import validate_main_cte_window_semantics
+        payload["cte_window_semantics"] = (config or {}).get("cte_window_semantics")
+        validate_main_cte_window_semantics(payload)
     torch.save(payload, path)
 
 
@@ -214,7 +219,10 @@ def load_cte_checkpoint(path: str | Path, model, optimizer=None, scheduler=None,
     from .main_data import MAIN_PROFILE, validate_main_artifact
     if payload.get("profile") == MAIN_PROFILE:
         validate_main_artifact(payload)
+        from .cte_windows import validate_main_cte_window_semantics
+        validate_main_cte_window_semantics(payload)
     model.load_state_dict(payload["model"], strict=True)
+    model.zeva_main_features = payload.get("profile") == MAIN_PROFILE
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])
     if scheduler is not None and payload.get("scheduler") is not None:
@@ -243,7 +251,7 @@ def addon_layout_metadata(behavior_prefix_adapter) -> dict[str, str | None]:
         if effect_source not in {"latest_completed", "current_prediction"}:
             raise ValueError("unsupported zeva_ego effect_source")
     predictive = effect_source == "current_prediction"
-    main = getattr(config, "numerical_contract", None) == "zeva_main_v1"
+    main = getattr(config, "numerical_contract", None) == MAIN_NUMERICAL_CONTRACT
     if predictive != (prior_variant == "zeva_ego"):
         raise ValueError("predictive CTE and zeva_ego action prior must be used together")
     return {
@@ -252,11 +260,11 @@ def addon_layout_metadata(behavior_prefix_adapter) -> dict[str, str | None]:
         "effect_source": effect_source,
         **({"profile": "main_observed", "effect_source": "latest_completed",
             "prior_variant": "legacy_bit", "memory_semantics": "completed_effect_trace",
-            "numerical_contract": "zeva_main_v1"} if main else {}),
+            "numerical_contract": MAIN_NUMERICAL_CONTRACT} if main else {}),
         **({"prior_variant": prior_variant, "memory_semantics": "predicted_effect_trace",
             "numerical_contract": getattr(config, "numerical_contract", "legacy_v1")} if predictive else {}),
         "addon_schema": (
-            "zeva_main_observed_policy_v1" if main else "zeva_ego_prediction_v1" if predictive
+            MAIN_ADDON_SCHEMA if main else "zeva_ego_prediction_v1" if predictive
             else "zeva_ego_prefix_v1" if layout == "zeva_ego"
             else "cross_attempt_v1" if variant == "cross_attempt"
             else "legacy"

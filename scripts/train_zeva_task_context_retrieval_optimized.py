@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from fastwam.zeva import TaskContextBank
 from fastwam.zeva.checkpoint import checkpoint_sha256
+from fastwam.zeva.feature_precision import main_feature_autocast
 from fastwam.zeva.main_data import inherit_main_artifact, is_main_profile, validate_main_source
 from fastwam.zeva.static_task_context import (
     HEAD_FORMAT,
@@ -29,7 +30,7 @@ from fastwam.zeva.task_context_training import train_retrieval_head
 from fastwam.zeva.schemas import sha256_file
 
 
-def _full_validation(head, readouts, keys, labels, train_indices, val_indices, device):
+def _full_validation(head, readouts, keys, labels, train_indices, val_indices, device, *, main_features=False):
     head.eval()
     readouts = readouts.float().to(device)
     keys = F.normalize(keys.float().to(device), dim=-1)
@@ -37,7 +38,10 @@ def _full_validation(head, readouts, keys, labels, train_indices, val_indices, d
     train_idx = torch.tensor(train_indices, device=device, dtype=torch.long)
     val_idx = torch.tensor(val_indices, device=device, dtype=torch.long)
     with torch.no_grad():
-        q = head(readouts[val_idx])
+        with main_feature_autocast(device, enabled=main_features):
+            q = head(readouts[val_idx])
+        if main_features:
+            q = F.normalize(q.float(), dim=-1)
         scores = q @ keys[train_idx].T
         nearest = scores.argmax(dim=-1)
         predicted = labels[train_idx][nearest]
@@ -144,6 +148,7 @@ def main(cfg: DictConfig) -> None:
         keys,
         labels,
         seed=seed,
+        main_features=is_main_profile(cfg),
         **validation_kwargs,
         **dict(tc.training),
     )
@@ -164,6 +169,7 @@ def main(cfg: DictConfig) -> None:
         report_train,
         report_val,
         device,
+        main_features=is_main_profile(cfg),
     )
     if not all(torch.isfinite(torch.tensor(value)) for value in final_report.values()):
         raise FloatingPointError("static retrieval validation produced non-finite metrics")
