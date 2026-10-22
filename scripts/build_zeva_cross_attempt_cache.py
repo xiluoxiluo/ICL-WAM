@@ -25,9 +25,10 @@ import torch
 from safetensors.torch import load_file
 
 from fastwam.zeva.cross_attempt_cache import (
-    CROSS_ATTEMPT_CACHE_FORMAT, CrossAttemptPIMCache, HISTORY_KINDS,
+    CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT, CrossAttemptPIMCache, HISTORY_KINDS,
     build_episode_pairings, file_sha256, validate_episode_splits,
 )
+from fastwam.zeva.ego_boundary_cache import EGO_BOUNDARY_CACHE_FORMAT, EgoBoundaryCache
 from fastwam.zeva.memory import uniform_history_indices
 from fastwam.zeva.schemas import CacheManifest
 from fastwam.zeva.semantic_tasks import SemanticTaskMap, parse_episode_index_from_id
@@ -66,12 +67,20 @@ def build_cache(
     if not semantic_map.is_file():
         raise FileNotFoundError(semantic_map)
     semantic = SemanticTaskMap.load(semantic_map)
-    source_manifest = CacheManifest(**json.loads((phase_cache / "manifest.json").read_text()))
-    source_manifest.validate({
-        "schema_version": "zeva_fastwam_robotwin_cache_v4",
-        "history_semantics": "full_episode_prefix", "query_step_unit": "raw_action_step",
-        "feature_dtype": "float32",
-    })
+    source_values = json.loads((phase_cache / "manifest.json").read_text())
+    current_prediction = source_values.get("schema_version") == EGO_BOUNDARY_CACHE_FORMAT
+    ego_source = EgoBoundaryCache(phase_cache) if current_prediction else None
+    if current_prediction:
+        source_manifest = ego_source.manifest
+        if source_manifest.semantic_task_map_sha256 != file_sha256(semantic_map):
+            raise ValueError("boundary cache semantic map identity mismatch")
+    else:
+        source_manifest = CacheManifest(**source_values)
+        source_manifest.validate({
+            "schema_version": "zeva_fastwam_robotwin_cache_v4",
+            "history_semantics": "full_episode_prefix", "query_step_unit": "raw_action_step",
+            "feature_dtype": "float32",
+        })
     rows = json.loads((phase_cache / "episode_index.json").read_text())
     if not isinstance(rows, list) or not rows:
         raise ValueError("source phase/effect cache has no records")
@@ -85,9 +94,12 @@ def build_cache(
             raise ValueError("an episode cannot belong to multiple tasks")
         tasks[episode] = task
     splits = validate_episode_splits(
-        json.loads(episode_splits.read_text()) if episode_splits else _automatic_splits(tasks, validation_fraction, seed),
+        json.loads(episode_splits.read_text()) if episode_splits else (
+            ego_source.splits if current_prediction else _automatic_splits(tasks, validation_fraction, seed)),
         set(tasks),
     )
+    if current_prediction and splits != ego_source.splits:
+        raise ValueError("predicted-effect PIM must preserve the CTE/boundary cache episode split")
     query_set, train_set = set(splits[split]), set(splits["train"])
     if not query_set:
         raise ValueError(f"episode split {split} is empty")
@@ -104,7 +116,7 @@ def build_cache(
         raise ValueError("invalid history mixture weights")
     if split == "train" and weights["empty"] > 0:
         raise ValueError("frozen-parent training requires nonempty histories; use empty diagnostics on validation")
-    queries = [row for row in rows if row["record_type"] == "phase_query" and str(row["episode_id"]) in query_set]
+    queries = [row for row in rows if row["record_type"] == "phase_query" and str(row["episode_id"]) in query_set and (not current_prediction or row["policy_valid"])]
     if not queries:
         raise ValueError("no query rows in selected split")
     query_episode_ids = sorted({str(row["episode_id"]) for row in queries})
@@ -128,6 +140,9 @@ def build_cache(
             "phase": (np.float32, (n, dp)), "bit_effects": (np.float32, (n, bit_size, de)),
             "bit_mask": (np.uint8, (n, bit_size)),
         }
+        if current_prediction:
+            specs["current_effect"] = (np.float32, (n, de))
+            specs["current_effect_mask"] = (np.uint8, (n,))
         for name, (dtype, shape) in specs.items():
             arrays[name] = np.lib.format.open_memmap(temporary / f"{name}.npy", mode="w+", dtype=dtype, shape=shape)
             arrays[name][:] = 0
@@ -138,6 +153,7 @@ def build_cache(
         seen_queries: set[tuple[str, int]] = set()
         seen_windows: set[int] = set()
         shard_name, tensors = None, None
+        verified_shards: set[str] = set()
         cursor = 0
         # Completed effects at time t are available to the query at t. Sorting
         # by explicit raw time prevents accidental future BIT leakage.
@@ -148,6 +164,10 @@ def build_cache(
                 continue
             name = str(row["shard"])
             if shard_name != name:
+                if current_prediction and name not in verified_shards:
+                    if file_sha256(phase_cache / name) != source_manifest.shard_sha256.get(name):
+                        raise ValueError("boundary prediction shard checksum mismatch")
+                    verified_shards.add(name)
                 tensors = load_file(str(phase_cache / name), device="cpu")
                 shard_name = name
                 if (tensors["phase_pre"].dtype != torch.float32 or tensors["effect"].dtype != torch.float32
@@ -187,24 +207,33 @@ def build_cache(
                     if episode in initial_phases:
                         raise ValueError("duplicate initial phase query")
                     initial_phases[episode] = phase
-                if episode not in query_set:
-                    continue
-                identity = (episode, raw_step)
-                window_index = int(row["window_index"])
-                if window_index < 0 or identity in seen_queries or window_index in seen_windows:
-                    raise ValueError("duplicate query identity/window index")
-                seen_queries.add(identity)
-                seen_windows.add(window_index)
-                arrays["window_index"][cursor] = window_index
-                arrays["raw_step"][cursor] = raw_step
-                arrays["episode_index"][cursor] = ep_index[episode]
-                arrays["task_index"][cursor] = task_index[tasks[episode]]
-                arrays["phase"][cursor] = phase
-                completed = list(bit[episode])
-                if completed:
-                    arrays["bit_effects"][cursor, -len(completed):] = np.stack(completed)
-                    arrays["bit_mask"][cursor, -len(completed):] = 1
-                cursor += 1
+                if episode in query_set and (not current_prediction or row["policy_valid"]):
+                    identity = (episode, raw_step)
+                    window_index = int(row["window_index"])
+                    if window_index < 0 or identity in seen_queries or window_index in seen_windows:
+                        raise ValueError("duplicate query identity/window index")
+                    seen_queries.add(identity)
+                    seen_windows.add(window_index)
+                    arrays["window_index"][cursor] = window_index
+                    arrays["raw_step"][cursor] = raw_step
+                    arrays["episode_index"][cursor] = ep_index[episode]
+                    arrays["task_index"][cursor] = task_index[tasks[episode]]
+                    arrays["phase"][cursor] = phase
+                    past = list(bit[episode])
+                    if past:
+                        arrays["bit_effects"][cursor, -len(past):] = np.stack(past)
+                        arrays["bit_mask"][cursor, -len(past):] = 1
+                    if current_prediction:
+                        arrays["current_effect"][cursor] = effect
+                        arrays["current_effect_mask"][cursor] = 1
+                    cursor += 1
+                if current_prediction:
+                    # Match deployment: condition the current action first, then
+                    # append its prediction. The query never reads itself in BIT.
+                    if episode in train_set:
+                        effects[episode].append((phase, effect))
+                    if episode in query_set:
+                        bit[episode].append(effect)
             else:
                 raise ValueError(f"unsupported record type: {row['record_type']}")
         if cursor != n:
@@ -250,7 +279,7 @@ def build_cache(
         for name, value in metadata.items():
             (temporary / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
         manifest = {
-            "format": CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
+            "format": EGO_CROSS_ATTEMPT_CACHE_FORMAT if current_prediction else CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
             "retrieval_mode": "cross_attempt", "source_subset": "train-only", "split": split,
             "history_semantics": "full_episode_prefix", "query_step_unit": "raw_action_step",
             "history_source_semantics": "other_train_episode", "candidate_semantics": "complete_episode_uniform",
@@ -272,6 +301,15 @@ def build_cache(
             "array_sha256": {f"{name}.npy": file_sha256(temporary / f"{name}.npy") for name in arrays},
             "conditions_sha256": file_sha256(conditions) if conditions else None,
         }
+        if current_prediction:
+            global_kinds = [kind for kind in HISTORY_KINDS[:3] if all(row[kind] for row in pairings.values())]
+            if not global_kinds:
+                raise ValueError("no nonempty history kind is available for every query episode")
+            manifest.update(globally_available_history_kinds=global_kinds,
+                            memory_semantics="predicted_effect_trace", effect_source="current_prediction",
+                            executed_horizon=source_manifest.executed_horizon,
+                            cte_input_type=source_manifest.cte_input_type,
+                            source_episode_splits_sha256=source_manifest.episode_splits_sha256)
         (temporary / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         reader = CrossAttemptPIMCache(temporary)
         # Validate every query's episode/task mapping without decoding RGB.

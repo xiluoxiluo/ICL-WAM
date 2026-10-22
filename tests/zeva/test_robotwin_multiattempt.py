@@ -316,6 +316,7 @@ def test_manifest_retry_preserves_scene_instruction_and_resets_episode_once(tmp_
     rows = read_attempts(path)
     assert [row["attempt"] for row in rows] == [1, 2]
     assert [row["status"] for row in rows] == ["timeout", "success"]
+    assert [row["reset_scope"] for row in rows] == ["episode", "attempt"]
 
 
 def test_http_and_native_runtime_export_one_compatible_class():

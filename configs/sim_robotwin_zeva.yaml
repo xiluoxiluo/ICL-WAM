@@ -20,3 +20,12 @@ EVALUATION:
   skip_get_obs_within_replan: false
   cte_checkpoint: null
   addon_checkpoint: null
+  # Standalone/legacy evaluation remains replayable. The frozen-manifest
+  # runner explicitly selects torch_continuous_slot_v1, 8 slots, seed 20260907.
+  model_rng_protocol: request_seed_stream_v1
+  evaluation_slot_index: 0
+  evaluation_slot_count: 1
+  model_rng_state_path: null
+  model_rng_task_name: null
+  model_rng_run_id: null
+  expected_manifest_sha256: null

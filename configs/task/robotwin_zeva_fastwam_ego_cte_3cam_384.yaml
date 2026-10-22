@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - override /data: robotwin
+  - override /model: zeva_ego_fastwam
+  - _self_
+
+# One process / GPU. Full episodes, paired by canonical task without
+# replacement; every epoch covers the complete train split.
+batch_size: 8
+num_workers: 4
+num_epochs: 80
+max_steps: null
+learning_rate: 1.0e-4
+lr_scheduler_type: null  # new CTE trainer keeps both optimizer-group LRs fixed
+cte_vision_learning_rate: 1.0e-5
+weight_decay: 1.0e-4
+max_grad_norm: 1.0
+seed: 1000
+device: null
+mixed_precision: "no"
+gradient_accumulation_steps: 1
+cte_eval_every_epochs: 5
+cte_effect_weight: 0.2
+cte_smoke_steps: 0
+cte_validation_fraction: 0.05
+cte_episode_split_path: null
+
+data:
+  train:
+    use_text_embed_cache: false
+    val_set_proportion: 0.0  # explicit episode split is owned by the CTE trainer
+    skip_padding_as_possible: false

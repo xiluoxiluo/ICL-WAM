@@ -227,6 +227,13 @@ def create_fastwam(
                 "zeva.training_stage must be 'policy_injection' or 'pim_adapter'"
             )
         model.set_zeva_training_stage(training_stage)
+        model.zeva_training_recipe = str(zeva.get("training_recipe", "frozen_parent"))
+        if model.zeva_training_recipe not in {"frozen_parent", "ego_adapter_warmup"}:
+            raise ValueError("unsupported Zeva training_recipe")
+        if model.zeva_training_recipe == "ego_adapter_warmup":
+            if (training_stage != "pim_adapter" or prompt_variant != "cross_attempt"
+                    or getattr(policy_adapter.config, "effect_source", None) != "current_prediction"):
+                raise ValueError("ego_adapter_warmup requires predictive cross-attempt Stage2B")
     return model
 
 

@@ -163,8 +163,9 @@ class CausalPromptEncoder(nn.Module):
     ) -> Tensor:
         """Read all valid bounded candidates with a causal phase query.
 
-        Current BIT remains an input of the parent's action prior; it is not
-        inserted into persistent history. Empty rows are finite exact zeros,
+        Current BIT is retained for legacy prior callers; the predictive EAP
+        uses global/phase instead. BIT is not inserted into persistent history.
+        Empty rows are finite exact zeros,
         including mixed empty/nonempty batches and padded NaN payloads.
         """
         cfg = self.config

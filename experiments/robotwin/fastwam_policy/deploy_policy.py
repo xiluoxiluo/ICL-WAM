@@ -39,7 +39,8 @@ from fastwam.zeva import (
     TaskContextBank,
     retrieve_task_context,
 )
-from fastwam.zeva.attempt_protocol import ModelSeedStream
+from fastwam.zeva.attempt_protocol import ModelSeedStream, ContinuousModelNoiseStream, CONTINUOUS_NOISE_PROTOCOL
+from fastwam.zeva.ego_episode_data import prepare_ego_rgb_views
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.static_task_context import (
     StaticTaskContextRetriever, StaticTaskContextSession, task_context_identity,
@@ -58,6 +59,13 @@ def _prefix_metadata(model: Any) -> dict[str, Any]:
         "prefix_layout": layout,
         "effect_source": getattr(config, "effect_source", None) if layout == "zeva_ego" else None,
     }
+
+
+def _supports_boundary_observations(model_cfg: Any, processor_cfg: Any) -> bool:
+    effect_source = model_cfg.get("zeva", {}).get("adapter", {}).get("effect_source", "latest_completed")
+    transforms = processor_cfg.get("action_state_transforms")
+    return (effect_source == "current_prediction" and (transforms is None or len(transforms) == 0)
+            and not bool(processor_cfg.get("use_stepwise_action_norm", False)))
 
 
 def _is_none_like(value: Any) -> bool:
@@ -210,6 +218,13 @@ class WorldActionRobotWinPolicy:
         max_attempts: int = 1,
         cross_memory_enabled: bool = True,
         pim_diagnostic_interval: int = 0,
+        model_rng_protocol: str = "request_seed_stream_v1",
+        evaluation_slot_index: int = 0,
+        evaluation_slot_count: int = 1,
+        model_rng_state_path: Optional[str] = None,
+        model_rng_task_name: Optional[str] = None,
+        model_rng_run_id: Optional[str] = None,
+        skip_get_obs_within_replan: bool = False,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -227,6 +242,10 @@ class WorldActionRobotWinPolicy:
             raise ValueError(
                 "zeva_mode must be base, zeva_stage2, pim_shadow, or pim_on"
             )
+        self.skip_get_obs_within_replan = bool(skip_get_obs_within_replan)
+        if (requested_zeva_mode != "base" and self.skip_get_obs_within_replan
+                and not _supports_boundary_observations(model_cfg_copy, processor_cfg)):
+            raise ValueError("skipping non-boundary observations requires current_prediction with state-independent joint normalization")
         zeva_memory_cfg = model_cfg_copy.get("zeva", {}).get("memory", {})
         task_context_cfg = model_cfg_copy.get("zeva", {}).get("task_context", {})
         self.task_context_bank = None
@@ -274,6 +293,8 @@ class WorldActionRobotWinPolicy:
                     "video_size": [int(value) for value in video_size],
                     "context_len": int(model_cfg_copy.get("tokenizer_max_len", 128)),
                     "readout_dim": int(model_cfg_copy.video_dit_config.hidden_dim),
+                    **({"memory_semantics": "predicted_effect_trace", "effect_source": "current_prediction", "cte_variant": "zeva_ego"}
+                       if model_cfg_copy.get("zeva", {}).get("adapter", {}).get("effect_source") == "current_prediction" else {}),
                 },
             )
             if self.model.zeva_prompt_encoder is None or retriever.bank.value_dim != self.model.zeva_prompt_encoder.config.global_dim:
@@ -301,6 +322,10 @@ class WorldActionRobotWinPolicy:
             **_prefix_metadata(self.model),
         }
         self.cte = None
+        self._ego_cte = False
+        self.cte_schema = None
+        self._cte_state = None
+        self._ego_has_started = False
         self.lifecycle = None
         self._cte_history = None
         self._cte_frame_encoder = None
@@ -332,9 +357,37 @@ class WorldActionRobotWinPolicy:
                     "CTE checkpoint metadata is incompatible with RoboTwin V1 "
                     "(action_dim=14, cameras=cam_high/cam_left_wrist/cam_right_wrist)"
                 )
-            allowed_cte = set(CausalTransitionEncoderConfig.__dataclass_fields__)
-            cte_cfg = CausalTransitionEncoderConfig(**{k: v for k, v in cte_values.items() if k in allowed_cte})
-            if (
+            self.cte_schema = str(cte_payload.get("schema", "legacy_cte"))
+            self.checkpoint_identity["cte_schema"] = self.cte_schema
+            self._ego_cte = self.cte_schema == "iclwam_zeva_ego_cte_v1"
+            if self._ego_cte:
+                from fastwam.zeva.ego_cte_training import load_ego_cte_checkpoint
+                self.cte, cte_payload = load_ego_cte_checkpoint(str(cte_checkpoint), device=device, require_ready=True)
+                cte_cfg = self.cte.cfg
+                if (cte_cfg.executed_horizon, cte_cfg.action_dim, cte_cfg.image_size) != (24, 14, 224):
+                    raise ValueError("RoboTwin Zeva-Ego requires H24/joint14/RGB224")
+                if cte_payload.get("dataset_stats_sha256") != checkpoint_sha256(dataset_stats_path):
+                    raise ValueError("Zeva-Ego deployment action stats differ from CTE training")
+                adapter_cfg = self.model.zeva_behavior_prefix_adapter.config
+                if getattr(adapter_cfg, "effect_source", "latest_completed") != "current_prediction":
+                    raise ValueError("Zeva-Ego CTE requires current_prediction prefix conditioning")
+                if zeva_memory_cfg.get("memory_semantics") != "predicted_effect_trace":
+                    raise ValueError("Zeva-Ego CTE requires explicit predicted_effect_trace runtime memory")
+                if requested_zeva_mode != "pim_shadow":
+                    if self._static_task_context_session is None:
+                        raise ValueError("formal Zeva-Ego deployment requires the trained static task-memory retriever")
+                    bank = self._static_task_context_session.retriever.bank
+                    if bank.metadata.get("semantic_task_map_sha256") != cte_payload["semantic_task_map_sha256"]:
+                        raise ValueError("static task-memory semantic map differs from CTE training")
+                    train_episodes = set(cte_payload["episode_splits"]["train"])
+                    if any(entry["episode_id"] not in train_episodes for entry in bank.entries):
+                        raise ValueError("static task-memory contains a non-training CTE episode")
+            else:
+                allowed_cte = set(CausalTransitionEncoderConfig.__dataclass_fields__)
+                cte_cfg = CausalTransitionEncoderConfig(**{k: v for k, v in cte_values.items() if k in allowed_cte})
+                if getattr(self.model.zeva_behavior_prefix_adapter.config, "effect_source", "latest_completed") == "current_prediction":
+                    raise ValueError("legacy CTE checkpoints do not provide a causal current predicted effect")
+            if not self._ego_cte and (
                 cte_cfg.action_dim != 14
                 or cte_cfg.transition_steps != 4
                 or cte_cfg.effect_window_transitions != 4
@@ -368,10 +421,14 @@ class WorldActionRobotWinPolicy:
                     "Evaluation pim_top_k must match the trained model.zeva.memory.pim_top_k; "
                     f"got {pim_top_k} vs {configured_top_k}"
                 )
-            self.cte = CausalTransitionEncoder(cte_cfg).to(device).eval()
-            load_cte_checkpoint(str(cte_checkpoint), self.cte, map_location=device)
+            if not self._ego_cte:
+                self.cte = CausalTransitionEncoder(cte_cfg).to(device).eval()
+                load_cte_checkpoint(str(cte_checkpoint), self.cte, map_location=device)
             cte_input_type = str(cte_payload.get("cte_input_type", cte_values.get("input_type", "rgb_frame")))
-            if cte_input_type == "rgb_frame":
+            if self._ego_cte:
+                if cte_input_type != "rgb_multiview":
+                    raise ValueError("Zeva-Ego CTE checkpoint must declare rgb_multiview")
+            elif cte_input_type == "rgb_frame":
                 if cte_cfg.image_channels != 3:
                     raise ValueError("rgb_frame CTE checkpoints must set image_channels=3")
             elif cte_input_type == "wan_vae_latent":
@@ -448,6 +505,7 @@ class WorldActionRobotWinPolicy:
                     transition_steps=cte_cfg.transition_steps,
                     effect_window_transitions=cte_cfg.effect_window_transitions,
                     action_dim=cte_cfg.action_dim,
+                    memory_semantics="predicted_effect_trace" if self._ego_cte else "completed_effect_trace",
                 ),
             )
 
@@ -462,6 +520,8 @@ class WorldActionRobotWinPolicy:
             )
         self.replan_steps = int(max(1, min(replan_steps, action_horizon)))
         if self.zeva_mode != "base":
+            if self._ego_cte and self.replan_steps != int(self.cte.cfg.executed_horizon):
+                raise ValueError("Zeva-Ego replan_steps must equal the trained executed_horizon=24")
             transition_steps = int(self.cte.cfg.transition_steps)
             if self.replan_steps % transition_steps:
                 raise ValueError(
@@ -472,6 +532,19 @@ class WorldActionRobotWinPolicy:
         self.sigma_shift = sigma_shift
         self.seed = seed
         self._model_seed_stream = ModelSeedStream(seed)
+        self._model_noise_stream = None
+        self.evaluation_slot_index, self.evaluation_slot_count = int(evaluation_slot_index), int(evaluation_slot_count)
+        if not 0 <= self.evaluation_slot_index < self.evaluation_slot_count:
+            raise ValueError("evaluation slot index must be within slot count")
+        if model_rng_protocol == CONTINUOUS_NOISE_PROTOCOL:
+            if seed is None:
+                raise ValueError("continuous model RNG requires an explicit model seed")
+            self._model_noise_stream = ContinuousModelNoiseStream(seed, slot_index=self.evaluation_slot_index,
+                slot_count=self.evaluation_slot_count, run_id=model_rng_run_id,
+                state_path=model_rng_state_path, task_name=model_rng_task_name,
+                checkpoint_identity=self.checkpoint_identity)
+        elif model_rng_protocol != "request_seed_stream_v1":
+            raise ValueError("unsupported model RNG protocol")
         self._attempt_id = 0
         self._replan_index = 0
         self._last_inference_seed = seed
@@ -586,22 +659,48 @@ class WorldActionRobotWinPolicy:
         image_tensor = image_tensor * 2.0 - 1.0
         return image_tensor
 
+    def _build_robotwin_cte_views(self, observation: Dict[str, Any]) -> torch.Tensor:
+        views = []
+        for key in ("head_camera", "left_camera", "right_camera"):
+            rgb = np.asarray(observation["observation"][key]["rgb"])
+            if rgb.ndim != 3 or rgb.shape[-1] != 3:
+                raise ValueError("CTE expects original three HxWx3 RGB views")
+            views.append(torch.from_numpy(np.array(rgb, copy=True)).permute(2, 0, 1))
+        return prepare_ego_rgb_views(views, self.cte.cfg.image_size)
+
+    def _step_ego_cte(self, observation: Dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        previous = None
+        if self._ego_has_started:
+            if len(self._transition_actions) != self.cte.cfg.executed_horizon:
+                raise ValueError("CTE replan requires exactly the previous completed H24 action chunk")
+            previous = torch.stack(self._transition_actions).unsqueeze(0)
+        elif self._transition_actions:
+            raise ValueError("the first CTE boundary must use action SOS")
+        parameter = next(self.cte.parameters())
+        images = self._build_robotwin_cte_views(observation).unsqueeze(0).to(parameter)
+        if previous is not None:
+            previous = previous.to(parameter)
+        phase, predicted_effect, self._cte_state = self.cte.step(images, previous, self._cte_state)
+        self._ego_has_started = True
+        self._transition_actions.clear()
+        return phase, predicted_effect
+
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state_vector)
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
-        request_seed = self._model_seed_stream.next_seed()
+        noise_stream = getattr(self, "_model_noise_stream", None)
+        initial_noise = None if noise_stream is None else noise_stream.next_noise((1, self.action_horizon, 14))
+        request_seed = self._model_seed_stream.next_seed() if noise_stream is None else None
+        noise_kwargs = {} if initial_noise is None else {"initial_action_noise": initial_noise}
         self._last_inference_seed = request_seed
         if self.zeva_mode != "base":
-            if self._cte_history is None and self._needs_episode_reset:
+            if self._needs_episode_reset:
                 self.lifecycle.reset_episode(instruction, episode_id=f"episode-{self.episode_count}")
                 self._needs_episode_reset = False
-                self._cte_history = CausalCTEHistory(self.cte, frame_encoder=self._cte_frame_encoder)
-                self._cte_history.reset(image_tensor[0].float())
-                self._observed_effect_count = 0
-            elif self._cte_history is None:
+            if not getattr(self, "_ego_cte", False) and self._cte_history is None:
                 self._cte_history = CausalCTEHistory(self.cte, frame_encoder=self._cte_frame_encoder)
                 self._cte_history.reset(image_tensor[0].float())
                 self._observed_effect_count = 0
@@ -638,8 +737,15 @@ class WorldActionRobotWinPolicy:
                         "sources": task_context_result.sources,
                     }
                 task_tokens = task_tokens.to(device=self.model.device, dtype=self.model.torch_dtype)
-                encoded = self._cte_history.forward()
-                phase = encoded["phase"][:, -1]
+                if getattr(self, "_ego_cte", False):
+                    phase, current_effect = self._step_ego_cte(observation)
+                    trace_phase, trace_effect = phase, current_effect
+                    current_effect = current_effect.to(device=self.model.device, dtype=self.model.torch_dtype)
+                    current_effect_mask = torch.ones(phase.shape[0], dtype=torch.bool, device=self.model.device)
+                else:
+                    encoded = self._cte_history.forward()
+                    phase = encoded["phase"][:, -1]
+                    current_effect, current_effect_mask = None, None
                 memory = self.lifecycle.memory_inputs(phase, task_tokens)
                 phase = phase.to(device=self.model.device, dtype=self.model.torch_dtype)
                 memory = {
@@ -692,9 +798,8 @@ class WorldActionRobotWinPolicy:
                 "pim_mask": pim_mask,
                 "zeva_action_residual": zeva_action_residual,
                 "zeva_task_tokens": task_tokens,
-                # The separate effect prefix reads the same completed BIT
-                # as the prior. Never use a future effect or phase-cache
-                # query row's zero placeholder as a current prediction.
+                # Legacy reads completed BIT; the new version supplies a
+                # separate causal current prediction below.
                 "zeva_bit_effects": memory["bit_effects"],
                 "zeva_bit_mask": memory["bit_mask"],
                 "zeva_mode": self.zeva_mode,
@@ -711,6 +816,9 @@ class WorldActionRobotWinPolicy:
                 "rand_device": self.rand_device,
                 "tiled": self.tiled,
             }
+            infer_kwargs.update(noise_kwargs)
+            if current_effect is not None:
+                infer_kwargs.update(zeva_current_effect=current_effect, zeva_current_effect_mask=current_effect_mask)
             infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
             with torch.no_grad():
                 pred = self.model.infer_action_zeva(**infer_kwargs)
@@ -741,8 +849,16 @@ class WorldActionRobotWinPolicy:
                 self.zeva_mode,
                 self.cross_memory_enabled,
             )
+            action_chunk = self._denormalize_action(pred["action"])[0]
+            if getattr(self, "_ego_cte", False):
+                if action_chunk.shape[0] < self.replan_steps:
+                    raise ValueError("Zeva-Ego action prediction is shorter than its H24 execution chunk")
+                # The query saw only earlier predictions in BIT/PIM. This
+                # boundary enters BIT and private pending PIM after the action.
+                self.lifecycle.observe_predicted_effect(trace_phase, trace_effect,
+                    metadata={"source_step": self.step_count, "decision_boundary": True})
             self._replan_index += 1
-            return self._denormalize_action(pred["action"])[0]
+            return action_chunk
         infer_kwargs = {
             "prompt": prompt,
             "input_image": image_tensor,
@@ -756,6 +872,7 @@ class WorldActionRobotWinPolicy:
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
+        infer_kwargs.update(noise_kwargs)
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
@@ -815,6 +932,9 @@ class WorldActionRobotWinPolicy:
                     "bit_effects": memory["bit_effects"],
                     "bit_mask": memory["bit_mask"],
                 }
+                if "zeva_current_effect" in infer_kwargs:
+                    prefix_kwargs.update(current_effect=infer_kwargs["zeva_current_effect"],
+                                         current_effect_mask=infer_kwargs["zeva_current_effect_mask"])
                 on_prefix, on_valid = adapter.behavior_prefix_tokens(
                     task_tokens, causal_prompt, pim_mask, **prefix_kwargs,
                 )
@@ -855,13 +975,18 @@ class WorldActionRobotWinPolicy:
             pim = None
         return {
             "model_seed": self.seed,
-            "seed_stream": self._model_seed_stream.snapshot(),
+            "seed_stream": (getattr(self, "_model_noise_stream", None) or self._model_seed_stream).snapshot(),
+            "evaluation_slot": {"index": getattr(self, "evaluation_slot_index", 0), "count": getattr(self, "evaluation_slot_count", 1)},
+            "memory_semantics": "predicted_effect_trace" if getattr(self, "_ego_cte", False) else "completed_effect_trace",
             "checkpoint_identity": self.checkpoint_identity,
+            "cte_schema": getattr(self, "cte_schema", None),
+            "prior_variant": getattr(getattr(getattr(self.model, "zeva_behavior_prefix_adapter", None), "config", None), "prior_variant", "legacy_bit"),
             **_prefix_metadata(self.model),
             "zeva_mode": self.zeva_mode,
             "cross_memory_enabled": self.cross_memory_enabled,
             "action_horizon": self.action_horizon,
             "replan_steps": self.replan_steps,
+            "skip_get_obs_within_replan": bool(getattr(self, "skip_get_obs_within_replan", False)),
             "num_inference_steps": self.num_inference_steps,
             "pim_entries": len(pim) if pim is not None else 0,
             "pim_pending_entries": getattr(pim, "pending_count", 0),
@@ -870,6 +995,11 @@ class WorldActionRobotWinPolicy:
             "terminal_observation_step": self._terminal_observation_step,
             "pim_diagnostics_last": dict(self._last_pim_diagnostics),
         }
+
+    def save_model_rng_state(self) -> None:
+        stream = getattr(self, "_model_noise_stream", None)
+        if stream is not None:
+            stream.save_state()
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
@@ -881,7 +1011,7 @@ class WorldActionRobotWinPolicy:
         return not self.pending_actions
 
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
-        if self.zeva_mode != "base" and observation is not None and self._cte_history is not None:
+        if self.zeva_mode != "base" and not getattr(self, "_ego_cte", False) and observation is not None and self._cte_history is not None:
             next_image = self._build_robotwin_image_tensor(observation)[0].float()
             if len(self._transition_actions) >= self.cte.cfg.transition_steps:
                 action_group = torch.stack(self._transition_actions[: self.cte.cfg.transition_steps]).to(self.model.device)
@@ -941,6 +1071,8 @@ class WorldActionRobotWinPolicy:
         self.step_count = 0
         self.reset_timing_rollout()
         self._cte_history = None
+        self._cte_state = None
+        self._ego_has_started = False
         self._observed_effect_count = 0
         self._transition_actions.clear()
         self._attempt_finalized = False
@@ -969,6 +1101,8 @@ class WorldActionRobotWinPolicy:
         self._last_pim_diagnostics = {}
         self._terminal_observation_step = None
         self._attempt_finalized = False
+        self._cte_state = None
+        self._ego_has_started = False
         if self.lifecycle is None:
             return
         if attempt_id == 0:
@@ -981,6 +1115,8 @@ class WorldActionRobotWinPolicy:
         if self.lifecycle.pim.task_cluster is not None:
             self.lifecycle.reset_attempt(attempt_id)
         self._cte_history = None
+        self._cte_state = None
+        self._ego_has_started = False
         self._observed_effect_count = 0
         self._transition_actions.clear()
         self._attempt_finalized = False
@@ -1009,7 +1145,7 @@ class WorldActionRobotWinPolicy:
             self._terminal_observation_step = self.step_count
             has_complete_tail = len(self._transition_actions) == self.cte.cfg.transition_steps
 
-            if has_terminal_obs and has_complete_tail and self._cte_history is not None:
+            if not getattr(self, "_ego_cte", False) and has_terminal_obs and has_complete_tail and self._cte_history is not None:
                 next_image = self._build_robotwin_image_tensor(terminal_obs)[0].float()
                 action_group = torch.stack(self._transition_actions).to(self.model.device)
                 self._cte_history.append_transition(action_group, next_image)
@@ -1126,10 +1262,11 @@ def get_model(usr_args: Dict[str, Any]):
     addon_checkpoint = usr_args.get("addon_checkpoint", cfg.EVALUATION.get("addon_checkpoint"))
     pim_top_k = int(usr_args.get("pim_top_k", cfg.EVALUATION.get("pim_top_k", 4)))
     max_attempts = int(usr_args.get("max_attempts", cfg.EVALUATION.get("max_attempts", 1)))
-    if zeva_mode != "base" and _parse_bool(usr_args.get("skip_get_obs_within_replan", cfg.EVALUATION.get("skip_get_obs_within_replan", False))):
+    skip_observations = _parse_bool(usr_args.get("skip_get_obs_within_replan", cfg.EVALUATION.get("skip_get_obs_within_replan", False)))
+    if zeva_mode != "base" and skip_observations and not _supports_boundary_observations(cfg.model, cfg.data.train.processor):
         raise ValueError(
-            "Zeva evaluation requires skip_get_obs_within_replan=false so every executed "
-            "action can be paired with an observed after-frame"
+            "Zeva evaluation requires skip_get_obs_within_replan=false unless the model uses "
+            "current_prediction with no action-state transforms or stepwise normalization"
         )
 
     policy = WorldActionRobotWinPolicy(
@@ -1158,6 +1295,13 @@ def get_model(usr_args: Dict[str, Any]):
         max_attempts=max_attempts,
         cross_memory_enabled=_parse_bool(usr_args.get("cross_memory_enabled", cfg.EVALUATION.get("cross_memory_enabled", True))),
         pim_diagnostic_interval=int(usr_args.get("pim_diagnostic_interval", cfg.EVALUATION.get("pim_diagnostic_interval", 0))),
+        model_rng_protocol=str(usr_args.get("model_rng_protocol", cfg.EVALUATION.get("model_rng_protocol", "request_seed_stream_v1"))),
+        evaluation_slot_index=int(usr_args.get("evaluation_slot_index", 0)),
+        evaluation_slot_count=int(usr_args.get("evaluation_slot_count", 1)),
+        model_rng_state_path=usr_args.get("model_rng_state_path"),
+        model_rng_task_name=usr_args.get("model_rng_task_name"),
+        model_rng_run_id=usr_args.get("model_rng_run_id"),
+        skip_get_obs_within_replan=skip_observations,
     )
     return policy
 

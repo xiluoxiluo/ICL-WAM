@@ -269,9 +269,12 @@ def main(cfg: DictConfig):
     for key in (
         "model_seed", "cross_memory_enabled", "pim_diagnostic_interval",
         "episode_manifest", "fixed_instruction", "attempt_log_path", "condition", "run_id",
+        "model_rng_protocol", "evaluation_slot_index", "evaluation_slot_count",
+        "model_rng_state_path", "model_rng_task_name", "model_rng_run_id",
+        "expected_manifest_sha256",
     ):
         value = cfg.EVALUATION.get(key)
-        if key in {"episode_manifest", "attempt_log_path"}:
+        if key in {"episode_manifest", "attempt_log_path", "model_rng_state_path"}:
             value = _resolve_optional_path(value, base=PROJECT_ROOT)
         _append_override(overrides, key, value)
     task_context = cfg.model.get("zeva", {}).get("task_context", {})

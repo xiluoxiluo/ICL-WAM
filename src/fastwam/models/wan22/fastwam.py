@@ -100,6 +100,7 @@ class FastWAM(torch.nn.Module):
         self.zeva_behavior_prefix_adapter = None
         self.zeva_injection_mode = "memory_residual"
         self.zeva_training_stage = "policy_injection"
+        self.zeva_training_recipe = "frozen_parent"
         self.zeva_mode = "base"
 
         self.to(self.device)
@@ -305,11 +306,13 @@ class FastWAM(torch.nn.Module):
         *,
         bit_effects: Optional[torch.Tensor] = None,
         bit_mask: Optional[torch.Tensor] = None,
+        current_effect: Optional[torch.Tensor] = None,
+        current_effect_mask: Optional[torch.Tensor] = None,
         enable_pim: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build policy-hidden prefix tokens and per-example key validity.
 
-        The versioned ``zeva_ego`` layout keeps global, completed-effect and
+        The versioned ``zeva_ego`` layout keeps global, effect and
         PIM in separate positions. The original single-slot layout remains
         available only for its original configurations/checkpoints.
         """
@@ -321,6 +324,7 @@ class FastWAM(torch.nn.Module):
         tokens, valid = adapter.behavior_prefix_tokens(
             task_tokens, causal_prompt, pim_mask,
             bit_effects=bit_effects, bit_mask=bit_mask, enable_pim=enable_pim,
+            current_effect=current_effect, current_effect_mask=current_effect_mask,
         )
         expected_slots = 3 if getattr(adapter.config, "prefix_layout", "legacy_merged") == "zeva_ego" else 1
         expected = (task_tokens.shape[0], expected_slots, int(self.video_expert.hidden_dim))
@@ -1081,6 +1085,8 @@ class FastWAM(torch.nn.Module):
             return (
                 list(self.zeva_prompt_encoder.parameters())
                 + list(adapter.pim_adapter_parameters())
+                + (list(adapter.policy_injection_parameters())
+                   if getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_adapter_warmup" else [])
             )
         raise RuntimeError(
             f"unsupported Zeva training stage: {self.zeva_training_stage}"
@@ -1112,6 +1118,15 @@ class FastWAM(torch.nn.Module):
                 parameter.requires_grad_(True)
             if getattr(adapter.config, "pim_variant", "legacy") == "cross_attempt":
                 adapter.pim_to_global.train()
+            if getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_adapter_warmup":
+                # Keep a static DDP parameter graph. The optimizer gives EAP
+                # LR=0 during warmup, then its explicit lower learning rate.
+                for parameter in adapter.policy_injection_parameters():
+                    parameter.requires_grad_(True)
+                adapter.prior.train()
+                adapter.action_prior_adapter.train()
+                adapter.behavior_global_projector.train()
+                adapter.behavior_effect_projector.train()
             return
         raise RuntimeError(f"unsupported Zeva training stage: {stage}")
 
@@ -1244,6 +1259,8 @@ class FastWAM(torch.nn.Module):
         zeva_task_tokens: Optional[torch.Tensor] = None,
         zeva_bit_effects: Optional[torch.Tensor] = None,
         zeva_bit_mask: Optional[torch.Tensor] = None,
+        zeva_current_effect: Optional[torch.Tensor] = None,
+        zeva_current_effect_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Train only the Zeva residual against FastWAM action flow matching."""
         if input_image.ndim != 4 or input_image.shape[1] != 3:
@@ -1327,6 +1344,8 @@ class FastWAM(torch.nn.Module):
                 task_tokens=zeva_task_tokens,
                 bit_effects=zeva_bit_effects,
                 bit_mask=zeva_bit_mask,
+                current_effect=zeva_current_effect,
+                current_effect_mask=zeva_current_effect_mask,
                 enable_pim=(self.zeva_training_stage == "pim_adapter"),
             )
             (
@@ -1407,7 +1426,8 @@ class FastWAM(torch.nn.Module):
             if zeva_prior_mean is None or zeva_prior_std is None:
                 raise ValueError("exact Zeva training requires action-prior outputs")
             prior_loss = gaussian_prior_nll(
-                clean_action.float(), zeva_prior_mean.float(), zeva_prior_std.float(), action_valid
+                clean_action.float(), zeva_prior_mean.float(), zeva_prior_std.float(), action_valid,
+                reference_reduction=(self.zeva_behavior_prefix_adapter.config.prior_variant == "zeva_ego"),
             )
             loss = loss + prior_loss * float(self.zeva_behavior_prefix_adapter.config.prior_loss_weight)
             prior_error = (clean_action.float() - zeva_prior_mean.float()).square().mean(dim=-1)
@@ -1462,6 +1482,7 @@ class FastWAM(torch.nn.Module):
                 parent_prefix, parent_valid = adapter.behavior_prefix_tokens(
                     zeva_task_tokens, causal_prompt, pim_mask, enable_pim=False,
                     bit_effects=zeva_bit_effects, bit_mask=zeva_bit_mask,
+                    current_effect=zeva_current_effect, current_effect_mask=zeva_current_effect_mask,
                 )
                 actual_prefix = behavior_token.to(parent_prefix)
                 prefix_delta = actual_prefix - parent_prefix
@@ -1761,6 +1782,9 @@ class FastWAM(torch.nn.Module):
         zeva_mode: str = "base",
         enable_prefix_injection: Optional[bool] = None,
         enable_action_prior: Optional[bool] = None,
+        zeva_current_effect: Optional[torch.Tensor] = None,
+        zeva_current_effect_mask: Optional[torch.Tensor] = None,
+        initial_action_noise: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
         self.eval()
         if zeva_mode not in {"base", "zeva_stage2", "pim_shadow", "pim_on"}:
@@ -1809,13 +1833,22 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
-        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+        noise_shape = (1, action_horizon, self.action_expert.action_dim)
+        if initial_action_noise is not None:
+            if seed is not None:
+                raise ValueError("initial_action_noise and seed are mutually exclusive")
+            if tuple(initial_action_noise.shape) != noise_shape:
+                raise ValueError(f"initial_action_noise must have shape {noise_shape}")
+            if not initial_action_noise.is_floating_point() or not torch.isfinite(initial_action_noise).all():
+                raise ValueError("initial_action_noise must be a finite floating-point tensor")
+            # Clone: paired PIM-on/off probes must share immutable starting
+            # noise and must not advance the evaluation slot's RNG twice.
+            latents_action = initial_action_noise.to(device=self.device, dtype=self.torch_dtype).clone()
+        else:
+            generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+            latents_action = torch.randn(
+                noise_shape, generator=generator, device=rand_device, dtype=torch.float32,
+            ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
@@ -1899,6 +1932,8 @@ class FastWAM(torch.nn.Module):
                 task_tokens=zeva_task_tokens,
                 bit_effects=zeva_bit_effects,
                 bit_mask=zeva_bit_mask,
+                current_effect=zeva_current_effect,
+                current_effect_mask=zeva_current_effect_mask,
                 enable_pim=(zeva_mode == "pim_on"),
             )
             (
@@ -2086,6 +2121,7 @@ class FastWAM(torch.nn.Module):
             "pim_gate": self.zeva_behavior_prefix_adapter.pim_gate.detach().cpu(),
             **addon_layout_metadata(self.zeva_behavior_prefix_adapter),
             "training_stage": self.zeva_training_stage,
+            "training_recipe": getattr(self, "zeva_training_recipe", "frozen_parent"),
             "step": int(step), "config": config or {},
             "base_checkpoint_sha256": base_checkpoint_sha256,
             "cte_checkpoint_sha256": cte_checkpoint_sha256,
@@ -2127,6 +2163,13 @@ class FastWAM(torch.nn.Module):
                 allowed += ("zeva_behavior_prefix_adapter.pim_to_global.",)
             elif getattr(self.zeva_behavior_prefix_adapter.config, "prefix_layout", "legacy_merged") == "legacy_merged":
                 allowed += ("zeva_behavior_prefix_adapter.pim_gate",)
+            if getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_adapter_warmup":
+                allowed += (
+                    "zeva_behavior_prefix_adapter.prior.",
+                    "zeva_behavior_prefix_adapter.action_prior_adapter.",
+                    "zeva_behavior_prefix_adapter.behavior_global_projector.",
+                    "zeva_behavior_prefix_adapter.behavior_effect_projector.",
+                )
         else:
             raise RuntimeError(f"unsupported Zeva training stage: {stage}")
         invalid = [
@@ -2195,6 +2238,8 @@ class FastWAM(torch.nn.Module):
         )
         if stage == "pim_adapter":
             required += ("pim_phases", "pim_effects", "pim_mask")
+        if getattr(self.zeva_behavior_prefix_adapter.config, "effect_source", "latest_completed") == "current_prediction":
+            required += ("current_effect", "current_effect_mask")
         missing = [key for key in required if key not in sample]
         if missing:
             raise KeyError(f"Zeva Stage 2 sample is missing fields: {missing}")
@@ -2278,6 +2323,8 @@ class FastWAM(torch.nn.Module):
             zeva_task_tokens=task_tokens,
             zeva_bit_effects=sample["bit_effects"].to(self.device),
             zeva_bit_mask=sample["bit_mask"].to(self.device),
+            zeva_current_effect=None if sample.get("current_effect") is None else sample["current_effect"].to(self.device),
+            zeva_current_effect_mask=None if sample.get("current_effect_mask") is None else sample["current_effect_mask"].to(self.device),
         )
         metrics.update(
             {

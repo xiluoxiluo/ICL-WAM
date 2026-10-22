@@ -18,6 +18,7 @@ from experiments.robotwin.multiattempt import (
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--expected-manifest-sha256", help="Verify the saved run manifest against its command_plan.json digest")
     parser.add_argument("--log", help="One complete condition JSONL")
     parser.add_argument("--on", help="Memory-on JSONL, paired with --off")
     parser.add_argument("--off", help="Same-checkpoint memory-off JSONL")
@@ -28,7 +29,7 @@ def main() -> None:
     args = parser.parse_args()
     if bool(args.log) == bool(args.on or args.off) or bool(args.on) != bool(args.off):
         parser.error("Supply either --log or both --on and --off")
-    manifest, sha = load_manifest(args.manifest)
+    manifest, sha = load_manifest(args.manifest, expected_sha256=args.expected_manifest_sha256)
     if args.log:
         rows = read_attempts(args.log)
         result = summarize_attempts(manifest, sha, rows)

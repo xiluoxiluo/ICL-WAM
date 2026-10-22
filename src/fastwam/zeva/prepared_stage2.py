@@ -32,7 +32,7 @@ from torch.utils.data import Dataset
 
 from fastwam.datasets.zeva_robotwin_dataset import ZevaRobotWinDataset
 from fastwam.zeva.checkpoint import checkpoint_sha256
-from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMAT, CrossAttemptPIMCache
+from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMATS, CrossAttemptPIMCache
 
 
 PIM_CACHE_FORMAT = "zeva_stage2_prepared_pim_v1"
@@ -74,7 +74,7 @@ class PreparedPIMCache:
             raise FileNotFoundError(f"prepared PIM manifest not found: {manifest_path}")
         self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self._cross_attempt = None
-        if self.manifest.get("format") == CROSS_ATTEMPT_CACHE_FORMAT:
+        if self.manifest.get("format") in CROSS_ATTEMPT_CACHE_FORMATS:
             self._cross_attempt = CrossAttemptPIMCache(self.root, expected=expected)
             for name in ("phase_dim", "effect_dim", "top_k", "bit_size", "num_queries", "retrieval_mode", "episode_ids", "task_ids"):
                 setattr(self, name, getattr(self._cross_attempt, name))
@@ -277,7 +277,15 @@ class PreparedZevaStage2Dataset(Dataset):
         base_dataset: Dataset,
         pim_cache: PreparedPIMCache,
         static_context: StaticEpisodeContextCache,
+        history_schedule: str = "legacy",
     ) -> None:
+        if history_schedule not in {"legacy", "ego_optimizer_step"}:
+            raise ValueError("unknown prepared PIM history schedule")
+        self.history_schedule = history_schedule
+        if history_schedule == "ego_optimizer_step" and (
+            pim_cache._cross_attempt is None or not pim_cache._cross_attempt.current_prediction
+        ):
+            raise ValueError("ego_optimizer_step requires predicted-effect cross-attempt cache v2")
         self.base = ZevaRobotWinDataset(base_dataset)
         self.pim = pim_cache
         self.static_context = static_context
@@ -294,7 +302,8 @@ class PreparedZevaStage2Dataset(Dataset):
         return len(self.pim)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        prepared = self.pim.get(index)
+        prepared = (self.pim._cross_attempt.get_history_candidates(index)
+                    if self.history_schedule == "ego_optimizer_step" else self.pim.get(index))
         requested_index = int(prepared["window_index"])
         sample = self.base[requested_index]
         source_index = int(sample.get("dataset_index", requested_index))
@@ -331,7 +340,8 @@ class PreparedZevaStage2Dataset(Dataset):
                 "task_context": self.static_context.get(prepared["episode_id"]),
             }
         )
-        for name in ("pim_history_kind", "pim_history_count"):
+        for name in ("pim_history_kind", "pim_history_count", "pim_nonempty_history_weight", "current_effect", "current_effect_mask",
+                     "pim_history_phases", "pim_history_effects", "pim_history_masks", "pim_history_scores", "pim_history_available"):
             if name in prepared:
                 sample[name] = prepared[name]
         sample.pop("episode", None)

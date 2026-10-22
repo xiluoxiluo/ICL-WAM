@@ -124,11 +124,9 @@ def main(usr_args):
             f"when fixed_seed is set, got {eval_num_episodes}"
         )
     zeva_mode = str(usr_args.get("zeva_mode", "base"))
-    if zeva_mode != "base" and skip_get_obs_within_replan:
-        raise ValueError(
-            "Zeva fixed-seed evaluation requires observations at every executed action; "
-            "skip_get_obs_within_replan must be false"
-        )
+    # get_model validates observation skipping against the resolved CTE and
+    # normalization contract. Legacy completed-effect CTE requires every action;
+    # predictive RGB CTE can read only boundaries with stateless normalization.
     eval_output_dir = usr_args.get("eval_output_dir")
     save_dir = None
     video_save_dir = None
@@ -144,7 +142,9 @@ def main(usr_args):
     if manifest_path:
         if fixed_seed is not None:
             raise ValueError("episode_manifest and fixed_seed are mutually exclusive")
-        manifest, manifest_sha256 = load_manifest(manifest_path)
+        manifest, manifest_sha256 = load_manifest(
+            manifest_path, expected_sha256=usr_args.get("expected_manifest_sha256"),
+        )
         for name, value in (("task_config", task_config), ("instruction_type", instruction_type)):
             if manifest[name] != value:
                 raise ValueError(f"Manifest {name} differs from evaluation configuration")
@@ -270,7 +270,12 @@ def main(usr_args):
                                        "condition": usr_args.get("condition") or zeva_mode,
                                        "task_config": task_config,
                                        "instruction_type": instruction_type,
+                                       "skip_get_obs_within_replan": skip_get_obs_within_replan,
                                    })
+    # Commit only after every frozen episode in this task completed. A failed
+    # task must not advance the next task's model stream or enable partial resume.
+    if hasattr(model, "save_model_rng_state"):
+        model.save_model_rng_state()
     suc_nums.append(suc_num)
 
     topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
@@ -479,9 +484,11 @@ def eval_policy(task_name,
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 TASK_ENV.set_instruction(instruction=instruction)
             current_video_path = start_attempt_video(attempt_id)
+            reset_scope = "episode" if attempt_id == 0 else "attempt"
             if hasattr(model, "begin_attempt"):
                 model.begin_attempt(attempt_id)
             elif attempt_id:
+                reset_scope = "episode"  # Explicitly record incompatible fallback behavior.
                 reset_func(model)
             before = model.evaluation_metadata() if hasattr(model, "evaluation_metadata") else {}
             started = time.perf_counter()
@@ -517,6 +524,7 @@ def eval_policy(task_name,
                         "scene_seed": int(now_seed),
                         "instruction": str(instruction),
                         "attempt": attempt_id + 1,
+                        "reset_scope": reset_scope,
                         "max_attempts": max_attempts,
                         "success": bool(succ) if status != "error" else False,
                         "status": status,

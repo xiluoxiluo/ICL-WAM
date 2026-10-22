@@ -1,18 +1,33 @@
 # ICLWAM：把 Zeva 因果记忆接到 FastWAM
 
-## Zeva-Ego 独立 global / effect / PIM prefix 更新
+## 当前推荐：Zeva-Ego 预测 CTE 与跨尝试 PIM
 
-`prefix_layout=zeva_ego` 把原来相加的 behavior slot 改为三个独立 attention 位置：`[G(g + U(c)), E(latest_completed_BIT), P(c)]`。它们分别承载 global、当前尝试已完成的 effect、跨尝试 PIM context；空 effect/PIM 同时从 attention K/V 中屏蔽。跨尝试分支只读取已经结束的尝试，最多 3 次历史 × 64 条完整 effect，保留 PIM 对 global 和 action prior 的条件化，并用同一个新 checkpoint 做 memory-on/off 对照。
+本次按 [Zeva `feature/zeva_ego` 的 README 与实际训练/评测代码](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101) 对齐了从 CTE 到 RoboTwin rollout 的完整语义。**新训练请使用 [预测 CTE / task memory / Stage2 / RoboTwin 运行指南](docs/zeva_ego_training_evaluation.md)**；其中包含完整命令、参考源码、适配差异及旧产物迁移边界。
 
-这对齐了 Zeva-Ego 的独立 token 布局和读取思路，同时保留 FastWAM 的 video/action experts 与 mixed attention。effect 来自现有 BIT 的最新 completed effect，区别于参考 Zeva-Ego 的当前 effect prediction；v4 cache 的 `phase_query.effect` 是占位字段，不能用于替代预测。
+主要变化：
 
-**新训练、权重迁移和 10 × 20 场景评测请使用 [独立 prefix / cross-attempt 运行指南](docs/zeva_ego_cross_attempt.md)。** 新流程是：
+- **预测式 CTE**：三路独立 RGB224 + 三流 Mamba，读取当前观察和上一段实际执行的24步 joint14动作，预测下一边界的视觉变化；不再把4-step transition、16-step completed effect当成参考分支的语义。
+- **完整 episode 训练**：80epoch、同任务episode成对且无放回、5%独立holdout、分组学习率、EMA0.99；三项预测gain与数据/源码身份通过检查后才能构建Stage2缓存。正式模型缺Mamba会明确报错，CPU surrogate不能成为正式checkpoint。
+- **独立条件与参考 prior**：`[G(g+U(c)), E(current_prediction), P(c)]` 三个token分别可读；EAP由phase查询global生成的8个waypoint，再把prior mean投影到ActionDiT。新路径不使用旧标量gate。
+- **预测历史与split隔离**：当前attempt结束后才提交其预测trace；离线PIM训练缓存与task memory只使用train episodes作为历史源。Stage1、cache与Stage2共享episode split，validation轨迹不进入bank或离线PIM历史；在线PIM读取本评测episode此前attempt的trace。
+- **PIM阶段安排**：前500次更新只训PIM，之后联合训EAP与PIM；历史模式采用5:2:1固定循环，后期加入2次empty，按optimizer step统一索引。FastWAM保持冻结，这是与参考foundation也解冻的明确差异。
+- **RoboTwin评测**：冻结10×20场景、同seed/指令重试、成功即停、最多4次、固定200分母；8个逻辑slot的连续模型噪声跨task交接，并审计reset、视频、噪声消耗和artifact身份。新旧版本可指定各自完整CTE/bank/head组合。
 
-1. `robotwin_zeva_fastwam_ego_policy_3cam_384` 训练新 Stage2A，使用原 legacy prepared cache；可用 `policy_warmstart_checkpoint` 复用旧 Stage2A 的已有模块，新增 effect projector 必须训练。
-2. `robotwin_zeva_fastwam_cross_attempt_3cam_384` 加载训练完成的新 Stage2A，冻结父模型并训练 PIM；使用 cross-attempt prepared cache，已有且身份匹配的版本可复用。
-3. 用同一新 Stage2B checkpoint 做 `new_on/new_off` 配对 RoboTwin 评测，验证实际成功率。
+| 阶段 | 新入口 / task |
+| --- | --- |
+| CTE | `scripts/train_zeva_ego_cte.py` / `robotwin_zeva_fastwam_ego_cte_3cam_384` |
+| 预测缓存 | `scripts/build_zeva_ego_boundary_cache.py` |
+| task memory / 全query static context | `scripts/build_zeva_ego_task_memory.py`；中间训练现有retrieval head |
+| PIM train/validation cache | `scripts/build_zeva_cross_attempt_cache.py`，自动识别新boundary schema |
+| Stage2A | `scripts/train_zeva_fastwam_prepared.py` / `robotwin_zeva_ego_policy_3cam_384` |
+| Stage2B | 同一prepared入口 / `robotwin_zeva_ego_pim_3cam_384` |
+| 正式评测 | `scripts/eval_zeva_robotwin_manifest.py`，默认新预测版；on/off使用同一Stage2B权重 |
 
-新 addon schema 为 `zeva_ego_prefix_v1`；缺 layout 的历史权重固定按 `legacy_merged` 读取。旧 Stage2A 不能直接初始化新 Stage2B，旧 Stage2B 也不能直接按新布局部署。复现此前 merged cross-attempt 结果时，显式设置 `model.zeva.adapter.prefix_layout=legacy_merged`。本次拆 token 不要求重建 CTE、BIT 或已有身份匹配的缓存；尚无 cross-attempt cache 的实验仍需为 Stage2B 构建它。下面原有流程对应 legacy 配置，便于复现旧基线。
+新addon schema为 `zeva_ego_prediction_v1`。**需要重训CTE并重建依赖它的全部缓存、检索产物和Stage2权重**；可以复用原FastWAM base、原始数据、stats、语义任务表及匹配的文本cache。新旧产物混用会报错。已有 `latest_completed` 三token版本仍可按 [历史独立prefix指南](docs/zeva_ego_cross_attempt.md) 复现。
+
+本次已加入CPU结构、梯度、因果性、缓存、部署生命周期和评测协议测试；**没有实际完成80epoch GPU训练或200episode RoboTwin仿真，因此尚无新版成功率结果**。FastWAM仍保持video/action experts、joint14、预测32步/执行24步；本项目没有改成pi0.5，也不直接加载参考pi0.5发布权重。
+
+## 历史 V1 说明：以下命令与合同用于旧版复现
 
 ICLWAM 在 FastWAM 的 RoboTwin action path 上加入 Zeva 的因果记忆模块。FastWAM 仍然负责根据图像、语言和本体状态生成动作；记忆模块从历史交互中提取当前 phase、短期 BIT 和跨尝试保留的 PIM，通过 video 流中的 behavior prefix 与 action hidden space 中的 prior residual 两条路径影响动作。
 
@@ -301,6 +316,8 @@ python scripts/train_zeva_fastwam.py \
 
 ## 8. Legacy RoboTwin 测试
 
+本节复现旧completed-effect CTE与top-4 reader。固定seed封装入口当前默认已改为预测式Ego模型，因此下例显式指定legacy task和 `request_seed_stream_v1`。新模型及完整200episode协议请使用[预测版训练与评测指南](docs/zeva_ego_training_evaluation.md#7-robotwin-pim-evaluation)，不要向默认新task传入本节旧CTE/addon。
+
 ### 8.1 固定 seed 测试
 
 先确认 RoboTwin assets 已安装，且 third_party/RoboTwin/policy/fastwam_policy 可以由脚本创建。对同一个 task 和 seed，建议分别测试 base、zeva_stage2、pim_shadow 和 pim_on。
@@ -310,7 +327,10 @@ base 只测试原始 FastWAM：
 ~~~bash
 python scripts/eval_zeva_robotwin_fixed_attempts.py \
   --task click_alarmclock \
+  --sim-task robotwin_zeva_fastwam_pim_3cam_384 \
   --ckpt $BASE_CKPT \
+  --dataset-stats ./data/robotwin2.0/dataset_stats.json \
+  --model-seed 0 --model-rng-protocol request_seed_stream_v1 \
   --seed 0 \
   --max-attempts 4 \
   --mode base
@@ -321,7 +341,10 @@ pim_shadow 运行 CTE/BIT/PIM lifecycle，但不加载 addon，也不改变 Fast
 ~~~bash
 python scripts/eval_zeva_robotwin_fixed_attempts.py \
   --task click_alarmclock \
+  --sim-task robotwin_zeva_fastwam_pim_3cam_384 \
   --ckpt $BASE_CKPT \
+  --dataset-stats ./data/robotwin2.0/dataset_stats.json \
+  --model-seed 0 --model-rng-protocol request_seed_stream_v1 \
   --cte-checkpoint $CTE_CKPT \
   --seed 0 \
   --max-attempts 4 \
@@ -341,6 +364,8 @@ python experiments/robotwin/eval_robotwin_single.py \
   EVALUATION.cte_checkpoint=$CTE_CKPT \
   EVALUATION.addon_checkpoint=$PIM_CKPT \
   EVALUATION.zeva_mode=pim_on \
+  EVALUATION.model_seed=0 \
+  EVALUATION.model_rng_protocol=request_seed_stream_v1 \
   EVALUATION.fixed_seed=0 \
   EVALUATION.max_attempts=4 \
   EVALUATION.action_horizon=32 \
@@ -355,7 +380,11 @@ python experiments/robotwin/eval_robotwin_single.py \
 ~~~bash
 python scripts/eval_zeva_robotwin_fixed_attempts.py \
   --task click_alarmclock \
+  --sim-task robotwin_zeva_fastwam_pim_3cam_384 \
+  --prefix-layout legacy_merged --effect-source latest_completed \
   --ckpt $BASE_CKPT \
+  --dataset-stats ./data/robotwin2.0/dataset_stats.json \
+  --model-seed 0 --model-rng-protocol request_seed_stream_v1 \
   --cte-checkpoint $CTE_CKPT \
   --addon-checkpoint $PIM_CKPT \
   --task-context-bank ./runs/zeva_task_context/behavior_bank.pt \
@@ -377,7 +406,7 @@ python scripts/eval_zeva_robotwin_fixed_attempts.py \
 
 固定 seed 对比时，task、seed、max_attempts 和 replan_steps 要保持一致。max_attempts=4 表示同一个 fixed-seed episode 最多重试四次，不是四个独立 episode。
 
-Zeva 测试必须满足：
+本节legacy Zeva测试必须满足（新预测式CTE的观测要求见新指南）：
 
 - action_horizon=32；
 - replan_steps 是 4 的倍数；

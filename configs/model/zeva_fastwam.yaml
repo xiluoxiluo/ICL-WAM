@@ -26,9 +26,9 @@ zeva:
     effect_dim: 128
     num_layers: 4
     num_heads: 8
-    # Match Zeva's serving path: RGB is encoded once by the frozen Wan VAE
-    # outside CTE.  Set input_type=rgb_frame/image_channels=3 only for an
-    # explicitly separate CPU/debug checkpoint.
+    # Legacy ICL-WAM window CTE. This Wan-VAE representation differs from
+    # feature/zeva_ego's independent RGB ResNet18 encoder. The predictive
+    # path is configured separately in zeva_ego_fastwam.yaml.
     image_channels: 48
     input_type: wan_vae_latent
     vae_input_size: ${data.train.video_size}

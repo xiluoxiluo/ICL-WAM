@@ -1,0 +1,34 @@
+# @package _global_
+defaults:
+  - override /data: robotwin
+  - override /model: zeva_ego_fastwam
+  - _self_
+
+ckpt: null  # required: frozen FastWAM base
+batch_size: 1
+num_workers: 4
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-4
+weight_decay: 1.0e-4
+max_grad_norm: 1.0
+max_steps: 5000
+num_epochs: 1
+lr_scheduler_type: cosine
+log_every: 10
+save_every: 500
+eval_every: 250
+eval_num_samples: 16
+mixed_precision: bf16
+seed: 1000
+
+data:
+  train:
+    use_text_embed_cache: true
+    val_set_proportion: 0.0  # boundary/PIM manifests own train/validation IDs
+    skip_padding_as_possible: false
+    video_backend: pyav
+
+model:
+  zeva:
+    training_stage: policy_injection
+    training_recipe: frozen_parent

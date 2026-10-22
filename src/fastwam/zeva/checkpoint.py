@@ -109,16 +109,22 @@ def addon_layout_metadata(behavior_prefix_adapter) -> dict[str, str | None]:
     if layout not in {"legacy_merged", "zeva_ego"}:
         raise ValueError(f"unsupported addon prefix_layout: {layout!r}")
     effect_source = None
+    prior_variant = str(getattr(config, "prior_variant", "legacy_bit"))
     if layout == "zeva_ego":
         effect_source = str(getattr(config, "effect_source", "latest_completed"))
-        if effect_source != "latest_completed":
-            raise ValueError("zeva_ego prefix requires effect_source='latest_completed'")
+        if effect_source not in {"latest_completed", "current_prediction"}:
+            raise ValueError("unsupported zeva_ego effect_source")
+    predictive = effect_source == "current_prediction"
+    if predictive != (prior_variant == "zeva_ego"):
+        raise ValueError("predictive CTE and zeva_ego action prior must be used together")
     return {
         "pim_variant": variant,
         "prefix_layout": layout,
         "effect_source": effect_source,
+        **({"prior_variant": prior_variant, "memory_semantics": "predicted_effect_trace"} if predictive else {}),
         "addon_schema": (
-            "zeva_ego_prefix_v1" if layout == "zeva_ego"
+            "zeva_ego_prediction_v1" if predictive
+            else "zeva_ego_prefix_v1" if layout == "zeva_ego"
             else "cross_attempt_v1" if variant == "cross_attempt"
             else "legacy"
         ),
@@ -130,12 +136,19 @@ def _checkpoint_prefix_layout(payload: dict) -> str:
     if layout not in {"legacy_merged", "zeva_ego"}:
         raise ValueError(f"unsupported checkpoint prefix_layout: {layout!r}")
     if layout == "zeva_ego":
-        if payload.get("addon_schema") != "zeva_ego_prefix_v1":
-            raise ValueError("zeva_ego checkpoint is missing its zeva_ego_prefix_v1 schema marker")
-        if payload.get("effect_source") != "latest_completed":
-            raise ValueError("zeva_ego checkpoint effect_source must be 'latest_completed'")
-    elif payload.get("addon_schema") == "zeva_ego_prefix_v1":
-        raise ValueError("zeva_ego_prefix_v1 checkpoint must declare prefix_layout='zeva_ego'")
+        schema = payload.get("addon_schema")
+        if schema not in {"zeva_ego_prefix_v1", "zeva_ego_prediction_v1"}:
+            raise ValueError("zeva_ego checkpoint requires a zeva_ego_prefix_v1 or zeva_ego_prediction_v1 schema marker")
+        expected_source = "current_prediction" if schema == "zeva_ego_prediction_v1" else "latest_completed"
+        if payload.get("effect_source") != expected_source:
+            raise ValueError(f"zeva_ego checkpoint effect_source must be {expected_source!r}")
+        if schema == "zeva_ego_prediction_v1" and (
+            payload.get("prior_variant") != "zeva_ego"
+            or payload.get("memory_semantics") != "predicted_effect_trace"
+        ):
+            raise ValueError("predictive checkpoint is missing its prior/memory semantics")
+    elif payload.get("addon_schema") in {"zeva_ego_prefix_v1", "zeva_ego_prediction_v1"}:
+        raise ValueError("zeva_ego checkpoint must declare prefix_layout='zeva_ego'")
     elif payload.get("pim_variant", "legacy") == "cross_attempt":
         if payload.get("addon_schema") != "cross_attempt_v1":
             raise ValueError("cross_attempt checkpoint is missing its cross_attempt_v1 schema marker")
@@ -188,6 +201,11 @@ def load_addon_checkpoint(
             raise ValueError(f"addon checkpoint {name} mismatch")
     expected_layout = addon_layout_metadata(behavior_prefix_adapter)
     checkpoint_layout = _checkpoint_prefix_layout(payload)
+    if payload.get("prior_variant", "legacy_bit") != expected_layout.get("prior_variant", "legacy_bit"):
+        raise ValueError("addon checkpoint prior_variant mismatch; train a new predictive Stage2A")
+    if checkpoint_layout == "zeva_ego" and expected_layout["prefix_layout"] == "zeva_ego":
+        if payload.get("effect_source") != expected_layout["effect_source"]:
+            raise ValueError("addon checkpoint effect_source mismatch; rebuild CTE, caches and Stage2A")
     if load_scope in {"all", "policy_injection"} and checkpoint_layout != expected_layout["prefix_layout"]:
         raise ValueError(
             "addon checkpoint prefix_layout mismatch: "

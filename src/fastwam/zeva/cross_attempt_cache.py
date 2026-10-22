@@ -18,6 +18,8 @@ import torch
 
 
 CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v1"
+EGO_CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v2"
+CROSS_ATTEMPT_CACHE_FORMATS = (CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT)
 HISTORY_KINDS = ("matched", "far", "cross_condition", "empty")
 
 
@@ -105,13 +107,21 @@ class CrossAttemptPIMCache:
     def __init__(self, root: str | Path, *, expected: dict[str, Any] | None = None) -> None:
         self.root = Path(root).expanduser().resolve()
         self.manifest = json.loads((self.root / "manifest.json").read_text())
-        if self.manifest.get("format") != CROSS_ATTEMPT_CACHE_FORMAT:
+        if self.manifest.get("format") not in CROSS_ATTEMPT_CACHE_FORMATS:
             raise ValueError("not a cross-attempt PIM cache")
         for key, value in dict(expected or {}).items():
             if self.manifest.get(key) != value:
                 raise ValueError(f"prepared PIM identity mismatch for {key}: expected={value!r}, actual={self.manifest.get(key)!r}")
         if self.manifest.get("pim_variant") != "cross_attempt" or self.manifest.get("source_subset") != "train-only":
             raise ValueError("cross-attempt cache requires explicit train-only provenance")
+        self.current_prediction = self.manifest["format"] == EGO_CROSS_ATTEMPT_CACHE_FORMAT
+        if self.current_prediction:
+            for key, required in {"memory_semantics": "predicted_effect_trace", "effect_source": "current_prediction",
+                                  "executed_horizon": 24, "cte_input_type": "rgb_multiview"}.items():
+                if self.manifest.get(key) != required:
+                    raise ValueError(f"predicted-effect cache semantic mismatch: {key}")
+        elif self.manifest.get("memory_semantics", "completed_effect_trace") != "completed_effect_trace":
+            raise ValueError("legacy cross-attempt cache cannot contain predicted-effect semantics")
         self.phase_dim = int(self.manifest["phase_dim"])
         self.effect_dim = int(self.manifest["effect_dim"])
         self.bit_size = int(self.manifest["bit_size"])
@@ -184,6 +194,10 @@ class CrossAttemptPIMCache:
                             raise ValueError("history condition does not match pairing kind")
                     elif kind == "cross_condition" and indices:
                         raise ValueError("cross-condition pairing requires actual condition metadata")
+        if self.current_prediction:
+            global_kinds = [kind for kind in HISTORY_KINDS[:3] if all(row[kind] for row in self.pairings.values())]
+            if not global_kinds or self.manifest.get("globally_available_history_kinds") != global_kinds:
+                raise ValueError("globally available history kinds do not match pairing provenance")
         self.weights = {kind: float(self.manifest["history_weights"].get(kind, 0.0)) for kind in HISTORY_KINDS}
         if any(not np.isfinite(weight) or weight < 0 for weight in self.weights.values()) or sum(self.weights.values()) <= 0:
             raise ValueError("invalid history mixture weights")
@@ -203,6 +217,9 @@ class CrossAttemptPIMCache:
             "history_effects": (np.float32, (len(history_ids), self.max_entries, self.effect_dim)),
             "history_mask": (np.uint8, (len(history_ids), self.max_entries)),
         }
+        if self.current_prediction:
+            specs["current_effect"] = (np.float32, (n, self.effect_dim))
+            specs["current_effect_mask"] = (np.uint8, (n,))
         for name, (dtype, shape) in specs.items():
             path = self.root / f"{name}.npy"
             expected_sha = self.manifest.get("array_sha256", {}).get(path.name)
@@ -214,14 +231,15 @@ class CrossAttemptPIMCache:
             self._arrays[name] = array
         if not np.all(np.asarray(self._arrays["history_mask"]).sum(axis=1) > 0):
             raise ValueError("history catalog contains an empty source episode")
-        for name in ("history_mask", "bit_mask"):
+        for name in (("history_mask", "bit_mask", "current_effect_mask") if self.current_prediction else ("history_mask", "bit_mask")):
             if not np.all((self._arrays[name] == 0) | (self._arrays[name] == 1)):
                 raise ValueError(f"non-binary cross-attempt mask: {name}")
 
     def __len__(self) -> int:
         return self.num_queries
 
-    def get(self, index: int, *, history_kind: str | None = None, history_count: int | None = None) -> dict[str, Any]:
+    def get(self, index: int, *, history_kind: str | None = None, history_count: int | None = None,
+            generator: torch.Generator | None = None) -> dict[str, Any]:
         index = int(index)
         if index < 0:
             index += len(self)
@@ -236,7 +254,8 @@ class CrossAttemptPIMCache:
             raise ValueError("cross-attempt query task mismatch")
         # Training uses the worker's seeded torch RNG and varies by visit.
         # Validation uses a local generator, independent of visit/worker order.
-        generator = None if self.split == "train" else torch.Generator().manual_seed(self.seed + index)
+        if generator is None and self.split == "validation":
+            generator = torch.Generator().manual_seed(self.seed + index)
         pairings = self.pairings[episode_id]
         if history_kind is None:
             weights = torch.tensor([self.weights[k] if k == "empty" or pairings.get(k) else 0.0 for k in HISTORY_KINDS])
@@ -268,7 +287,7 @@ class CrossAttemptPIMCache:
         norms = np.linalg.norm(phases, axis=1) * max(float(np.linalg.norm(phase)), 1e-12)
         scores = (phases @ phase) / np.maximum(norms, 1e-12)
         scores[~mask] = -np.inf
-        return {
+        result = {
             "window_index": int(arrays["window_index"][index]), "raw_step": int(arrays["raw_step"][index]),
             "episode_id": episode_id, "task_id": task_id,
             "phase": torch.from_numpy(phase), "bit_effects": torch.from_numpy(bit_effects),
@@ -277,5 +296,41 @@ class CrossAttemptPIMCache:
             "pim_mask": torch.from_numpy(mask), "pim_scores": torch.from_numpy(scores),
             "pim_history_kind": torch.tensor(HISTORY_KINDS.index(history_kind), dtype=torch.long),
             "pim_history_count": torch.tensor(len(selected), dtype=torch.long),
+            "pim_nonempty_history_weight": torch.tensor(sum(self.weights[k] for k in HISTORY_KINDS[:3] if pairings.get(k)), dtype=torch.float32),
             "pim_source_episode_ids": [self.history_episodes[i]["episode_id"] for i in selected],
         }
+        if self.current_prediction:
+            effect = np.array(arrays["current_effect"][index], copy=True)
+            if not np.isfinite(effect).all():
+                raise ValueError("non-finite current predicted effect")
+            result["current_effect"] = torch.from_numpy(effect)
+            result["current_effect_mask"] = torch.tensor(bool(arrays["current_effect_mask"][index]))
+        return result
+
+    def get_history_candidates(self, index: int) -> dict[str, Any]:
+        """Bundle one prior attempt per mode for optimizer-step selection.
+
+        No training-step state lives in dataset workers: prefetch cannot move
+        the PIM-only warmup boundary or independently choose microbatch modes.
+        """
+        if not self.current_prediction:
+            raise ValueError("optimizer-step history schedule requires predicted-effect cache v2")
+        result = self.get(index, history_kind="empty")
+        kinds = self.manifest["globally_available_history_kinds"]
+        bundles = {"pim_history_phases": [], "pim_history_effects": [],
+                   "pim_history_masks": [], "pim_history_scores": []}
+        available = []
+        for kind_index, kind in enumerate(HISTORY_KINDS[:3]):
+            enabled = kind in kinds
+            # Candidate identity is query-local and stable across workers,
+            # prefetch depth and resume. Only optimizer-step mode selection
+            # varies during the new curriculum; legacy get() stays stochastic.
+            generator = torch.Generator().manual_seed(self.seed + 3 * int(index) + kind_index)
+            candidate = self.get(index, history_kind=kind, history_count=1, generator=generator) if enabled else result
+            available.append(enabled)
+            for target, source in (("pim_history_phases", "pim_phases"), ("pim_history_effects", "pim_effects"),
+                                   ("pim_history_masks", "pim_mask"), ("pim_history_scores", "pim_scores")):
+                bundles[target].append(candidate[source])
+        result.update({name: torch.stack(values) for name, values in bundles.items()})
+        result["pim_history_available"] = torch.tensor(available, dtype=torch.bool)
+        return result

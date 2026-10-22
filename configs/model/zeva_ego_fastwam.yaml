@@ -1,0 +1,109 @@
+defaults:
+  - fastwam
+  - _self_
+
+# Predictive Zeva-Ego contract. Legacy wan_vae_latent/window CTE configs are
+# deliberately separate; none of their trained artifacts can be reused here.
+zeva:
+  enabled: true
+  pim_variant: cross_attempt
+  training_stage: policy_injection
+  training_recipe: frozen_parent
+  policy_checkpoint: null
+  policy_warmstart_checkpoint: null
+  action_only: true
+  freeze_fastwam: true
+  freeze_cte_stage2: true
+  cte:
+    variant: zeva_ego
+    checkpoint: null
+    input_type: rgb_multiview
+    action_dim: 14
+    executed_horizon: 24
+    hidden_dim: 256
+    retrieval_dim: 128
+    phase_dim: 256
+    effect_dim: 256
+    aux_phase_dim: 128
+    num_layers: 4
+    num_heads: 4
+    num_views: 3
+    image_size: 224
+    dropout: 0.1
+    ema_decay: 0.99
+    temporal_backend: mamba
+    vision_backbone: resnet18
+    vision_pretrained: true
+  memory:
+    memory_semantics: predicted_effect_trace
+    bit_size: 4
+    pim_retrieval_mode: cross_attempt
+    pim_top_k: 192
+    pim_max_entries: 192
+    cross_attempt_only: true
+    max_past_attempts: 3
+    max_entries_per_attempt: 64
+    merge_threshold: 0.85  # unused by the bounded cross-attempt reader
+    beta_phase: 0.5
+    beta_effect: 0.5
+  task_context:
+    mode: static
+    bank_path: null
+    readout_cache_path: null
+    query_readout_cache_path: null
+    retrieval_checkpoint: null
+    static_episode_cache_path: null
+    build_stage: bank
+    top_k: 5
+    key_dim: ${model.zeva.cte.retrieval_dim}
+    value_dim: 256
+    temperature: 0.07
+    retrieval:
+      input_dim: ${model.video_dit_config.hidden_dim}
+      hidden_dim: 1024
+      output_dim: ${model.zeva.cte.retrieval_dim}
+      dropout: 0.1
+    training:
+      steps: 2000
+      batch_size: 32
+      learning_rate: 1.0e-4
+      temperature: 0.07
+      validation_fraction: 0.2
+      eval_every: 50
+  prompt:
+    pim_variant: cross_attempt
+    global_dim: 256
+    phase_dim: 256
+    effect_dim: 256
+    brief_length: 4
+    persistent_length: 192
+    hidden_dim: 256
+    num_heads: 4
+    pim_context_dropout: 0.0
+    pim_support_dropout: 0.0
+  adapter:
+    mode: exact_zeva
+    pim_variant: cross_attempt
+    prefix_layout: zeva_ego
+    effect_source: current_prediction
+    prior_variant: zeva_ego
+    memory_dim: 256
+    global_dim: 256
+    phase_dim: 256
+    effect_dim: 256
+    effect_history_length: 4
+    action_dim: 14
+    action_horizon: 32
+    action_hidden_dim: 1024
+    prior_hidden_dim: 256
+    prior_num_heads: 4
+    prior_loss_weight: 0.01
+    prior_dropout_rate: 0.4
+    prior_inference_guidance_scale: 0.5
+    leading_condition_steps: 0
+  cache:
+    path: null  # build_zeva_ego_boundary_cache.py, never a legacy v4 cache
+    strict_manifest: true
+  prepared_stage2:
+    pim_cache_path: null
+    validation_pim_cache_path: null

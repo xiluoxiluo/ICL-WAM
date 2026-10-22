@@ -93,6 +93,9 @@ class ExactZevaPolicyInjectionConfig:
     # The existing ICL-WAM CTE encodes completed interactions. It does not
     # provide Zeva-Ego's prediction of the current state's future effect.
     effect_source: str = "latest_completed"
+    # The predictive CTE has a different policy contract. Keep old weights
+    # explicit rather than silently changing their BIT-conditioned prior.
+    prior_variant: str = "legacy_bit"
 
     def __post_init__(self) -> None:
         values = (
@@ -117,8 +120,18 @@ class ExactZevaPolicyInjectionConfig:
             raise ValueError("pim_prefix_init_std must be positive")
         if self.prefix_layout not in {"legacy_merged", "zeva_ego"}:
             raise ValueError("prefix_layout must be legacy_merged or zeva_ego")
-        if self.effect_source != "latest_completed":
-            raise ValueError("effect_source must be latest_completed")
+        if self.effect_source not in {"latest_completed", "current_prediction"}:
+            raise ValueError("effect_source must be latest_completed or current_prediction")
+        if self.prior_variant not in {"legacy_bit", "zeva_ego"}:
+            raise ValueError("prior_variant must be legacy_bit or zeva_ego")
+        if self.effect_source == "current_prediction":
+            if self.prefix_layout != "zeva_ego" or self.prior_variant != "zeva_ego":
+                raise ValueError("current_prediction requires zeva_ego prefix_layout and prior_variant")
+        if self.prior_variant == "zeva_ego":
+            if self.effect_source != "current_prediction":
+                raise ValueError("zeva_ego prior requires the predictive CTE contract")
+            if self.phase_dim != self.prior_hidden_dim or self.global_dim != self.prior_hidden_dim:
+                raise ValueError("zeva_ego prior requires phase_dim=global_dim=prior_hidden_dim")
 
 
 class FastWAMPolicyInjectionPrior(nn.Module):
@@ -219,11 +232,59 @@ class FastWAMPolicyInjectionPrior(nn.Module):
         return mean, std
 
 
-def gaussian_prior_nll(target: Tensor, mean: Tensor, std: Tensor, valid: Tensor | None = None) -> Tensor:
-    """Zeva's diagonal-Gaussian action-prior objective."""
+class ZevaEgoActionPrior(nn.Module):
+    """Reference EAP: global waypoints attended by the current raw CTE phase.
+
+    Effects condition the independent visual prefix. They are deliberately
+    not folded into the local query of this prior (unlike legacy ICL-WAM).
+    Shapes retain FastWAM's joint14 / horizon32 action contract.
+    """
+
+    def __init__(self, config: ExactZevaPolicyInjectionConfig) -> None:
+        super().__init__()
+        self.config = config
+        dim = config.prior_hidden_dim
+        self.temporal_waypoint = nn.Sequential(
+            nn.Linear(dim, 512), nn.GELU(), nn.Linear(512, dim * 8),
+        )
+        self.pos_emb = nn.Parameter(torch.randn(1, 8, dim) * 0.02)
+        self.progress_attention = nn.MultiheadAttention(dim, config.prior_num_heads, batch_first=True)
+        self.norm_global = nn.LayerNorm(dim)
+        self.norm_local = nn.LayerNorm(dim)
+        self.dist_head = nn.Sequential(
+            nn.Linear(dim, 512), nn.GELU(),
+            nn.Linear(512, config.action_horizon * config.action_dim * 2),
+        )
+        nn.init.normal_(self.dist_head[-1].weight, std=0.01)
+        nn.init.zeros_(self.dist_head[-1].bias)
+
+    def forward(self, task_tokens: Tensor, phase: Tensor,
+                bit_effects: Tensor | None = None, bit_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        cfg = self.config
+        if task_tokens.ndim != 2 or task_tokens.shape[-1] != cfg.global_dim:
+            raise ValueError("task_tokens must be [B,global_dim]")
+        if phase.shape != (task_tokens.shape[0], cfg.phase_dim):
+            raise ValueError("phase must be [B,phase_dim]")
+        anchors = self.temporal_waypoint(task_tokens).reshape(-1, 8, cfg.prior_hidden_dim) + self.pos_emb
+        keys = self.norm_global(anchors)
+        local, _ = self.progress_attention(self.norm_local(phase)[:, None], keys, keys, need_weights=False)
+        params = self.dist_head(local[:, 0]).reshape(-1, cfg.action_horizon, cfg.action_dim, 2)
+        return params[..., 0], params[..., 1].clamp(-5.0, 2.0).exp()
+
+
+def gaussian_prior_nll(target: Tensor, mean: Tensor, std: Tensor, valid: Tensor | None = None,
+                       *, reference_reduction: bool = False) -> Tensor:
+    """Diagonal-Gaussian objective, with versioned action-dimension scaling.
+
+    Zeva-Ego sums log probabilities across action dimensions, then averages
+    time/batch. Preserve the old mean reduction for legacy trained weights.
+    """
     if target.shape != mean.shape or mean.shape != std.shape:
         raise ValueError("target, mean, and std must have the same shape")
-    nll = 0.5 * (((target - mean) / std).square() + 2.0 * std.log()).mean(dim=-1)
+    if reference_reduction:
+        nll = -torch.distributions.Normal(mean, std).log_prob(target).sum(dim=-1)
+    else:
+        nll = 0.5 * (((target - mean) / std).square() + 2.0 * std.log()).mean(dim=-1)
     if valid is None:
         return nll.mean()
     if valid.shape != nll.shape:
@@ -263,9 +324,9 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
     """Separate behavior-prefix and action-prior injection branches.
 
     ``legacy_merged`` preserves ICL-WAM's original combined global/PIM slot.
-    ``zeva_ego`` exposes independent global, completed-effect, and PIM slots,
-    following Zeva-Ego's prefix topology. Its effect source remains the
-    existing ICL-WAM CTE's latest completed BIT, not a predicted future effect.
+    ``zeva_ego`` exposes independent global, effect, and PIM slots. The
+    versioned effect_source distinguishes legacy completed effects from the
+    predictive CTE's current-boundary effect; their checkpoints cannot mix.
     Both layouts project the action-prior mean into ActionDiT hidden space.
     """
 
@@ -275,13 +336,16 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         super().__init__()
         self.config = config or ExactZevaPolicyInjectionConfig()
         cfg = self.config
-        self.prior = FastWAMPolicyInjectionPrior(cfg)
+        self.prior = (ZevaEgoActionPrior(cfg) if cfg.prior_variant == "zeva_ego"
+                      else FastWAMPolicyInjectionPrior(cfg))
         self.action_prior_adapter = nn.Linear(cfg.action_dim, cfg.action_hidden_dim)
         self.behavior_global_projector = nn.Linear(cfg.global_dim, cfg.context_dim)
         self.prefix_project = nn.Linear(cfg.memory_dim, cfg.context_dim)
         self.pim_gate = nn.Parameter(torch.tensor(float(cfg.prompt_gate_init)))
         if cfg.pim_variant == "cross_attempt":
-            self.pim_to_global = nn.Linear(cfg.memory_dim, cfg.global_dim, bias=False)
+            self.pim_to_global = nn.Linear(
+                cfg.memory_dim, cfg.global_dim, bias=(cfg.prior_variant == "zeva_ego"),
+            )
             # Retain the scalar in the state dict for legacy diagnostics, but
             # the new path neither multiplies by it nor trains it.
             self.pim_gate.requires_grad_(False)
@@ -321,6 +385,8 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         if self.config.pim_variant == "cross_attempt":
             nn.init.normal_(self.prefix_project.weight, std=self.config.pim_prefix_init_std)
             nn.init.zeros_(self.pim_to_global.weight)
+            if self.pim_to_global.bias is not None:
+                nn.init.zeros_(self.pim_to_global.bias)
         else:
             nn.init.xavier_uniform_(self.prefix_project.weight)
         nn.init.zeros_(self.prefix_project.bias)
@@ -466,6 +532,8 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         *,
         bit_effects: Tensor | None = None,
         bit_mask: Tensor | None = None,
+        current_effect: Tensor | None = None,
+        current_effect_mask: Tensor | None = None,
         enable_pim: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """Build prefix embeddings and their attention-key validity mask.
@@ -489,14 +557,20 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             raise ValueError("causal_prompt must be [B,memory_dim]")
         if pim_mask.ndim != 2 or pim_mask.shape[0] != batch:
             raise ValueError("pim_mask must be [B,N]")
-        if bit_effects is None or bit_mask is None:
-            raise ValueError(
-                "zeva_ego prefix requires bit_effects and bit_mask for latest_completed effect"
-            )
-        if bit_effects.shape != (batch, cfg.effect_history_length, cfg.effect_dim):
-            raise ValueError("bit_effects must match [B,effect_history_length,effect_dim]")
-        if bit_mask.shape != bit_effects.shape[:2]:
-            raise ValueError("bit_mask must match bit_effects [B,effect_history_length]")
+        if cfg.effect_source == "latest_completed":
+            if current_effect is not None or current_effect_mask is not None:
+                raise ValueError("latest_completed checkpoint cannot consume current_prediction inputs")
+            if bit_effects is None or bit_mask is None:
+                raise ValueError("zeva_ego prefix requires bit_effects and bit_mask for latest_completed effect")
+            if bit_effects.shape != (batch, cfg.effect_history_length, cfg.effect_dim):
+                raise ValueError("bit_effects must match [B,effect_history_length,effect_dim]")
+            if bit_mask.shape != bit_effects.shape[:2]:
+                raise ValueError("bit_mask must match bit_effects [B,effect_history_length]")
+        else:
+            if current_effect is None or current_effect_mask is None:
+                raise ValueError("current_prediction requires current_effect and current_effect_mask")
+            if current_effect.shape != (batch, cfg.effect_dim) or current_effect_mask.shape != (batch,):
+                raise ValueError("current_effect/current_effect_mask must be [B,effect_dim]/[B]")
 
         parameter = self.prefix_project.weight
         has_pim = pim_mask.to(device=parameter.device, dtype=torch.bool).any(dim=-1)
@@ -512,10 +586,17 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         global_token = self.behavior_global_projector(
             conditioned_task.to(self.behavior_global_projector.weight)
         )
-        completed_effect, has_effect = select_latest_completed_effect(
-            bit_effects.to(self.behavior_effect_projector.weight), bit_mask,
-        )
-        effect_token = self.behavior_effect_projector(completed_effect)
+        if cfg.effect_source == "latest_completed":
+            effect, has_effect = select_latest_completed_effect(
+                bit_effects.to(self.behavior_effect_projector.weight), bit_mask,
+            )
+        else:
+            effect = current_effect.to(self.behavior_effect_projector.weight)
+            has_effect = current_effect_mask.to(device=effect.device, dtype=torch.bool)
+            effect = torch.where(has_effect[:, None], effect, torch.zeros_like(effect))
+            if not torch.isfinite(effect).all():
+                raise ValueError("valid current_effect must be finite")
+        effect_token = self.behavior_effect_projector(effect)
         effect_token = torch.where(
             has_effect[:, None], effect_token, torch.zeros_like(effect_token)
         )

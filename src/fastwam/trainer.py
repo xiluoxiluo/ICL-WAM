@@ -4,6 +4,7 @@ import inspect
 import math
 import os
 import re
+import random
 from math import ceil
 from pathlib import Path
 import time
@@ -11,6 +12,7 @@ import time
 import numpy as np
 import torch
 from accelerate import Accelerator
+from accelerate.utils import DistributedType, GradientAccumulationPlugin
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, LambdaLR, LinearLR, SequentialLR
@@ -23,6 +25,7 @@ from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 from .zeva.checkpoint import checkpoint_sha256
+from .zeva.ego_pim_schedule import HISTORY_KINDS, apply_history_kind, select_history_kind, eap_lr_factor
 
 logger = get_logger(__name__)
 
@@ -65,15 +68,48 @@ class Wan22Trainer:
         )
         if self.zeva_training:
             logger.info("Zeva training stage: %s", self.zeva_training_stage)
+        self.zeva_training_recipe = str(getattr(self.model, "zeva_training_recipe", "frozen_parent"))
+        self.ego_curriculum = self.zeva_training and self.zeva_training_recipe == "ego_adapter_warmup"
+        self.predictive_zeva = self.zeva_training and getattr(
+            getattr(getattr(self.model, "zeva_behavior_prefix_adapter", None), "config", None),
+            "effect_source", "latest_completed",
+        ) == "current_prediction"
+        if self.predictive_zeva and self.mixed_precision == "fp16":
+            raise ValueError("Predictive Stage2 supports bf16/no precision; fp16 scaler state is not part of its checkpoint contract")
+        self._zeva_data_identity = {}
+        if self.predictive_zeva:
+            for split, dataset in (("train", self.train_dataset), ("validation", self.val_dataset)):
+                if dataset is None:
+                    raise ValueError("Predictive Stage2 requires separate train and validation prepared datasets")
+                self._zeva_data_identity[split] = {
+                    "pim_manifest_sha256": checkpoint_sha256(dataset.pim.root / "manifest.json"),
+                    "static_context_sha256": checkpoint_sha256(dataset.static_context.path),
+                    "num_queries": len(dataset),
+                }
+        self._zeva_resume_rng = None
+        self.ego_warmup_steps = int(cfg.get("zeva_pim_warmup_steps", 500))
+        self.ego_available_history_kinds = ()
+        if self.ego_curriculum:
+            if getattr(self.train_dataset, "history_schedule", None) != "ego_optimizer_step":
+                raise ValueError("ego_adapter_warmup requires optimizer-step history candidates")
+            self.ego_available_history_kinds = tuple(self.train_dataset.pim.manifest["globally_available_history_kinds"])
+            if self.ego_warmup_steps < 1:
+                raise ValueError("zeva_pim_warmup_steps must be positive")
         self._validate_policy_warmstart_configuration()
 
         self.accelerator = Accelerator(
-            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            **({"gradient_accumulation_plugin": GradientAccumulationPlugin(
+                num_steps=self.gradient_accumulation_steps, sync_with_dataloader=False,
+            )} if self.predictive_zeva else {"gradient_accumulation_steps": self.gradient_accumulation_steps}),
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
         )
         
         deepspeed_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        if self.predictive_zeva and self.accelerator.distributed_type not in {
+            DistributedType.NO, DistributedType.MULTI_GPU, DistributedType.MULTI_CPU,
+        }:
+            raise ValueError("Predictive addon checkpoints support a single process / ordinary DDP, not sharded DeepSpeed/FSDP state")
         deepspeed_config = getattr(deepspeed_plugin, "deepspeed_config", {}) or {}
         zero_stage = deepspeed_config.get("zero_optimization", {}).get("stage", "none")
         logger.info(
@@ -107,7 +143,18 @@ class Wan22Trainer:
             elif self.zeva_training_stage == "pim_adapter":
                 adapter = self.model.zeva_behavior_prefix_adapter
                 prompt_params = list(self.model.zeva_prompt_encoder.parameters())
-                if (
+                if self.ego_curriculum:
+                    pim_params = prompt_params + list(adapter.pim_adapter_parameters())
+                    eap_params = list(adapter.policy_injection_parameters())
+                    trainable_params = pim_params + eap_params
+                    optimizer_params = [
+                        {"params": pim_params, "lr": self.learning_rate, "name": "pim"},
+                        {"params": eap_params, "lr": float(cfg.get("zeva_eap_learning_rate", 1e-5)), "name": "eap"},
+                    ]
+                    logger.info("Predictive PIM: %d PIM-only steps, then PIM+EAP; FastWAM frozen; effective batch=%d",
+                                self.ego_warmup_steps, self.batch_size * self.gradient_accumulation_steps * self.accelerator.num_processes)
+                    logger.info("Real available history kinds: %s (5:2:1, then 5:2:1:2 with empty)", self.ego_available_history_kinds)
+                elif (
                     getattr(adapter.config, "pim_variant", "legacy") == "cross_attempt"
                     or getattr(adapter.config, "prefix_layout", "legacy_merged") == "zeva_ego"
                 ):
@@ -167,11 +214,21 @@ class Wan22Trainer:
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
         warmup_steps = int(total_train_steps * 0.05)
-        self.scheduler = self._build_scheduler(
-            scheduler_type=cfg.lr_scheduler_type,
-            total_train_steps=total_train_steps,
-            warmup_steps=warmup_steps,
-        )
+        if self.ego_curriculum:
+            if str(cfg.lr_scheduler_type) != "constant":
+                raise ValueError("ego_adapter_warmup uses constant group LRs after PIM-only warmup")
+            if total_train_steps <= self.ego_warmup_steps:
+                raise ValueError("formal predictive PIM training must continue past warmup")
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda=[
+                lambda step: 1.0,
+                lambda step: eap_lr_factor(step, self.ego_warmup_steps),
+            ])
+        else:
+            self.scheduler = self._build_scheduler(
+                scheduler_type=cfg.lr_scheduler_type,
+                total_train_steps=total_train_steps,
+                warmup_steps=warmup_steps,
+            )
         if self.zeva_training and self.zeva_training_stage == "pim_adapter":
             logger.info(
                 "PIM optimizer initial LRs: %s",
@@ -282,6 +339,7 @@ class Wan22Trainer:
             seed=self.seed,
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
+            pad_to_global_batch=getattr(self, "predictive_zeva", False),
         )
         return DataLoader(
             dataset,
@@ -291,6 +349,10 @@ class Wan22Trainer:
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
+            # Predictive inputs/candidate histories are deterministic. Keep
+            # worker startup out of the model's flow-noise RNG on resume.
+            generator=(torch.Generator().manual_seed(self.seed + self.accelerator.process_index)
+                       if getattr(self, "predictive_zeva", False) else None),
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
@@ -478,6 +540,12 @@ class Wan22Trainer:
             return
         resume_path = Path(str(resume))
         if resume_path.is_dir():
+            if getattr(self, "predictive_zeva", False):
+                required = ("optimizer_scheduler.pt", "trainer_state.json", "COMPLETE",
+                            f"rng_rank_{self.accelerator.process_index:04d}.pt")
+                missing = [name for name in required if not (resume_path / name).is_file()]
+                if missing:
+                    raise ValueError(f"Predictive Stage2 resume requires a complete checkpoint directory; missing {missing}")
             if self.zeva_training and (resume_path / "optimizer_scheduler.pt").is_file():
                 logger.info("Resuming Zeva addon optimizer/scheduler state from directory: %s", resume)
                 addon_path = (
@@ -502,6 +570,7 @@ class Wan22Trainer:
                     load_scope="all",
                 )
                 checkpoint_stage = addon_payload.get("training_stage")
+                self._validate_zeva_resume_recipe(addon_payload)
                 if checkpoint_stage != self.zeva_training_stage:
                     raise ValueError(
                         "Zeva resume stage mismatch: "
@@ -518,6 +587,26 @@ class Wan22Trainer:
                     self.global_step = int(progress.get("global_step", 0))
                     self.epoch = int(progress.get("epoch", 0))
                     self.batch_in_epoch = int(progress.get("batch_in_epoch", 0))
+                if getattr(self, "predictive_zeva", False):
+                    if progress.get("data_identity") != self._zeva_data_identity:
+                        raise ValueError("Predictive Stage2 resume train/validation cache identity changed")
+                    if int(addon_payload.get("step", -1)) != self.global_step:
+                        raise ValueError("Predictive Stage2 resume addon/progress step mismatch")
+                    self._zeva_resume_rng = torch.load(
+                        resume_path / f"rng_rank_{self.accelerator.process_index:04d}.pt",
+                        map_location="cpu", weights_only=False,
+                    )
+                    self._validate_rank_rng(self._zeva_resume_rng)
+                    self.train_sampler.set_epoch_offset(self.epoch)
+                    self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
+                    if self.batch_in_epoch > 0 and len(self.train_sampler) == 0:
+                        # DataLoaderShard does not advance its iteration for
+                        # an initially empty loader. Normalize an exhausted
+                        # checkpoint to the next epoch before constructing it.
+                        self.epoch += 1
+                        self.batch_in_epoch = 0
+                        self.train_sampler.set_epoch_offset(self.epoch)
+                        self.train_sampler.clear_resume_batch_offset()
                 return
             logger.info("Resuming full training state from directory: %s", resume)
             self.load_training_state(str(resume_path))
@@ -525,6 +614,8 @@ class Wan22Trainer:
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
         if self.zeva_training:
+            if getattr(self, "predictive_zeva", False):
+                raise ValueError("Predictive Stage2 resume requires checkpoints/state/step_XXXXXX with optimizer and rank RNG; addon-only is not a resume")
             base_path = self.cfg.get("ckpt")
             zeva_cfg = self.cfg.model.get("zeva", {})
             cte_path = zeva_cfg.get("cte", {}).get("checkpoint") if hasattr(zeva_cfg, "get") else None
@@ -538,6 +629,7 @@ class Wan22Trainer:
                 load_scope="all",
             )
             checkpoint_stage = payload.get("training_stage")
+            self._validate_zeva_resume_recipe(payload)
             if checkpoint_stage != self.zeva_training_stage:
                 raise ValueError(
                     "Zeva resume stage mismatch: "
@@ -549,6 +641,49 @@ class Wan22Trainer:
         logger.info("Loading weight checkpoint only: %s", resume)
         self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+
+    def _validate_zeva_resume_recipe(self, payload):
+        expected = getattr(self, "zeva_training_recipe", "frozen_parent")
+        if payload.get("training_recipe", "frozen_parent") != expected:
+            raise ValueError("Zeva resume training_recipe mismatch")
+        keys = set()
+        if getattr(self, "predictive_zeva", False):
+            keys.update(("learning_rate", "weight_decay", "max_grad_norm", "lr_scheduler_type",
+                         "max_steps", "num_epochs", "seed", "batch_size",
+                         "gradient_accumulation_steps", "mixed_precision"))
+        if expected == "ego_adapter_warmup":
+            keys.update(("zeva_pim_warmup_steps", "zeva_eap_learning_rate", "learning_rate", "seed",
+                         "gradient_accumulation_steps", "batch_size"))
+        saved = payload.get("config", {})
+        for key in sorted(keys):
+            if saved.get(key) != self.cfg.get(key):
+                raise ValueError(f"Predictive Stage2 resume curriculum/optimizer mismatch: {key}")
+
+    def _rank_rng_state(self):
+        device = torch.device(self.accelerator.device)
+        return {
+            "format": "zeva_ego_stage2_rng_v1", "step": self.global_step,
+            "world_size": self.accelerator.num_processes, "rank": self.accelerator.process_index,
+            "python": random.getstate(), "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+        }
+
+    def _validate_rank_rng(self, state):
+        for name, expected in (("format", "zeva_ego_stage2_rng_v1"), ("step", self.global_step),
+                               ("world_size", self.accelerator.num_processes), ("rank", self.accelerator.process_index)):
+            if state.get(name) != expected:
+                raise ValueError(f"Predictive Stage2 rank RNG mismatch: {name}")
+        if (state.get("torch_cuda") is not None) != (torch.device(self.accelerator.device).type == "cuda"):
+            raise ValueError("Predictive Stage2 resume RNG device type changed")
+
+    def _restore_rank_rng(self, state):
+        self._validate_rank_rng(state)
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"].cpu())
+        if state["torch_cuda"] is not None:
+            torch.cuda.set_rng_state(state["torch_cuda"].cpu(), self.accelerator.device)
 
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
@@ -696,6 +831,11 @@ class Wan22Trainer:
                         for key, value in source.items()
                     }
                     sample["_training_mode"] = "zeva_stage2"
+                    if getattr(self, "ego_curriculum", False):
+                        # Validation uses a fixed real nonempty mode so its
+                        # paired on/off gain remains interpretable after step500.
+                        kind = HISTORY_KINDS.index(self.ego_available_history_kinds[0])
+                        sample = apply_history_kind(sample, kind)
                     memory_off = dict(sample)
                     for key in ("pim_phases", "pim_effects", "pim_mask"):
                         if key in memory_off:
@@ -968,20 +1108,27 @@ class Wan22Trainer:
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
         }
+        if getattr(self, "predictive_zeva", False):
+            payload["data_identity"] = self._zeva_data_identity
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
     def save_checkpoint(self):
         step_tag = f"step_{self.global_step:06d}"
+        state_path = os.path.join(self.state_dir, step_tag)
 
+        self.accelerator.wait_for_everyone()
+        ensure_dir(state_path)
+        if getattr(self, "predictive_zeva", False) and self.accelerator.is_main_process:
+            # An interrupted overwrite must never retain a stale completion
+            # marker beside a mix of old/new weights, optimizer and RNG state.
+            (Path(state_path) / "COMPLETE").unlink(missing_ok=True)
         self.accelerator.wait_for_everyone()
         ckpt_path = None
         if self.accelerator.is_main_process:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
         self.accelerator.wait_for_everyone()
 
-        state_path = os.path.join(self.state_dir, step_tag)
-        ensure_dir(state_path)
         if self.zeva_training:
             # Saving Accelerator's complete model state here would duplicate
             # the frozen Wan/Action/MoT/VAE weights.  Zeva needs only the
@@ -994,11 +1141,18 @@ class Wan22Trainer:
                     },
                     Path(state_path) / "optimizer_scheduler.pt",
                 )
+            if getattr(self, "predictive_zeva", False):
+                rng_path = Path(state_path) / f"rng_rank_{self.accelerator.process_index:04d}.pt"
+                temporary = rng_path.with_suffix(".tmp")
+                torch.save(self._rank_rng_state(), temporary)
+                temporary.replace(rng_path)
         else:
             self.accelerator.save_state(output_dir=state_path)
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
+            if getattr(self, "predictive_zeva", False):
+                (Path(state_path) / "COMPLETE").write_text("complete\n", encoding="utf-8")
         self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
@@ -1058,6 +1212,9 @@ class Wan22Trainer:
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
         data_iter = iter(self.train_loader)
+        if getattr(self, "_zeva_resume_rng", None) is not None:
+            self._restore_rank_rng(self._zeva_resume_rng)
+            self._zeva_resume_rng = None
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
 
@@ -1081,6 +1238,12 @@ class Wan22Trainer:
                         # DeepSpeed forward hooks observe the complete Zeva
                         # prompt -> adapter -> action-loss graph.
                         sample = dict(sample)
+                        if self.ego_curriculum:
+                            kind = select_history_kind(
+                                self.global_step, seed=self.seed, warmup_steps=self.ego_warmup_steps,
+                                available_kinds=self.ego_available_history_kinds,
+                            )
+                            sample = apply_history_kind(sample, kind)
                         sample["_training_mode"] = "zeva_stage2"
                         loss, loss_dict = self.model(sample)
                         if not torch.isfinite(loss):
@@ -1092,11 +1255,17 @@ class Wan22Trainer:
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    clip_params = (parameter for group in self.optimizer.param_groups if group["lr"] > 0
+                                   for parameter in group["params"]) if self.ego_curriculum else self.model.parameters()
+                    grad_norm = self.accelerator.clip_grad_norm_(clip_params, self.max_grad_norm)
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    if self.ego_curriculum and self.accelerator.optimizer_step_was_skipped:
+                        # Overflow is not an optimizer update and must not
+                        # advance the warmup or history-mode clock.
+                        continue
                     self.global_step += 1
                     global_loss = float(
                         self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
@@ -1190,7 +1359,8 @@ class Wan22Trainer:
                             eval_payload = {f"eval/{key}": float(value) for key, value in metrics.items() if isinstance(value, (int, float))}
                             self._wandb_log(eval_payload)
 
-                    if self.save_every > 0 and self.global_step % self.save_every == 0:
+                    if (self.save_every > 0 and self.global_step % self.save_every == 0
+                            and self.global_step < self.max_steps):
                         ckpt_info = self.save_checkpoint()
                         if self.accelerator.is_main_process:
                             logger.info(

@@ -4,15 +4,15 @@
 # Adapted from air-embodied-brain/Zeva's
 # ``cosmos_framework/model/zeva/causal_transition_encoder.py``.
 #
-# ICL-WAM adaptations are limited to RoboTwin's action width and data/mask
-# boundary; the architecture and effect-window semantics remain canonical.
+# This legacy window-based implementation predates feature/zeva_ego. The
+# branch's RGB/replanning-cadence predictive CTE is implemented in ego_cte.py.
 
-"""Causal Transition Encoder (CTE), copied from Zeva's canonical module.
+"""Legacy window-based Causal Transition Encoder retained for old artifacts.
 
-ICL-WAM changes only the RoboTwin action width (14).  The CTE input, internal
-heads, right-shifted action stream, and effect-window heads are kept identical
-to Zeva's ``[B,T,C,H,W]`` tensor interface.  RGB/Wan-VAE conversion belongs to
-the caller and is never performed in this module.
+The four-action transition and sixteen-action completed-effect semantics are
+not the predictive CTE used by Zeva's feature/zeva_ego branch. RGB/Wan-VAE
+conversion belongs to this legacy path's caller. Do not load these weights
+into the new RGB/Mamba CTE or reinterpret effect_post as current prediction.
 """
 
 from __future__ import annotations

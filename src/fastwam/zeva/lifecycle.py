@@ -18,10 +18,13 @@ class LifecycleConfig:
     transition_steps: int = 4
     effect_window_transitions: int = 4
     action_dim: int = 14
+    memory_semantics: str = "completed_effect_trace"
 
     def __post_init__(self) -> None:
         if min(self.bit_size, self.transition_steps, self.effect_window_transitions, self.action_dim) < 1:
             raise ValueError("lifecycle dimensions must be positive")
+        if self.memory_semantics not in {"completed_effect_trace", "predicted_effect_trace"}:
+            raise ValueError("unknown memory semantics")
 
 
 class CausalCTEHistory:
@@ -237,6 +240,26 @@ class CausalMemoryLifecycle:
         *,
         metadata: dict[str, object] | None = None,
     ) -> None:
+        if self.config.memory_semantics != "completed_effect_trace":
+            raise ValueError("observed completed effects cannot enter a predicted-effect trace")
+        self._append_effect(phase_at_window_start, effect_post, metadata=metadata)
+
+    def observe_predicted_effect(
+        self, phase: Tensor, predicted_effect: Tensor, *, metadata: dict[str, object] | None = None,
+    ) -> None:
+        """Append after predicting the current action, never before its read.
+
+        The raw vector is the current causal CTE prediction, not a realized
+        future outcome. Cross-attempt PIM keeps it private until end_attempt().
+        """
+        if self.config.memory_semantics != "predicted_effect_trace":
+            raise ValueError("predicted effects require an explicitly versioned trace")
+        if not self.pim.config.cross_attempt_only:
+            raise ValueError("predicted traces require attempt-private PIM until commit")
+        self._append_effect(phase, predicted_effect, metadata=metadata)
+
+    def _append_effect(self, phase_at_window_start: Tensor, effect_post: Tensor,
+                       *, metadata: dict[str, object] | None = None) -> None:
         if self.pim.task_cluster is None:
             raise RuntimeError("reset_episode() is required before observing effects")
         if phase_at_window_start.ndim == 2 and phase_at_window_start.shape[0] == 1:
@@ -256,7 +279,7 @@ class CausalMemoryLifecycle:
             effect=effect_post.detach(),
             attempt_id=self._attempt_id,
             transition_index=effect_index * self.config.effect_window_transitions,
-            metadata={**dict(metadata or {}), "effect_index": effect_index},
+            metadata={**dict(metadata or {}), "effect_index": effect_index, "memory_semantics": self.config.memory_semantics},
         )
         self.bit.append(effect_post, effect_index)
         self._effect_index += 1

@@ -1,10 +1,12 @@
 # Zeva-Ego 独立 prefix 与 cross-attempt PIM：实现、训练与 RoboTwin 评测
 
+> **历史版本指南（`latest_completed`）。** 本文记录上一版独立prefix实现，保留用于复现；文中的“新模型”/`new_*`指当时的三token模型。当前 `current_prediction` CTE、Ego prior、训练流程和连续slot评测见[新指南](zeva_ego_training_evaluation.md)。下方历史评测命令显式指定旧task与旧RNG规则，避免误用当前CLI默认值。
+
 本次更新把此前相加在一个 behavior slot 中的 global/PIM 改为独立的 global、effect、PIM 三个 prefix token，配置名为 `prefix_layout=zeva_ego`。跨尝试历史仍由 `pim_variant=cross_attempt` 读出，并同时影响 prefix 与 action prior。是否改善后续尝试，需要用重新训练的权重做配对 RoboTwin 评测；gate 大小和单元测试结果都不能替代成功率。
 
 参考版本固定为 [Zeva `feature/zeva_ego` / `bae85ad753d3afe4f2e56762373d48ac0267e101`](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101)。重点参考其 [`ZevaEffectActionPrior`](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/src/openpi/zeva/cte_eap.py)、[`ZevaPIMEAP`](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/src/openpi/zeva/pim_policy.py)、[跨尝试训练器](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/train_cross_attempt_pim.py) 和 [RoboTwin 评测协议](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/README_EVALUATION.md)。
 
-这里对齐的是独立 token 布局、PIM 读取和冻结父模型的训练思路。FastWAM 继续使用各自有独立参数的 video/action experts 及其 MoT mixed attention，保持 joint14、动作预测长度 32、三相机 384 × 320；没有改成 Zeva 的 pi0.5 policy。effect 的来源也不同，见下文。因此这是一项有明确边界的适配，不能视作两种模型的完整等价实现。
+这里对齐的是独立 token 布局与 PIM 读取。本文历史实现全程冻结父模型；参考 Zeva-Ego 则在500步 PIM-only warmup 后更新 foundation、EAP 和 PIM，两者的训练策略不同。FastWAM 继续使用各自有独立参数的 video/action experts 及其 MoT mixed attention，保持 joint14、动作预测长度32、三相机384×320。effect 来源也不同，见下文；完整的预测版与训练适配见新指南。
 
 ## 1. 本次具体改动
 
@@ -238,18 +240,22 @@ python scripts/eval_zeva_robotwin_manifest.py \
   --cte-checkpoint "$CTE_CKPT" \
   --old-addon-checkpoint "$OLD_ADDON" \
   --new-addon-checkpoint "$NEW_ADDON" \
+  --old-task-config robotwin_zeva_fastwam_pim_3cam_384 \
+  --new-task-config robotwin_zeva_fastwam_cross_attempt_3cam_384 \
   --old-prefix-layout legacy_merged \
-  --new-prefix-layout zeva_ego --effect-source latest_completed \
+  --new-prefix-layout zeva_ego \
+  --old-effect-source latest_completed --new-effect-source latest_completed \
   --task-context-bank "$BEHAVIOR_BANK" \
   --task-context-retrieval-checkpoint "$RETRIEVAL_HEAD" \
   --conditions base old new_off new_on \
+  --model-rng-protocol request_seed_stream_v1 --slots 1 \
   --model-seed 0 --gpu-id 0 --num-inference-steps 10 \
   --output-dir ./evaluate_results/cross_attempt_seed0
 ```
 
-上例 `old` 默认使用原 top-4 task。如果旧模型来自此前的 `cross_attempt_v1` 合并布局，还要传入 `--old-task-config robotwin_zeva_fastwam_cross_attempt_3cam_384`，保留 `--old-prefix-layout legacy_merged`。runner 会按相应 reader 配置解析 PIM 容量，避免将旧 cross-attempt 权重错误地配成 top-4。直接通过 Hydra 运行旧 cross-attempt 配置时也必须添加 `model.zeva.adapter.prefix_layout=legacy_merged`。
+上例**显式**将 `old` 设为原top-4 task。当前runner默认的old已经是上一版cross-attempt三token模型，new默认是新的预测CTE模型，因此复现本节时不能省略上面的task/source/RNG参数。如果要比较此前的 `cross_attempt_v1` 合并布局，将上例old task改为 `robotwin_zeva_fastwam_cross_attempt_3cam_384`，保留 `--old-prefix-layout legacy_merged`。runner按配置解析reader容量；通过Hydra运行合并布局也必须添加 `model.zeva.adapter.prefix_layout=legacy_merged`。
 
-先加 `--dry-run` 可以在 CPU 上验证 manifest、解析各 condition 的 reader 容量/layout/effect 合同，写出冻结的 `manifest.json` 与 `command_plan.json`。dry-run 明确跳过权重文件存在性、模型加载和仿真检查；它不是 rollout 成功。全四组产生 40 个 task/condition 子进程计划，最多执行 3200 次尝试，实际数量因成功即停而减少。
+先加 `--dry-run` 可以在 CPU 上验证 manifest、解析各 condition 的 reader 容量/layout/effect 合同，写出冻结的 `manifest.json` 与 `command_plan.json`。dry-run 明确跳过权重文件存在性、模型加载和仿真检查；它不是 rollout 成功。dry-run使用的目录也不能再用于正式运行，必须另取新目录。全四组产生 40 个 task/condition 子进程计划，最多执行 3200 次尝试，实际数量因成功即停而减少。
 
 用 `--tasks task_a task_b` 可生成独立 hash 的开发子集；不能把子集结果当作完整 200 episode 报告。正式结果每个 model seed 使用新的输出目录，不在已有 JSONL 后盲目续写。
 
@@ -260,6 +266,7 @@ python scripts/eval_zeva_robotwin_manifest.py \
 ```bash
 python scripts/eval_zeva_robotwin_fixed_attempts.py \
   --task click_alarmclock --seed 0 --model-seed 0 --max-attempts 4 \
+  --model-rng-protocol request_seed_stream_v1 \
   --sim-task robotwin_zeva_fastwam_cross_attempt_3cam_384 \
   --prefix-layout zeva_ego --effect-source latest_completed \
   --ckpt "$BASE_CKPT" --dataset-stats "$STATS" \
@@ -273,9 +280,9 @@ python scripts/eval_zeva_robotwin_fixed_attempts.py \
 
 ### 噪声、终止帧与视频
 
-每个 task/condition 进程只加载一次模型，持有独立的 request seed stream。每次重新规划取一个新模型 seed，重建环境时不重置这个流。所有 condition 都使用相同规则，避免 memory-off 由于反复使用同一噪声而缺乏重试多样性。
+本节显式选择的**旧协议 `request_seed_stream_v1`**中，每个task/condition进程只加载一次模型并创建独立request-seed流。每次重规划取一个新seed，场景重建不重置流，但下一个task重新创建流；`--slots 1`保留原来的按task排序执行。它不是目前默认的 `torch_continuous_slot_v1`。旧completed-effect CTE依然要求每步观测。
 
-该实现与 Zeva 的八个 slot、每 slot 连续 Torch RNG 不是完全相同的数值协议。on/off 初始 model seed 相同，但成功时间与规划次数改变后，后续随机请求可能错位。因此正式结论建议至少重复 model seed 0、1、2；单次 run 的 bootstrap 区间只反映固定任务集内的 episode 不确定性。
+该旧协议与Zeva的八个连续Torch RNG slot不同。当前默认的新连续CPU协议及其与参考CUDA实现的数值边界见[新指南](zeva_ego_training_evaluation.md#7-robotwin-pim-evaluation)。两种协议都可能因不同条件的成功时间/规划次数而使后续随机请求错位。历史实验需要多seed时应预先确定seed集合，并分别使用全新输出目录；单次run的bootstrap区间只反映固定任务集内的episode不确定性。
 
 开发阶段加 `--pim-diagnostic-interval 5`，每五次规划额外计算一次同噪声 memory-off，记录前 24 个实际执行动作的差异。它重算关闭 PIM 的 prior，并且不消耗主请求 seed stream。额外推理会增加耗时，正式速度比较保持相同设置或关闭该诊断。
 
@@ -292,6 +299,8 @@ python scripts/report_zeva_robotwin_multiattempt.py \
 ```
 
 runner 自动生成每组 `.summary.json` 与 `paired_pim.summary.json`。分母始终是 manifest 的 episode 数量；reporter 拒绝丢失/重复 episode、乱序尝试、成功后继续、运行异常、身份错配或动作预算变化。输出包括 micro/macro/per-task SR@1–4、首败后恢复率、尝试数、执行步数、耗时及 `new_on − new_off` 的 task 内 episode 配对 bootstrap 区间。
+
+当前reporter还输出 `{attempt, solved, total, rate}` 累计点。保存到run目录的manifest包含运行protocol，hash与输入的源manifest不同；若传入reporter的 `--expected-manifest-sha256`，应使用 `command_plan.json` 中的 `manifest_sha256`。对没有新protocol字段的历史日志，`protocol_audit.status` 会明确标为 `not_recorded_legacy_manifest`，不会补造当时未记录的reset/RNG证据。
 
 正式 runner 强制保存每次尝试的视频，只有所有条件的数据、报告和视频审计通过才写入 `COMPLETE`。视频审计检查路径唯一、文件存在且非空，不验证视频内容或编码。独立 reporter 默认执行同样审计；只有显式使用 `--metadata-only` 才跳过，并把结果标记为 `METADATA_ONLY`。没有耗尽步数预算却标记为 timeout 的记录也会被拒绝。
 

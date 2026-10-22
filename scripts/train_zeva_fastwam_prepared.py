@@ -35,7 +35,9 @@ from fastwam.zeva.prepared_stage2 import (
 )
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.static_task_context import task_context_identity
-from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMAT, HISTORY_KINDS
+from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT, HISTORY_KINDS
+from fastwam.zeva.ego_boundary_cache import EgoBoundaryCache
+from fastwam.zeva.ego_cte_training import require_ego_checkpoint_ready
 
 
 def _require_file(value, name: str) -> Path:
@@ -135,6 +137,7 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("Stage-2 requires action_video_freq_ratio=4")
 
     zeva = cfg.model.zeva
+    predictive = str(zeva.adapter.get("effect_source", "latest_completed")) == "current_prediction"
     cross_attempt = str(zeva.prompt.get("pim_variant", "legacy")) == "cross_attempt"
     if cross_attempt != (str(zeva.adapter.get("pim_variant", "legacy")) == "cross_attempt"):
         raise ValueError("prompt and adapter PIM variants must agree")
@@ -146,8 +149,17 @@ def main(cfg: DictConfig) -> None:
     retrieval_mode = "cross_attempt" if cross_attempt else "phase"
     if str(zeva.memory.pim_retrieval_mode) != retrieval_mode:
         raise ValueError(f"prepared Stage-2 variant requires pim_retrieval_mode={retrieval_mode}")
-    if cross_attempt and training_stage != "pim_adapter":
+    if cross_attempt and training_stage != "pim_adapter" and not predictive:
         raise ValueError("cross-attempt variant is initialized from an existing Stage2A parent")
+    if predictive:
+        if len(cfg.data.train.dataset_dirs) != 1:
+            raise ValueError("predictive RoboTwin pipeline currently requires one dataset root")
+        if not cross_attempt or str(zeva.adapter.get("prior_variant")) != "zeva_ego":
+            raise ValueError("predictive Stage2 requires the Zeva-Ego prior and cross-attempt reader")
+        if str(zeva.memory.get("memory_semantics")) != "predicted_effect_trace":
+            raise ValueError("predictive Stage2 requires predicted_effect_trace memory")
+        if training_stage == "pim_adapter" and str(zeva.get("training_recipe")) != "ego_adapter_warmup":
+            raise ValueError("predictive Stage2B requires the explicit ego_adapter_warmup recipe")
 
     base_ckpt = _require_file(cfg.get("ckpt"), "ckpt")
     cte_ckpt = _require_file(zeva.cte.checkpoint, "model.zeva.cte.checkpoint")
@@ -189,12 +201,29 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("BIT size must match prompt brief_length")
 
     cte_payload = torch.load(cte_ckpt, map_location="cpu", weights_only=False)
-    cte_identity = cte_payload.get("semantic_task_identity") or {}
-    if str(cte_identity.get("sha256")) != semantic_sha:
-        raise ValueError("Stage-2 semantic map differs from CTE checkpoint")
     video_size = [int(v) for v in cfg.data.train.video_size]
-    if list(cte_payload.get("cte_vae_input_size", ())) != video_size:
-        raise ValueError("Stage-2 video size differs from CTE VAE input size")
+    boundary = None
+    if predictive:
+        require_ego_checkpoint_ready(cte_payload)
+        if cte_payload["semantic_task_map_sha256"] != semantic_sha or cte_payload["dataset_stats_sha256"] != stats_sha:
+            raise ValueError("predictive CTE semantic-task map or joint normalization mismatch")
+        boundary = EgoBoundaryCache(phase_root)
+        for key, expected in (("cte_checkpoint_sha256", cte_sha), ("dataset_stats_sha256", stats_sha),
+                              ("semantic_task_map_sha256", semantic_sha),
+                              ("phase_dim", int(zeva.prompt.phase_dim)), ("effect_dim", int(zeva.prompt.effect_dim)),
+                              ("dataset_path", str(Path(cfg.data.train.dataset_dirs[0]).expanduser().resolve()))):
+            if getattr(boundary.manifest, key) != expected:
+                raise ValueError(f"predictive boundary cache identity mismatch: {key}")
+        if boundary.splits != cte_payload["episode_splits"]:
+            raise ValueError("boundary cache must reuse the CTE episode train/validation split")
+        if float(cfg.data.train.get("val_set_proportion", -1)) != 0:
+            raise ValueError("explicit predictive episode splits require data.train.val_set_proportion=0")
+    else:
+        cte_identity = cte_payload.get("semantic_task_identity") or {}
+        if str(cte_identity.get("sha256")) != semantic_sha:
+            raise ValueError("Stage-2 semantic map differs from CTE checkpoint")
+        if list(cte_payload.get("cte_vae_input_size", ())) != video_size:
+            raise ValueError("Stage-2 video size differs from CTE VAE input size")
     if tuple(cte_payload.get("camera_keys", ())) != ("cam_high", "cam_left_wrist", "cam_right_wrist"):
         raise ValueError("Stage-2 camera order differs from CTE checkpoint")
 
@@ -208,7 +237,7 @@ def main(cfg: DictConfig) -> None:
             "bit_size": bit_size,
             "cte_checkpoint_sha256": cte_sha,
             "dataset_stats_sha256": stats_sha,
-            "dataset_path": str(cfg.data.train.dataset_dirs[0]),
+            "dataset_path": str(Path(cfg.data.train.dataset_dirs[0]).expanduser().resolve()) if predictive else str(cfg.data.train.dataset_dirs[0]),
             "semantic_task_map_sha256": semantic_sha,
             "phase_cache_manifest_sha256": sha256_file(phase_manifest_path),
             "phase_cache_index_sha256": sha256_file(phase_index_path),
@@ -218,14 +247,19 @@ def main(cfg: DictConfig) -> None:
         if not bool(zeva.memory.get("cross_attempt_only", False)) or int(zeva.memory.pim_max_entries) != top_k:
             raise ValueError("cross-attempt training/serving memory capacity must agree")
         pim_expected.update({
-            "format": CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
+            "format": EGO_CROSS_ATTEMPT_CACHE_FORMAT if predictive else CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
             "source_subset": "train-only", "split": "train",
             "max_past_attempts": int(zeva.memory.max_past_attempts),
             "max_entries_per_attempt": int(zeva.memory.max_entries_per_attempt),
             "history_source_semantics": "other_train_episode",
             "candidate_semantics": "complete_episode_uniform",
         })
+        if predictive:
+            pim_expected.update({"memory_semantics": "predicted_effect_trace", "effect_source": "current_prediction",
+                                 "executed_horizon": 24})
     pim = PreparedPIMCache(pim_root, expected=pim_expected)
+    if predictive and pim._cross_attempt.splits != boundary.splits:
+        raise ValueError("prepared PIM cache must use the exact CTE/boundary episode split")
     static_context = StaticEpisodeContextCache(static_path)
     validate_static_artifact_hashes(
         static_context,
@@ -241,6 +275,12 @@ def main(cfg: DictConfig) -> None:
         "video_size": video_size,
         "context_len": int(cfg.model.tokenizer_max_len),
     }
+    if predictive:
+        static_expected.update({
+            "memory_semantics": "predicted_effect_trace",
+            "phase_cache_manifest_sha256": sha256_file(phase_manifest_path),
+            "episode_splits_sha256": sha256_file(phase_root / "episode_splits.json"),
+        })
     for key, expected in static_expected.items():
         if static_context.metadata.get(key) != expected:
             raise ValueError(
@@ -257,7 +297,8 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("Stage-2 dataset did not load semantic_task_map_path")
     if str(base.semantic_task_identity.get("sha256")) != semantic_sha:
         raise ValueError("Stage-2 dataset semantic identity mismatch")
-    dataset = PreparedZevaStage2Dataset(base, pim, static_context)
+    history_schedule = "ego_optimizer_step" if predictive and training_stage == "pim_adapter" else "legacy"
+    dataset = PreparedZevaStage2Dataset(base, pim, static_context, history_schedule=history_schedule)
     validation_dataset = None
     validation_path = zeva.prepared_stage2.get("validation_pim_cache_path")
     if validation_path not in (None, "", "None", "null"):
@@ -272,7 +313,12 @@ def main(cfg: DictConfig) -> None:
                 raise ValueError(f"train and validation history conditions differ: {key}")
         if set(pim.episode_ids) & set(validation_pim.episode_ids):
             raise ValueError("train and validation prepared episodes overlap")
-        validation_dataset = PreparedZevaStage2Dataset(base, validation_pim, static_context)
+        validation_dataset = PreparedZevaStage2Dataset(base, validation_pim, static_context, history_schedule=history_schedule)
+        if predictive and history_schedule == "ego_optimizer_step":
+            if not set(pim.manifest["globally_available_history_kinds"]).issubset(validation_pim.manifest["globally_available_history_kinds"]):
+                raise ValueError("validation queries lack a training history condition; rebuild condition pairings")
+    elif predictive:
+        raise ValueError("predictive Stage2 requires an independent prepared validation cache")
 
     dropout = None
     if training_stage == "pim_adapter":
@@ -280,9 +326,11 @@ def main(cfg: DictConfig) -> None:
         if cross_attempt:
             if dropout.context_dropout != 0.0 or dropout.support_dropout != 0.0:
                 raise ValueError("cross-attempt cache owns history sampling; disable stacked prompt/context/support dropout")
-            if pim.manifest["history_weights"].get("empty", 0.0) != 0.0:
+            if not predictive and pim.manifest["history_weights"].get("empty", 0.0) != 0.0:
                 raise ValueError("frozen-parent training requires nonempty histories")
-            if int(os.environ.get("RANK", "0")) == 0:
+            if predictive:
+                print("History curriculum: optimizer-step 5:2:1, then 5:2:1:2; available modes:", pim.manifest["globally_available_history_kinds"])
+            elif int(os.environ.get("RANK", "0")) == 0:
                 _print_cross_attempt_probe(pim, seed=int(cfg.seed))
             dropout = None
         elif dropout.context_dropout <= 0.0 and dropout.support_dropout <= 0.0:
