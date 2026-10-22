@@ -27,6 +27,14 @@ from .task_context import TaskContextBank
 EGO_QUERY_READOUT_FORMAT = "zeva_ego_initial_query_readouts_v1"
 
 
+def _train_query_exclusion_semantics(mode: str) -> str:
+    if mode == "none":
+        return "none"
+    if mode == "leave_one_episode_out":
+        return "leave_one_episode_out_in_task_mean_and_candidates"
+    raise ValueError("task_context.train_query_exclusion must be none or leave_one_episode_out")
+
+
 def episode_task_instructions(base, cache) -> dict[str, str]:
     """Read raw task text from metadata only, without image/action access.
 
@@ -188,10 +196,17 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
                                            encoder_path: str | Path, head_path: str | Path,
                                            output_path: str | Path, expected_metadata: dict[str, Any],
                                            top_k: int = 5, device: str | torch.device = "cpu",
-                                           batch_size: int = 512) -> dict[str, Any]:
-    """Classify language, then aggregate that task's train demos without GT scope."""
+                                           batch_size: int = 512,
+                                           train_query_exclusion: str = "leave_one_episode_out") -> dict[str, Any]:
+    """Classify language, then aggregate that task's train demos without GT scope.
+
+    New predictive presets pass ``none`` to match Zeva-Ego's fixed task-scoped
+    train memory. The historical API default keeps existing LOO callers honest;
+    the choice is recorded and checked independently of train/validation split.
+    """
     from .task_language import TaskLanguageMemory, task_language_identity
 
+    exclusion_semantics = _train_query_exclusion_semantics(train_query_exclusion)
     inputs = tuple(Path(path).expanduser().resolve() for path in (bank_path, feature_path, encoder_path, head_path))
     output_path = Path(output_path).expanduser().resolve()
     if output_path in inputs or output_path.exists() or batch_size < 1:
@@ -212,7 +227,8 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
     with torch.no_grad():
         for start in range(0, len(ids), batch_size):
             stop = min(start + batch_size, len(ids))
-            exclusions = [identity if identity in train_ids else None for identity in ids[start:stop]]
+            exclusions = ([identity if identity in train_ids else None for identity in ids[start:stop]]
+                          if train_query_exclusion == "leave_one_episode_out" else None)
             result = memory.retrieve(query["features"][start:stop].to(device), exclude_episode_ids=exclusions)
             contexts.append(result.values.float().cpu())
             indices.append(result.indices.cpu())
@@ -225,7 +241,7 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
         "language_encoder_sha256": identity["language_encoder_sha256"],
         "language_feature_cache_sha256": checkpoint_sha256(feature_path), "top_k": top_k, "temperature": 1.0,
         "query_scope": "train_and_validation_task_language_only", "task_context_identity": identity,
-        "train_query_exclusion": "leave_one_episode_out_in_task_mean_and_candidates",
+        "train_query_exclusion": exclusion_semantics,
         "validation_query_sources": "train_only", "scope_selection": "predicted_task_only",
     }
     payload = {"format": STATIC_CONTEXT_FORMAT, "episode_ids": ids, "task_contexts": torch.cat(contexts),
@@ -243,13 +259,15 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
         temporary.unlink(missing_ok=True)
     return {"episodes": len(ids), "train_queries": len(train_ids),
             "validation_queries": len(cache.splits["validation"]), "top_k": top_k,
+            "train_query_exclusion": train_query_exclusion,
             "static_cache_sha256": checkpoint_sha256(output_path)}
 
 
 def validate_ego_task_language_static_context(static_context: StaticEpisodeContextCache, *, cache,
                                                bank_path: str | Path, feature_path: str | Path,
                                                encoder_path: str | Path, head_path: str | Path,
-                                               expected_metadata: dict[str, Any], top_k: int = 5) -> dict[str, Any]:
+                                               expected_metadata: dict[str, Any], top_k: int = 5,
+                                               train_query_exclusion: str = "leave_one_episode_out") -> dict[str, Any]:
     """Validate immutable query artifacts independently of a trainable foundation."""
     from .task_language import TASK_LANGUAGE_FEATURE_KIND, task_language_identity
 
@@ -263,7 +281,7 @@ def validate_ego_task_language_static_context(static_context: StaticEpisodeConte
         "language_feature_cache_sha256": checkpoint_sha256(feature_path), "top_k": top_k, "temperature": 1.0,
         "readout_kind": TASK_LANGUAGE_FEATURE_KIND, "query_mode": "task_language",
         "foundation_independent_query": True, "scope_selection": "predicted_task_only",
-        "train_query_exclusion": "leave_one_episode_out_in_task_mean_and_candidates",
+        "train_query_exclusion": _train_query_exclusion_semantics(train_query_exclusion),
         "validation_query_sources": "train_only",
         "task_context_identity": identity,
     }

@@ -18,6 +18,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
+
+from fastwam.zeva_memory_contract import pim_memory_contract, validate_checkpoint_pim_memory_contract
 
 from experiments.robotwin.multiattempt import (
     CONTINUOUS_NOISE_PROTOCOL, EVALUATION_PROTOCOL_SCHEMA, FROZEN_MANIFEST_SHA256,
@@ -30,7 +33,8 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
                      task_context_mode: str | None = None,
                      foundation_mode: str | None = None,
                      policy_text_encoder_device: str = "cpu",
-                     policy_text_cache_size: int = 16) -> dict:
+                     policy_text_cache_size: int = 16,
+                     pim_compression: str | None = None) -> dict:
     """Resolve reader capacity without importing or instantiating the policy."""
     from hydra import compose, initialize_config_dir
 
@@ -41,6 +45,8 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
             f"model.zeva.adapter.effect_source={effect_source}",
             *([] if task_context_mode is None else [f"model.zeva.task_context.mode={task_context_mode}"]),
             *([] if foundation_mode is None else [f"++foundation_mode={foundation_mode}"]),
+            *([] if pim_compression is None else [f"++model.zeva.memory.compression={pim_compression}",
+                                                 "++model.zeva.memory.allow_compression_override=true"]),
         ])
     zeva = cfg.model.zeva
     top_k = int(zeva.memory.pim_top_k)
@@ -52,7 +58,7 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
     semantics = str(zeva.memory.get("memory_semantics", "completed_effect_trace"))
     prior = str(zeva.adapter.get("prior_variant", "legacy_bit"))
     recipe = str(zeva.get("training_recipe", "frozen_parent"))
-    resolved_foundation_mode = "joint" if recipe == "ego_joint_warmup" else "frozen"
+    resolved_foundation_mode = "joint" if recipe in {"ego_joint_parent", "ego_joint_warmup"} else "frozen"
     if foundation_mode is not None and foundation_mode != resolved_foundation_mode:
         raise ValueError("This task does not support the requested foundation_mode; select a predictive Stage2B task")
     if (bool(zeva.get("freeze_fastwam", True)) != (resolved_foundation_mode == "frozen")):
@@ -60,7 +66,7 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
     if policy_text_encoder_device not in {"cpu", "cuda"} or policy_text_cache_size < 0:
         raise ValueError("Policy text encoder requires cpu/cuda and a nonnegative cache size")
     task_context_mode = str(zeva.task_context.get("mode", "static"))
-    if recipe == "ego_joint_warmup":
+    if resolved_foundation_mode == "joint":
         if bool(zeva.get("freeze_fastwam", True)) or task_context_mode != "task_language":
             raise ValueError("joint foundation evaluation requires freeze_fastwam=false and task_language retrieval")
     if task_context_mode == "task_language" and float(zeva.task_context.get("temperature", 1.0)) != 1.0:
@@ -77,6 +83,9 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
         effect_source == "current_prediction" and not processor.get("action_state_transforms")
         and not bool(processor.get("use_stepwise_action_norm", False))
     )
+    memory_contract = pim_memory_contract(zeva.memory)
+    if pim_compression is not None and memory_contract is None:
+        raise ValueError("PIM compression ablations require cross-attempt memory")
     return {
         "prefix_layout": str(zeva.adapter.prefix_layout),
         "effect_source": str(zeva.adapter.effect_source) if prefix_layout == "zeva_ego" else None,
@@ -89,25 +98,34 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
         "task_context_mode": task_context_mode,
         "policy_text_encoder_device": policy_text_encoder_device,
         "policy_text_cache_size": policy_text_cache_size,
+        "pim_memory_contract": memory_contract,
+        "pim_compression_override": bool(zeva.memory.get("allow_compression_override", False)),
         "skip_get_obs_within_replan": boundary_observations,
     }
 
 
-def _foundation_artifact(addon_path: str, training_recipe: str) -> dict:
+def _foundation_artifact(addon_path: str, training_recipe: str, *,
+                         memory_contract: dict | None = None, allow_compression_override: bool = False) -> dict:
     """Validate a real checkpoint bundle before launching the simulator."""
     import torch
     sys.path.insert(0, str(ROOT / "src"))
     from fastwam.zeva.checkpoint import resolve_joint_foundation_checkpoint
-    from fastwam.zeva.checkpoint import checkpoint_foundation_mode
+    from fastwam.zeva.checkpoint import checkpoint_foundation_mode, checkpoint_requires_foundation
 
     payload = torch.load(addon_path, map_location="cpu", weights_only=False)
     checkpoint_foundation_mode(payload)  # Reject inconsistent explicit mode metadata.
+    saved_memory = validate_checkpoint_pim_memory_contract(payload, memory_contract,
+                                                          allow_compression_override=allow_compression_override)
     if payload.get("training_recipe", "frozen_parent") != training_recipe:
         raise ValueError("Addon training recipe differs from the selected task; use the matching joint/frozen task config")
     foundation = resolve_joint_foundation_checkpoint(addon_path, payload=payload, verify_hash=True)
+    result = {"foundation_checkpoint_required": checkpoint_requires_foundation(payload),
+              "checkpoint_pim_memory_contract": saved_memory}
+    if payload.get("foundation_contract_schema") is not None:
+        result["foundation_contract_schema"] = payload["foundation_contract_schema"]
     if foundation is None:
-        return {}
-    return {"foundation_checkpoint": str(foundation),
+        return result
+    return {**result, "foundation_checkpoint": str(foundation),
             "foundation_sha256": payload["foundation_checkpoint"]["sha256"]}
 
 
@@ -187,6 +205,10 @@ def main() -> None:
                         help="Training mode of new_on/new_off; must match the selected addon")
     parser.add_argument("--old-foundation-mode", choices=("frozen", "joint"),
                         help="Optional mode for a predictive old-condition task")
+    parser.add_argument("--new-pim-compression", choices=("uniform", "similarity_merge"),
+                        help="Explicit recorded compression-only ablation for new_on/new_off")
+    parser.add_argument("--old-pim-compression", choices=("uniform", "similarity_merge"),
+                        help="Explicit recorded compression-only ablation for old")
     parser.add_argument("--policy-text-encoder-device", choices=("cpu", "cuda"), default="cpu",
                         help="Independent policy text encoder placement shared by all conditions")
     parser.add_argument("--policy-text-cache-size", type=int, default=16,
@@ -212,6 +234,8 @@ def main() -> None:
             parser.error("Use --old/--new-prefix-layout and --old/--new-effect-source for prefix contracts")
         if key in {"foundation_mode", "model.zeva.foundation_mode", "model.zeva.training_recipe", "model.zeva.freeze_fastwam"} or key.startswith("foundation_mode_settings."):
             parser.error("Use --old/--new-foundation-mode for foundation mode contracts")
+        if key in {"model.zeva.memory.compression", "model.zeva.memory.allow_compression_override"}:
+            parser.error("Use --old/--new-pim-compression for recorded memory ablations")
         if key in {f"model.zeva.task_context.{field}" for field in ("mode", "bank_path", "retrieval_checkpoint", "language_encoder_path", "top_k")}:
             parser.error("Use explicit task-context / task-language CLI options for retrieval artifacts")
     required = ["checkpoint", "dataset_stats"]
@@ -241,6 +265,7 @@ def main() -> None:
                 foundation_mode=(None if condition == "base" else getattr(args, f"{family}_foundation_mode")),
                 policy_text_encoder_device=args.policy_text_encoder_device,
                 policy_text_cache_size=args.policy_text_cache_size,
+                pim_compression=(None if condition == "base" else getattr(args, f"{family}_pim_compression")),
             )
             if condition == "base":
                 contracts[condition]["skip_get_obs_within_replan"] = True
@@ -248,6 +273,9 @@ def main() -> None:
                 # even if old_task_config is the joint-default Stage2B task.
                 contracts[condition]["training_recipe"] = "frozen_parent"
                 contracts[condition]["foundation_mode"] = "frozen"
+                contracts[condition]["foundation_checkpoint_required"] = False
+                contracts[condition]["pim_memory_contract"] = None
+                contracts[condition]["pim_compression_override"] = False
         except ValueError as exc:
             parser.error(f"Invalid {condition} policy configuration: {exc}")
     condition_assets = {}
@@ -274,12 +302,14 @@ def main() -> None:
             assets[name] = str(path)
         if not args.dry_run:
             try:
-                bundle = _foundation_artifact(getattr(args, f"{family}_addon_checkpoint"), contracts[condition]["training_recipe"])
+                bundle = _foundation_artifact(getattr(args, f"{family}_addon_checkpoint"), contracts[condition]["training_recipe"],
+                    memory_contract=contracts[condition]["pim_memory_contract"],
+                    allow_compression_override=contracts[condition]["pim_compression_override"])
             except (ValueError, FileNotFoundError) as exc:
                 parser.error(f"Invalid {condition} checkpoint bundle: {exc}")
             assets.update(bundle)
-            if bundle:
-                contracts[condition]["foundation_sha256"] = bundle["foundation_sha256"]
+            contracts[condition].update({key: value for key, value in bundle.items()
+                                         if key != "foundation_checkpoint"})
         condition_assets[condition] = assets
     expected_sha = args.expected_manifest_sha256
     if Path(args.manifest).expanduser().resolve() == (ROOT / "configs/robotwin_cross_attempt_10x20.json").resolve():
@@ -381,6 +411,10 @@ def main() -> None:
                 selected_mode = getattr(args, "new_foundation_mode" if new else "old_foundation_mode")
                 if selected_mode is not None:
                     command.append(setting("++foundation_mode", selected_mode))
+                selected_compression = getattr(args, "new_pim_compression" if new else "old_pim_compression")
+                if selected_compression is not None:
+                    command.append(setting("++model.zeva.memory.compression", selected_compression))
+                    command.append(setting("++model.zeva.memory.allow_compression_override", True))
                 command.extend([
                     setting("EVALUATION.cte_checkpoint", assets["cte_checkpoint"]),
                     setting("EVALUATION.addon_checkpoint", addon),

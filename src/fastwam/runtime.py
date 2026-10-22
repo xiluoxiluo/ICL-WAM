@@ -49,9 +49,9 @@ def _validate_zeva_foundation_config(zeva: dict) -> None:
     error rather than a silently different experiment.
     """
     recipe = str(zeva.get("training_recipe", "frozen_parent"))
-    if recipe not in {"frozen_parent", "ego_adapter_warmup", "ego_joint_warmup"}:
+    if recipe not in {"frozen_parent", "ego_joint_parent", "ego_adapter_warmup", "ego_joint_warmup"}:
         raise ValueError("unsupported Zeva training_recipe")
-    expected_mode = "joint" if recipe == "ego_joint_warmup" else "frozen"
+    expected_mode = "joint" if recipe in {"ego_joint_parent", "ego_joint_warmup"} else "frozen"
     mode = str(zeva.get("foundation_mode", expected_mode))
     if mode not in {"frozen", "joint"}:
         raise ValueError("zeva.foundation_mode must be 'frozen' or 'joint'")
@@ -61,10 +61,11 @@ def _validate_zeva_foundation_config(zeva: dict) -> None:
     if not isinstance(freeze, bool) or freeze != (mode == "frozen"):
         raise ValueError("zeva.freeze_fastwam must agree with foundation_mode/training_recipe")
     if mode == "joint":
-        if zeva.get("training_stage", "policy_injection") != "pim_adapter":
-            raise ValueError("joint foundation updates require predictive Stage2B")
+        expected_stage = "policy_injection" if recipe == "ego_joint_parent" else "pim_adapter"
+        if zeva.get("training_stage", "policy_injection") != expected_stage:
+            raise ValueError("joint foundation recipe and training_stage disagree")
         if zeva.get("task_context", {}).get("mode", "static") != "task_language":
-            raise ValueError("ego_joint_warmup requires frozen task_language retrieval independent of the changing foundation")
+            raise ValueError("joint foundation training requires frozen task_language retrieval independent of the changing foundation")
 
 
 def create_wan22_model(
@@ -251,6 +252,9 @@ def create_fastwam(
         model.zeva_task_context_mode = str(
             zeva.get("task_context", {}).get("mode", "static")
         )
+        from .zeva_memory_contract import pim_memory_contract
+        model.zeva_pim_memory_contract = pim_memory_contract(zeva.get("memory", {}))
+        model.zeva_allow_pim_compression_override = bool(zeva.get("memory", {}).get("allow_compression_override", False))
         training_stage = str(zeva.get("training_stage", "policy_injection"))
         if training_stage not in {"policy_injection", "pim_adapter"}:
             raise ValueError(
@@ -258,6 +262,10 @@ def create_fastwam(
             )
         model.set_zeva_training_stage(training_stage)
         model.zeva_training_recipe = str(zeva.get("training_recipe", "frozen_parent"))
+        if model.zeva_training_recipe == "ego_joint_parent" and (
+                training_stage != "policy_injection" or prompt_variant != "cross_attempt"
+                or getattr(policy_adapter.config, "effect_source", None) != "current_prediction"):
+            raise ValueError("ego_joint_parent requires predictive Stage2A")
         if model.zeva_training_recipe in {"ego_adapter_warmup", "ego_joint_warmup"}:
             if (training_stage != "pim_adapter" or prompt_variant != "cross_attempt"
                     or getattr(policy_adapter.config, "effect_source", None) != "current_prediction"):

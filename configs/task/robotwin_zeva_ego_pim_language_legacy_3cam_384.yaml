@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - robotwin_zeva_ego_pim_3cam_384
+  - _self_
+
+# Evaluation compatibility for the b8b6e84 task-language checkpoint family.
+# This is not the older image+text/static retrieval task. Choose the original
+# foundation_mode explicitly; retain the matching checkpoint and artifacts.
+# Exact historical training/resume should use its original code/config.
+model:
+  zeva:
+    memory:
+      compression: uniform
+      uniform_indexing: legacy_floor
+    prompt:
+      initialization: legacy_xavier
+    adapter:
+      initialization: legacy_xavier
+    task_context:
+      train_query_exclusion: leave_one_episode_out
+    prepared_stage2:
+      history_pairing: legacy_candidates
+      allow_reduced_curriculum: true

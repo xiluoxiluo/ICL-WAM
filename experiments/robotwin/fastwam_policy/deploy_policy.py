@@ -41,6 +41,7 @@ from fastwam.zeva import (
 )
 from fastwam.zeva.attempt_protocol import ModelSeedStream, ContinuousModelNoiseStream, CONTINUOUS_NOISE_PROTOCOL
 from fastwam.zeva.ego_episode_data import prepare_ego_rgb_views
+from fastwam.zeva_memory_contract import pim_memory_contract, validate_checkpoint_pim_memory_contract
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.static_task_context import (
     StaticTaskContextRetriever, StaticTaskContextSession, task_context_identity,
@@ -395,6 +396,9 @@ class WorldActionRobotWinPolicy:
             # identity to those deployed weights, not that unused recipe.
             "training_recipe": ("frozen_parent" if requested_zeva_mode == "base"
                                 else str(getattr(self.model, "zeva_training_recipe", "frozen_parent"))),
+            "foundation_checkpoint_required": False,
+            "pim_memory_contract": pim_memory_contract(zeva_memory_cfg) if requested_zeva_mode != "base" else None,
+            "pim_compression_override": bool(zeva_memory_cfg.get("allow_compression_override", False)) if requested_zeva_mode != "base" else False,
             **_prefix_metadata(self.model),
         }
         self.cte = None
@@ -565,6 +569,13 @@ class WorldActionRobotWinPolicy:
                     cte_checkpoint_sha256=checkpoint_sha256(cte_checkpoint),
                 )
                 self.checkpoint_identity["training_recipe"] = addon_payload.get("training_recipe", "frozen_parent")
+                from fastwam.zeva.checkpoint import checkpoint_requires_foundation
+                self.checkpoint_identity["foundation_checkpoint_required"] = checkpoint_requires_foundation(addon_payload)
+                self.checkpoint_identity["foundation_contract_schema"] = addon_payload.get("foundation_contract_schema")
+                self.checkpoint_identity["checkpoint_pim_memory_contract"] = validate_checkpoint_pim_memory_contract(
+                    addon_payload, self.checkpoint_identity["pim_memory_contract"],
+                    allow_compression_override=self.checkpoint_identity["pim_compression_override"],
+                )
                 if addon_payload.get("foundation_checkpoint") is not None:
                     self.checkpoint_identity["foundation_sha256"] = addon_payload["foundation_checkpoint"]["sha256"]
             pim = PersistentInteractionMemory(
@@ -579,6 +590,8 @@ class WorldActionRobotWinPolicy:
                     cross_attempt_only=bool(zeva_memory_cfg.get("cross_attempt_only", False)),
                     max_past_attempts=int(zeva_memory_cfg.get("max_past_attempts", 3)),
                     max_entries_per_attempt=int(zeva_memory_cfg.get("max_entries_per_attempt", 64)),
+                    compression=str(zeva_memory_cfg.get("compression", "uniform")),
+                    uniform_indexing=str(zeva_memory_cfg.get("uniform_indexing", "legacy_floor")),
                 )
             )
             self.lifecycle = CausalMemoryLifecycle(
@@ -1090,7 +1103,11 @@ class WorldActionRobotWinPolicy:
             "memory_semantics": "predicted_effect_trace" if getattr(self, "_ego_cte", False) else "completed_effect_trace",
             "checkpoint_identity": self.checkpoint_identity,
             "training_recipe": self.checkpoint_identity.get("training_recipe", "frozen_parent"),
-            "foundation_mode": ("joint" if self.checkpoint_identity.get("training_recipe") == "ego_joint_warmup" else "frozen"),
+            "foundation_mode": ("joint" if self.checkpoint_identity.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup"} else "frozen"),
+            "foundation_checkpoint_required": self.checkpoint_identity.get("foundation_checkpoint_required", False),
+            "foundation_contract_schema": self.checkpoint_identity.get("foundation_contract_schema"),
+            "pim_memory_contract": self.checkpoint_identity.get("pim_memory_contract"),
+            "pim_compression_override": self.checkpoint_identity.get("pim_compression_override", False),
             "policy_text_encoder_device": getattr(self, "policy_text_encoder_device", None),
             "policy_text_cache_size": getattr(self, "policy_text_cache_size", None),
             "policy_text_cache": (self._policy_prompt_cache.snapshot()

@@ -38,6 +38,35 @@ def _sha256(value: Any, name: str) -> str:
     return value
 
 
+def _audit_memory_contract(contract: dict, row: dict, identity: dict) -> None:
+    """Bind the served compression policy to its training artifact and plan."""
+    from fastwam.zeva_memory_contract import (
+        validate_checkpoint_pim_memory_contract, validate_pim_memory_contract,
+    )
+
+    expected = contract["pim_memory_contract"]
+    override = contract.get("pim_compression_override", False)
+    if type(override) is not bool:
+        raise ValueError("PIM compression override must be an explicit boolean")
+    for recorded in (row, identity):
+        if recorded.get("pim_memory_contract") != expected:
+            raise ValueError("Runtime PIM memory contract differs from the frozen policy contract")
+        if recorded.get("pim_compression_override") is not override:
+            raise ValueError("Runtime PIM compression override differs from the frozen policy contract")
+    if expected is None:
+        if override:
+            raise ValueError("A compression ablation requires cross-attempt PIM")
+        return
+    validate_pim_memory_contract(expected)
+    saved = validate_pim_memory_contract(identity.get("checkpoint_pim_memory_contract"))
+    if ("checkpoint_pim_memory_contract" in contract
+            and saved != contract["checkpoint_pim_memory_contract"]):
+        raise ValueError("Loaded checkpoint PIM contract differs from the verified evaluation artifact")
+    validate_checkpoint_pim_memory_contract(
+        {"pim_memory_contract": saved}, expected, allow_compression_override=override,
+    )
+
+
 def _protocol(manifest: dict[str, Any]) -> dict[str, Any] | None:
     protocol = manifest.get("evaluation_protocol")
     if protocol is None:
@@ -229,9 +258,24 @@ def audit_protocol_trace(manifest: dict[str, Any], rows: list[dict[str, Any]]) -
             if "foundation_mode" in contract:
                 if row.get("foundation_mode") != contract["foundation_mode"]:
                     raise ValueError("Runtime foundation_mode differs from the frozen policy contract")
-                expected_mode = "joint" if contract.get("training_recipe") == "ego_joint_warmup" else "frozen"
+                expected_mode = "joint" if contract.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup"} else "frozen"
                 if contract["foundation_mode"] != expected_mode:
                     raise ValueError("Frozen foundation mode and training recipe disagree")
+            if "foundation_checkpoint_required" in contract:
+                paired = contract["foundation_checkpoint_required"]
+                if type(paired) is not bool:
+                    raise ValueError("Foundation checkpoint requirement must be an explicit boolean")
+                if (row.get("foundation_checkpoint_required") is not paired
+                        or hashes.get("foundation_checkpoint_required") is not paired):
+                    raise ValueError("Runtime foundation checkpoint requirement differs from the verified bundle")
+                if not paired and contract.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup"}:
+                    raise ValueError("A joint training recipe requires its paired foundation checkpoint")
+            if "foundation_contract_schema" in contract:
+                if any(recorded.get("foundation_contract_schema") != contract["foundation_contract_schema"]
+                       for recorded in (row, hashes)):
+                    raise ValueError("Runtime foundation contract schema differs from the verified bundle")
+            if "pim_memory_contract" in contract:
+                _audit_memory_contract(contract, row, hashes)
             if "policy_text_encoder_device" in contract:
                 for key in ("policy_text_encoder_device", "policy_text_cache_size"):
                     if row.get(key) != contract[key]:
@@ -257,11 +301,14 @@ def audit_protocol_trace(manifest: dict[str, Any], rows: list[dict[str, Any]]) -
                 for key in ("training_recipe", "task_context_mode"):
                     if key in contracts[condition] and row.get(key) != contracts[condition][key]:
                         raise ValueError(f"Runtime {key} differs from the frozen policy contract")
-                if contracts[condition].get("training_recipe") == "ego_joint_warmup":
-                    _sha256(hashes.get("foundation_sha256"), "joint foundation SHA256")
-                    if hashes.get("training_recipe") != "ego_joint_warmup":
-                        raise ValueError("Joint model identity does not declare its training recipe")
-                    frozen_foundation = contracts[condition].get("foundation_sha256")
+                needs_foundation = contract.get("foundation_checkpoint_required",
+                    contract.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup"})
+                if needs_foundation:
+                    name = "joint foundation SHA256" if contract.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup"} else "paired foundation SHA256"
+                    _sha256(hashes.get("foundation_sha256"), name)
+                    if hashes.get("training_recipe") != contract.get("training_recipe"):
+                        raise ValueError("Paired model identity does not declare its actual training recipe")
+                    frozen_foundation = contract.get("foundation_sha256")
                     if frozen_foundation is not None and hashes["foundation_sha256"] != frozen_foundation:
                         raise ValueError("Loaded foundation differs from the frozen evaluation checkpoint bundle")
                 if contracts[condition].get("task_context_mode") == "task_language":

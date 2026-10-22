@@ -96,6 +96,7 @@ class ExactZevaPolicyInjectionConfig:
     # The predictive CTE has a different policy contract. Keep old weights
     # explicit rather than silently changing their BIT-conditioned prior.
     prior_variant: str = "legacy_bit"
+    initialization: str = "legacy_xavier"
 
     def __post_init__(self) -> None:
         values = (
@@ -124,6 +125,10 @@ class ExactZevaPolicyInjectionConfig:
             raise ValueError("effect_source must be latest_completed or current_prediction")
         if self.prior_variant not in {"legacy_bit", "zeva_ego"}:
             raise ValueError("prior_variant must be legacy_bit or zeva_ego")
+        if self.initialization not in {"legacy_xavier", "zeva_ego"}:
+            raise ValueError("adapter initialization must be legacy_xavier or zeva_ego")
+        if self.initialization == "zeva_ego" and self.prior_variant != "zeva_ego":
+            raise ValueError("zeva_ego initialization requires the predictive Zeva-Ego prior")
         if self.effect_source == "current_prediction":
             if self.prefix_layout != "zeva_ego" or self.prior_variant != "zeva_ego":
                 raise ValueError("current_prediction requires zeva_ego prefix_layout and prior_variant")
@@ -356,11 +361,12 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             self.pim_gate.requires_grad_(False)
         nn.init.zeros_(self.action_prior_adapter.weight)
         nn.init.zeros_(self.action_prior_adapter.bias)
-        nn.init.xavier_uniform_(self.behavior_global_projector.weight)
-        nn.init.zeros_(self.behavior_global_projector.bias)
+        if cfg.initialization == "legacy_xavier":
+            nn.init.xavier_uniform_(self.behavior_global_projector.weight)
+            nn.init.zeros_(self.behavior_global_projector.bias)
         nn.init.xavier_uniform_(self.prefix_project.weight)
         nn.init.zeros_(self.prefix_project.bias)
-        if cfg.prefix_layout == "zeva_ego":
+        if cfg.prefix_layout == "zeva_ego" and cfg.initialization == "legacy_xavier":
             nn.init.xavier_uniform_(self.behavior_effect_projector.weight)
             nn.init.zeros_(self.behavior_effect_projector.bias)
         if cfg.pim_variant == "cross_attempt":

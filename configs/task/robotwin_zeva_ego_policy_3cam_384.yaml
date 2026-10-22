@@ -4,16 +4,28 @@ defaults:
   - override /model: zeva_ego_fastwam
   - _self_
 
-ckpt: null  # required: frozen FastWAM base
+ckpt: null  # required: original FastWAM base; joint weights are exported separately
+# Reference Stage2A jointly updates foundation + EAP. Frozen remains an
+# explicit control with the same language memory and constant EAP schedule.
+foundation_mode: joint
+foundation_mode_settings:
+  frozen:
+    training_recipe: frozen_parent
+    freeze_fastwam: true
+  joint:
+    training_recipe: ego_joint_parent
+    freeze_fastwam: false
 batch_size: 1
 num_workers: 4
-gradient_accumulation_steps: 1
-learning_rate: 1.0e-4
+gradient_accumulation_steps: 64  # batch1 x accumulation64 x 4 GPUs = reference256
+learning_rate: 5.0e-5
+zeva_foundation_learning_rate: 5.0e-6
 weight_decay: 1.0e-4
 max_grad_norm: 1.0
 max_steps: 5000
 num_epochs: 1
-lr_scheduler_type: cosine
+lr_scheduler_type: constant
+zeva_stage2a_schedule: zeva_ego  # no LR warmup/decay, including the frozen control
 log_every: 10
 save_every: 500
 eval_every: 250
@@ -29,6 +41,9 @@ data:
     video_backend: pyav
 
 model:
+  mot_checkpoint_mixed_attn: true
   zeva:
     training_stage: policy_injection
-    training_recipe: frozen_parent
+    foundation_mode: ${foundation_mode}
+    training_recipe: ${foundation_mode_settings.${foundation_mode}.training_recipe}
+    freeze_fastwam: ${foundation_mode_settings.${foundation_mode}.freeze_fastwam}

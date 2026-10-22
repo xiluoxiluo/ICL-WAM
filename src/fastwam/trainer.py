@@ -34,6 +34,17 @@ from .zeva.distributed_training import (
 logger = get_logger(__name__)
 
 
+def _zeva_stage2a_schedule(cfg, recipe: str) -> str:
+    """Historical frozen Stage2A schedules include the 5% LR warmup."""
+    default = "zeva_ego" if recipe == "ego_joint_parent" else "legacy_warmup"
+    schedule = str(cfg.get("zeva_stage2a_schedule", default))
+    if schedule not in {"zeva_ego", "legacy_warmup"}:
+        raise ValueError("zeva_stage2a_schedule must be zeva_ego or legacy_warmup")
+    if schedule == "zeva_ego" and str(cfg.get("lr_scheduler_type", "constant")) != "constant":
+        raise ValueError("zeva_ego Stage2A requires a constant learning-rate schedule")
+    return schedule
+
+
 class Wan22Trainer:
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
@@ -74,11 +85,15 @@ class Wan22Trainer:
             logger.info("Zeva training stage: %s", self.zeva_training_stage)
         self.zeva_training_recipe = str(getattr(self.model, "zeva_training_recipe", "frozen_parent"))
         self.ego_curriculum = self.zeva_training and self.zeva_training_recipe in {"ego_adapter_warmup", "ego_joint_warmup"}
-        self.joint_foundation_training = self.zeva_training and self.zeva_training_recipe == "ego_joint_warmup"
+        self.joint_foundation_training = self.zeva_training and self.zeva_training_recipe in {"ego_joint_parent", "ego_joint_warmup"}
         self.predictive_zeva = self.zeva_training and getattr(
             getattr(getattr(self.model, "zeva_behavior_prefix_adapter", None), "config", None),
             "effect_source", "latest_completed",
         ) == "current_prediction"
+        self.zeva_stage2a_schedule = (
+            _zeva_stage2a_schedule(cfg, self.zeva_training_recipe)
+            if self.predictive_zeva and self.zeva_training_stage == "policy_injection" else None
+        )
         self.zeva_optimizer_sharding = optimizer_sharding_mode(cfg.get("zeva_optimizer_sharding", "none"))
         self.optimizer_betas = optimizer_betas(cfg.get("optimizer_betas"), predictive=self.predictive_zeva)
         if self.zeva_optimizer_sharding != "none" and not self.predictive_zeva:
@@ -166,7 +181,20 @@ class Wan22Trainer:
         if self.zeva_training:
             if self.zeva_training_stage == "policy_injection":
                 trainable_params = list(self.model.zeva_trainable_parameters())
-                optimizer_params = trainable_params
+                if self.predictive_zeva:
+                    eap_params = list(self.model.zeva_behavior_prefix_adapter.policy_injection_parameters())
+                    optimizer_params = [{"params": eap_params, "lr": self.learning_rate, "name": "eap"}]
+                    if self.joint_foundation_training:
+                        foundation_lr = float(cfg.get("zeva_foundation_learning_rate", 5e-6))
+                        if not math.isfinite(foundation_lr) or foundation_lr <= 0:
+                            raise ValueError("zeva_foundation_learning_rate must be finite and positive")
+                        optimizer_params.append({"params": self.model.zeva_foundation_parameters(),
+                                                 "lr": foundation_lr, "name": "foundation"})
+                    logger.info("Predictive Stage2A: %s from the first update; effective batch=%d",
+                                "foundation+EAP" if self.joint_foundation_training else "EAP with frozen foundation",
+                                self.batch_size * self.gradient_accumulation_steps * self.accelerator.num_processes)
+                else:
+                    optimizer_params = trainable_params
             elif self.zeva_training_stage == "pim_adapter":
                 adapter = self.model.zeva_behavior_prefix_adapter
                 prompt_params = list(self.model.zeva_prompt_encoder.parameters())
@@ -254,7 +282,12 @@ class Wan22Trainer:
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
         warmup_steps = int(total_train_steps * 0.05)
-        if self.ego_curriculum:
+        if self.zeva_stage2a_schedule == "zeva_ego":
+            # Reference Stage2A has constant group LRs from the first update;
+            # only Stage2B has a PIM-only warmup. Retain explicit historical
+            # warmup configurations so existing frozen-parent state can resume.
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda=lambda step: 1.0)
+        elif self.ego_curriculum:
             if str(cfg.lr_scheduler_type) != "constant":
                 raise ValueError("ego warmup recipes use constant group LRs after PIM-only warmup")
             if total_train_steps <= self.ego_warmup_steps:
@@ -707,9 +740,12 @@ class Wan22Trainer:
         if expected in {"ego_adapter_warmup", "ego_joint_warmup"}:
             keys.update(("zeva_pim_warmup_steps", "zeva_eap_learning_rate", "learning_rate", "seed",
                          "gradient_accumulation_steps", "batch_size"))
-        if expected == "ego_joint_warmup":
+        if expected in {"ego_joint_parent", "ego_joint_warmup"}:
             keys.add("zeva_foundation_learning_rate")
         saved = payload.get("config", {})
+        if getattr(self, "predictive_zeva", False) and getattr(self, "zeva_training_stage", None) == "policy_injection":
+            if _zeva_stage2a_schedule(saved, expected) != _zeva_stage2a_schedule(self.cfg, expected):
+                raise ValueError("Predictive Stage2 resume curriculum/optimizer mismatch: zeva_stage2a_schedule")
         for key in sorted(keys):
             if saved.get(key) != self.cfg.get(key):
                 raise ValueError(f"Predictive Stage2 resume curriculum/optimizer mismatch: {key}")

@@ -170,7 +170,7 @@ def test_prediction_cache_preserves_current_effect_and_train_only_history(tmp_pa
     assert boundary.get(0)["retrieval"].shape == (2,)
     prepared_root = tmp_path / "prepared"
     manifest = BUILDER.build_cache(phase_cache=output, output=prepared_root, semantic_map=semantic,
-                                   max_entries_per_attempt=4)
+                                   max_entries_per_attempt=4, allow_reduced_curriculum=True)
     assert manifest["format"] == EGO_CROSS_ATTEMPT_CACHE_FORMAT
     assert manifest["memory_semantics"] == "predicted_effect_trace"
     assert manifest["globally_available_history_kinds"] == ["matched", "far"]

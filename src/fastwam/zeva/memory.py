@@ -38,6 +38,8 @@ class PersistentInteractionMemoryConfig:
     cross_attempt_only: bool = False
     max_past_attempts: int = 3
     max_entries_per_attempt: int = 64
+    compression: str = "uniform"
+    uniform_indexing: str = "legacy_floor"
 
     def __post_init__(self) -> None:
         if min(self.phase_dim, self.effect_dim, self.capacity, self.top_k) < 1 or self.top_k > self.capacity:
@@ -56,6 +58,12 @@ class PersistentInteractionMemoryConfig:
             raise ValueError("At least one PIM merge weight must be positive")
         if min(self.max_past_attempts, self.max_entries_per_attempt) < 1:
             raise ValueError("PIM attempt limits must be positive")
+        if self.compression not in {"uniform", "similarity_merge"}:
+            raise ValueError("PIM compression must be uniform or similarity_merge")
+        if self.uniform_indexing not in {"legacy_floor", "reference_round"}:
+            raise ValueError("PIM uniform_indexing must be legacy_floor or reference_round")
+        if self.compression == "similarity_merge" and not self.cross_attempt_only:
+            raise ValueError("similarity_merge compression requires cross-attempt PIM")
         if self.cross_attempt_only:
             if self.capacity < self.max_past_attempts * self.max_entries_per_attempt:
                 raise ValueError("cross-attempt capacity must hold all bounded past attempts")
@@ -63,14 +71,18 @@ class PersistentInteractionMemoryConfig:
                 raise ValueError("cross-attempt PIM must expose its full capacity, not fixed top-k")
 
 
-def uniform_history_indices(length: int, limit: int) -> list[int]:
+def uniform_history_indices(length: int, limit: int, *, rounding: str = "legacy_floor") -> list[int]:
     """Deterministic endpoint-preserving compression shared by train and serve."""
     if length < 0 or limit < 1:
         raise ValueError("history length must be non-negative and limit positive")
+    if rounding not in {"legacy_floor", "reference_round"}:
+        raise ValueError("unknown uniform history indexing semantics")
     if length <= limit:
         return list(range(length))
     if limit == 1:
         return [0]
+    if rounding == "reference_round":
+        return torch.linspace(0, length - 1, limit, dtype=torch.float32).round().long().unique().tolist()
     return [i * (length - 1) // (limit - 1) for i in range(limit)]
 
 
@@ -168,19 +180,52 @@ class PersistentInteractionMemory:
             self.commit_attempt()
         self._attempt_id = attempt_id
 
+    def _merge_similar(self, entries: list[PIMMemoryEntry]) -> list[PIMMemoryEntry]:
+        """Reference weighted centroids, retaining raw vector magnitudes/counts."""
+        merged: list[PIMMemoryEntry] = []
+        phase_weight = self.config.phase_merge_weight / (self.config.phase_merge_weight + self.config.effect_merge_weight)
+        for original in entries:
+            entry = original.cpu()
+            if merged:
+                phase_scores = F.cosine_similarity(torch.stack([item.phase for item in merged]), entry.phase[None])
+                effect_scores = F.cosine_similarity(torch.stack([item.effect for item in merged]), entry.effect[None])
+                scores = phase_weight * phase_scores + (1.0 - phase_weight) * effect_scores
+                best = int(scores.argmax())
+                if float(scores[best]) >= self.config.merge_threshold:
+                    target = merged[best]
+                    count = target.observation_count + entry.observation_count
+                    target.phase = (target.phase * target.observation_count + entry.phase * entry.observation_count) / count
+                    target.effect = (target.effect * target.observation_count + entry.effect * entry.observation_count) / count
+                    target.observation_count = count
+                    target.first_attempt_id = min(target.first_attempt_id, entry.first_attempt_id)
+                    target.last_attempt_id = max(target.last_attempt_id, entry.last_attempt_id)
+                    target.attempt_id = target.last_attempt_id
+                    target.transition_index = entry.transition_index
+                    target.metadata.update(entry.metadata)
+                    target.metadata["last_merge_score"] = float(scores[best])
+                    continue
+            merged.append(entry)
+        return merged
+
     def commit_attempt(self) -> None:
-        """Publish a completed attempt once; no current/past prototype merging."""
+        """Publish once: merge within attempt, bound it, then merge retained attempts."""
         if self._attempt_id is None:
             raise RuntimeError("reset_episode() is required before commit_attempt()")
         if not self.config.cross_attempt_only or self._committed_attempt_id == self._attempt_id:
             return
         if self._pending_entries:
+            entries = self._pending_entries
+            if self.config.compression == "similarity_merge":
+                entries = self._merge_similar(entries)
             indices = uniform_history_indices(
-                len(self._pending_entries), self.config.max_entries_per_attempt
+                len(entries), self.config.max_entries_per_attempt,
+                rounding=self.config.uniform_indexing,
             )
-            self._past_attempts.append([self._pending_entries[i] for i in indices])
+            self._past_attempts.append([entries[i] for i in indices])
             del self._past_attempts[:-self.config.max_past_attempts]
             self._entries = [entry for attempt in self._past_attempts for entry in attempt]
+            if self.config.compression == "similarity_merge":
+                self._entries = self._merge_similar(self._entries)
         self._pending_entries.clear()
         self._committed_attempt_id = self._attempt_id
 

@@ -171,6 +171,7 @@ def build(cfg: DictConfig) -> dict:
                 cache=cache, bank_path=bank_path, feature_path=feature_path, encoder_path=encoder_path,
                 head_path=head_path, output_path=output, expected_metadata=metadata,
                 top_k=int(tc.top_k), device=device, batch_size=int(tc.get("static_context_batch_size", 512)),
+                train_query_exclusion=str(tc.get("train_query_exclusion", "leave_one_episode_out")),
             )
         else:
             if bank_path.exists() or feature_path.exists():

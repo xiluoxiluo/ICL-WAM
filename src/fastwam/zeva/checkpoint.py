@@ -10,11 +10,12 @@ import torch
 from .schemas import CacheManifest
 
 JOINT_FOUNDATION_SCHEMA = "iclwam_joint_foundation_v1"
+FOUNDATION_CONTRACT_SCHEMA = "iclwam_foundation_contract_v1"
 
 
 def checkpoint_foundation_mode(payload: dict) -> str:
     """Read the explicit mode, retaining recipe-based legacy compatibility."""
-    inferred = "joint" if payload.get("training_recipe") == "ego_joint_warmup" else "frozen"
+    inferred = "joint" if payload.get("training_recipe") in {"ego_joint_parent", "ego_joint_warmup"} else "frozen"
     mode = payload.get("foundation_mode", inferred)
     if mode not in {"frozen", "joint"}:
         raise ValueError("checkpoint foundation_mode must be 'frozen' or 'joint'")
@@ -26,10 +27,66 @@ def checkpoint_foundation_mode(payload: dict) -> str:
     return mode
 
 
+def checkpoint_requires_foundation(payload: dict) -> bool:
+    """Separate current-stage trainability from inherited backbone weights.
+
+    Frozen Stage2B can inherit the trained Stage2A foundation. It must ship
+    that backbone even though it never updates it. Historical joint Stage2B
+    bundles infer the requirement from their recipe; old frozen addons must
+    never silently acquire a sidecar.
+    """
+    from fastwam.zeva_memory_contract import checkpoint_pim_memory_contract
+
+    memory = checkpoint_pim_memory_contract(payload)
+    new_contract = (
+        any(name in payload for name in (
+            "foundation_contract_schema", "foundation_checkpoint_required",
+            "foundation_parent_identity", "pim_memory_contract",
+        ))
+        or payload.get("training_recipe") == "ego_joint_parent"
+        or (memory is not None and (memory["compression"], memory["uniform_indexing"])
+            != ("uniform", "legacy_floor"))
+    )
+    if new_contract:
+        if payload.get("foundation_contract_schema") != FOUNDATION_CONTRACT_SCHEMA:
+            raise ValueError("new checkpoint requires a complete versioned foundation contract")
+        missing = {"training_stage", "training_recipe", "foundation_mode",
+                   "foundation_checkpoint_required"} - payload.keys()
+        if missing:
+            raise ValueError(f"incomplete foundation contract: missing {sorted(missing)}")
+    mode = checkpoint_foundation_mode(payload)
+    required = payload.get("foundation_checkpoint_required", mode == "joint")
+    if type(required) is not bool:
+        raise ValueError("foundation_checkpoint_required must be boolean")
+    if mode == "joint" and not required:
+        raise ValueError("joint foundation checkpoint cannot disable its required weights")
+    if new_contract and required and not isinstance(payload.get("foundation_checkpoint"), dict):
+        raise ValueError("foundation contract is missing its required foundation checkpoint identity")
+    if not required:
+        if payload.get("foundation_checkpoint") is not None or payload.get("foundation_parent_identity") is not None:
+            raise ValueError("foundation checkpoint metadata requires trained or inherited foundation weights")
+        return False
+    stage, recipe = payload.get("training_stage"), payload.get("training_recipe")
+    valid = ((stage == "policy_injection" and recipe == "ego_joint_parent")
+             or (stage == "pim_adapter" and recipe in {"ego_joint_warmup", "ego_adapter_warmup"}))
+    if payload.get("addon_schema") != "zeva_ego_prediction_v1" or not valid:
+        raise ValueError("foundation bundle requires a predictive joint Stage2A/Stage2B or inherited frozen Stage2B")
+    if mode == "frozen":
+        parent = payload.get("foundation_parent_identity")
+        if (not isinstance(parent, dict) or parent.get("training_stage") != "policy_injection"
+                or parent.get("training_recipe") != "ego_joint_parent"):
+            raise ValueError("frozen foundation bundle requires its joint Stage2A parent identity")
+        for name in ("addon_sha256", "foundation_sha256"):
+            digest = parent.get(name)
+            if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError(f"foundation parent requires a valid {name}")
+    return True
+
+
 def resolve_joint_foundation_checkpoint(
     addon_path: str | Path, payload: dict | None = None, *, verify_hash: bool = True,
 ) -> Path | None:
-    """Resolve the required sibling weights of a jointly trained addon.
+    """Resolve required sibling weights, including a frozen inherited parent.
 
     Paths are bundle-relative basenames, so copying the pair to another host
     preserves its identity. A joint addon can never silently use the original
@@ -39,14 +96,8 @@ def resolve_joint_foundation_checkpoint(
     if payload is None:
         payload = torch.load(addon_path, map_location="cpu", weights_only=False)
     identity = payload.get("foundation_checkpoint")
-    joint = checkpoint_foundation_mode(payload) == "joint"
-    if not joint:
-        if identity is not None:
-            raise ValueError("foundation checkpoint metadata requires ego_joint_warmup")
+    if not checkpoint_requires_foundation(payload):
         return None
-    if (payload.get("training_stage") != "pim_adapter"
-            or payload.get("addon_schema") != "zeva_ego_prediction_v1"):
-        raise ValueError("joint foundation bundle requires predictive Stage2B")
     if not isinstance(identity, dict) or identity.get("schema") != JOINT_FOUNDATION_SCHEMA:
         raise ValueError("joint addon is missing its required foundation checkpoint identity")
     filename = identity.get("filename")
@@ -230,6 +281,10 @@ def save_addon_checkpoint(
             "pim_gate": behavior_prefix_adapter.pim_gate.detach().cpu(),
             **addon_layout_metadata(behavior_prefix_adapter),
             "training_stage": str(training_stage),
+            "training_recipe": "frozen_parent",
+            "foundation_contract_schema": FOUNDATION_CONTRACT_SCHEMA,
+            "foundation_mode": "frozen",
+            "foundation_checkpoint_required": False,
             "step": int(step),
             "config": config,
             "base_checkpoint_sha256": base_checkpoint_sha256,
@@ -252,14 +307,26 @@ def load_addon_checkpoint(
     target_training_stage: str | None = None,
     target_training_recipe: str | None = None,
     foundation_loader=None,
+    pim_memory_contract: dict | None = None,
+    allow_pim_compression_override: bool = False,
+    loaded_foundation_identity: dict | None = None,
 ) -> dict:
     payload = torch.load(path, map_location=map_location, weights_only=False)
     foundation_path = resolve_joint_foundation_checkpoint(path, payload)
+    if foundation_path is None and loaded_foundation_identity is not None:
+        raise ValueError("load the original FastWAM base before loading an addon that does not require trained foundation weights")
     if load_scope == "all" and target_training_recipe is not None:
-        target_joint = target_training_recipe == "ego_joint_warmup"
-        checkpoint_joint = payload.get("training_recipe") == "ego_joint_warmup"
+        target_joint = target_training_recipe in {"ego_joint_parent", "ego_joint_warmup"}
+        checkpoint_joint = checkpoint_foundation_mode(payload) == "joint"
         if target_joint != checkpoint_joint:
             raise ValueError("joint/frozen foundation recipe mismatch; use the matching complete checkpoint bundle")
+    if load_scope == "all" and target_training_stage is not None and payload.get("training_stage") != target_training_stage:
+        raise ValueError("addon checkpoint training stage mismatch; initialize Stage2B with load_scope='policy_injection'")
+    if load_scope == "all" and pim_memory_contract is not None:
+        from fastwam.zeva_memory_contract import validate_checkpoint_pim_memory_contract
+        validate_checkpoint_pim_memory_contract(
+            payload, pim_memory_contract, allow_compression_override=allow_pim_compression_override,
+        )
     if foundation_path is not None and foundation_loader is None:
         raise ValueError("joint addon requires the complete FastWAM foundation loader")
     if payload.get("task_context_identity") != task_context_identity:

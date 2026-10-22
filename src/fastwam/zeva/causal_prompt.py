@@ -41,6 +41,7 @@ class CausalPromptConfig:
     pim_context_dropout: float = 0.0
     pim_support_dropout: float = 0.0
     pim_variant: str = "legacy"
+    initialization: str = "legacy_xavier"
 
     def __post_init__(self) -> None:
         if min(
@@ -59,6 +60,10 @@ class CausalPromptConfig:
             raise ValueError("PIM context/support dropout must be in [0,1)")
         if self.pim_variant not in {"legacy", "cross_attempt"}:
             raise ValueError("pim_variant must be legacy or cross_attempt")
+        if self.initialization not in {"legacy_xavier", "zeva_ego"}:
+            raise ValueError("prompt initialization must be legacy_xavier or zeva_ego")
+        if self.initialization == "zeva_ego" and self.pim_variant != "cross_attempt":
+            raise ValueError("zeva_ego initialization requires the cross-attempt phase reader")
         if self.pim_variant == "cross_attempt" and (self.pim_context_dropout or self.pim_support_dropout):
             raise ValueError("cross_attempt uses explicit sampled memory masks; disable prompt-internal dropout")
 
@@ -73,7 +78,8 @@ class CausalPromptEncoder(nn.Module):
             self.pim_key = nn.Linear(cfg.phase_dim, cfg.hidden_dim, bias=False)
             self.pim_value = nn.Linear(cfg.effect_dim, cfg.hidden_dim, bias=False)
             self.last_retrieval_metrics: dict[str, Tensor] = {}
-            self.reset_parameters()
+            if cfg.initialization == "legacy_xavier":
+                self.reset_parameters()
             return
         self.global_project = nn.Sequential(nn.LayerNorm(cfg.global_dim), nn.Linear(cfg.global_dim, cfg.hidden_dim))
         self.phase_project = nn.Sequential(nn.LayerNorm(cfg.phase_dim), nn.Linear(cfg.phase_dim, cfg.hidden_dim))
@@ -88,6 +94,12 @@ class CausalPromptEncoder(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        if self.config.initialization == "zeva_ego":
+            # Reference Q/K/V use nn.Linear's default fan-in uniform init.
+            # Xavier would enlarge square value projections by sqrt(3).
+            for module in (self.pim_query, self.pim_key, self.pim_value):
+                module.reset_parameters()
+            return
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)

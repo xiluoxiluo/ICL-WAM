@@ -255,6 +255,8 @@ def test_manifest_runner_exports_complete_only_after_all_task_handoffs_and_audit
     ])
     visited = []
     identity = {"base_sha256": "a" * 64, "stats_sha256": "b" * 64,
+                "foundation_checkpoint_required": False,
+                "pim_memory_contract": None, "pim_compression_override": False,
                 "policy_text": {"schema": "iclwam_policy_text_v1",
                                 "prompt_semantics": "wan_whitespace_special_tokens_zero_padding_visible_v1",
                                 "encoder_device": "cpu", "encoder_dtype": "torch.float32",
@@ -294,6 +296,8 @@ def test_manifest_runner_exports_complete_only_after_all_task_handoffs_and_audit
                     "run_id": get("run_id"), "condition": "base", "zeva_mode": "base", "cross_memory_enabled": True,
                     "skip_get_obs_within_replan": get("skip_get_obs_within_replan"),
                     "foundation_mode": "frozen",
+                    "foundation_checkpoint_required": False,
+                    "pim_memory_contract": None, "pim_compression_override": False,
                     "policy_text_encoder_device": get("policy_text_encoder_device"),
                     "policy_text_cache_size": get("policy_text_cache_size"),
                     "checkpoint_identity": identity, "reset_scope": "episode" if attempt == 1 else "attempt",

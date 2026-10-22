@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+  - robotwin_zeva_ego_policy_3cam_384
+  - _self_
+
+# Reference global batch 256, adapted to sixteen training ranks.
+# The same foundation_mode=frozen|joint switch applies to Stage2A.
+batch_size: 1
+gradient_accumulation_steps: 16
+zeva_optimizer_sharding: zero1

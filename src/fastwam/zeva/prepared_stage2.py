@@ -285,7 +285,7 @@ class PreparedZevaStage2Dataset(Dataset):
         if history_schedule == "ego_optimizer_step" and (
             pim_cache._cross_attempt is None or not pim_cache._cross_attempt.current_prediction
         ):
-            raise ValueError("ego_optimizer_step requires predicted-effect cross-attempt cache v2")
+            raise ValueError("ego_optimizer_step requires a predicted-effect cross-attempt cache (v2 legacy or v3 reference)")
         self.base = ZevaRobotWinDataset(base_dataset)
         self.pim = pim_cache
         self.static_context = static_context

@@ -61,6 +61,13 @@ def test_manifest_uses_per_condition_layout_and_configured_reader_capacity(
         "memory_semantics": "predicted_effect_trace", "prior_variant": "zeva_ego",
         "training_recipe": "ego_joint_warmup", "task_context_mode": "task_language",
         "foundation_mode": "joint", "policy_text_encoder_device": "cpu", "policy_text_cache_size": 16,
+        "pim_memory_contract": {
+            "schema": "iclwam_cross_attempt_pim_memory_v1", "compression": "similarity_merge",
+            "uniform_indexing": "reference_round", "max_past_attempts": 3,
+            "max_entries_per_attempt": 64, "capacity": 192,
+            "merge_threshold": 0.95, "phase_weight": 0.5,
+        },
+        "pim_compression_override": False,
         "skip_get_obs_within_replan": True,
     }
     for item in plan["commands"]:

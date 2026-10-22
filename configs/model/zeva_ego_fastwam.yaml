@@ -44,7 +44,10 @@ zeva:
     cross_attempt_only: true
     max_past_attempts: 3
     max_entries_per_attempt: 64
-    merge_threshold: 0.85  # unused by the bounded cross-attempt reader
+    compression: similarity_merge
+    uniform_indexing: reference_round
+    allow_compression_override: false
+    merge_threshold: 0.95
     beta_phase: 0.5
     beta_effect: 0.5
   task_context:
@@ -58,6 +61,9 @@ zeva:
     retrieval_checkpoint: null  # frozen task-language classifier in the new mode
     static_episode_cache_path: null
     build_stage: bank
+    # The reference uses the same full train bank at training and inference.
+    # leave_one_episode_out explicitly reproduces the previous ICL-WAM cache.
+    train_query_exclusion: none
     top_k: 5
     key_dim: ${model.zeva.cte.retrieval_dim}
     value_dim: 256
@@ -75,6 +81,7 @@ zeva:
       validation_fraction: 0.2
       eval_every: 50
   prompt:
+    initialization: zeva_ego
     pim_variant: cross_attempt
     global_dim: 256
     phase_dim: 256
@@ -86,6 +93,7 @@ zeva:
     pim_context_dropout: 0.0
     pim_support_dropout: 0.0
   adapter:
+    initialization: zeva_ego
     mode: exact_zeva
     pim_variant: cross_attempt
     prefix_layout: zeva_ego
@@ -109,5 +117,7 @@ zeva:
     path: null  # build_zeva_ego_boundary_cache.py, never a legacy v4 cache
     strict_manifest: true
   prepared_stage2:
+    history_pairing: reference_nearest
+    allow_reduced_curriculum: false
     pim_cache_path: null
     validation_pim_cache_path: null

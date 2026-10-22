@@ -20,7 +20,9 @@ import torch
 
 from fastwam.zeva.checkpoint import checkpoint_sha256
 from fastwam.zeva.ego_boundary_cache import build_ego_boundary_cache
-from fastwam.zeva.ego_cte_training import load_ego_cte_checkpoint
+from fastwam.zeva.ego_cte_training import (
+    canonical_sha256, episode_metadata, load_ego_cte_checkpoint,
+)
 from fastwam.zeva.ego_episode_data import RoboTwinEgoEpisodeDataset
 
 
@@ -55,6 +57,13 @@ def main(cfg: DictConfig) -> None:
     dataset = RoboTwinEgoEpisodeDataset(instantiate(data_cfg),
         executed_horizon=cte.cfg.executed_horizon, image_size=cte.cfg.image_size, action_dim=cte.cfg.action_dim,
         episode_ids=[episode for values in splits.values() for episode in values])
+    # Matching episode IDs alone does not identify their original trajectories:
+    # offsets, lengths or semantic tasks may have changed in the source table.
+    # Verify the metadata already bound by Stage1 before decoding any RGB or
+    # exporting features under that checkpoint's train/validation split.
+    expected_episodes = metadata.get("data_identity", {}).get("episode_metadata_sha256")
+    if not expected_episodes or canonical_sha256(episode_metadata(dataset.episodes)) != expected_episodes:
+        raise ValueError("boundary cache episode metadata differs from CTE training")
     manifest = build_ego_boundary_cache(dataset, cte, output, identity=identity, episode_splits=splits)
     print(json.dumps(manifest, indent=2, sort_keys=True))
 

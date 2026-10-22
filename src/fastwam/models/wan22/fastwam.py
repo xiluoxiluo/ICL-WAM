@@ -1,4 +1,5 @@
 from typing import Any, Optional, Sequence, Union
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -20,6 +21,16 @@ from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
+
+
+def _validate_complete_state_dict(module: nn.Module, state, *, name: str) -> None:
+    """Preflight before strict restoration, which otherwise may partly copy."""
+    expected = module.state_dict()
+    if not isinstance(state, Mapping) or state.keys() != expected.keys():
+        raise ValueError(f"restoring the original base requires complete {name} weights")
+    if any(not isinstance(state[key], torch.Tensor) or state[key].shape != value.shape
+           for key, value in expected.items()):
+        raise ValueError(f"restoring the original base requires compatible complete {name} weights")
 
 
 class FastWAM(torch.nn.Module):
@@ -1096,7 +1107,8 @@ class FastWAM(torch.nn.Module):
             return []
         adapter = self.zeva_behavior_prefix_adapter
         if self.zeva_training_stage == "policy_injection":
-            return list(adapter.policy_injection_parameters())
+            return (list(adapter.policy_injection_parameters())
+                    + (self.zeva_foundation_parameters() if self.zeva_joint_foundation else []))
         if self.zeva_training_stage == "pim_adapter":
             return (
                 list(self.zeva_prompt_encoder.parameters())
@@ -1111,12 +1123,18 @@ class FastWAM(torch.nn.Module):
 
     @property
     def zeva_joint_foundation(self) -> bool:
-        return (self.zeva_training_stage == "pim_adapter"
-                and getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_joint_warmup")
+        recipe = getattr(self, "zeva_training_recipe", "frozen_parent")
+        return ((self.zeva_training_stage == "pim_adapter" and recipe == "ego_joint_warmup")
+                or (self.zeva_training_stage == "policy_injection" and recipe == "ego_joint_parent"))
 
     @property
     def zeva_foundation_mode(self) -> str:
         return "joint" if self.zeva_joint_foundation else "frozen"
+
+    @property
+    def zeva_requires_foundation_checkpoint(self) -> bool:
+        # A frozen Stage2B still deploys its already trained Stage2A backbone.
+        return self.zeva_joint_foundation or getattr(self, "zeva_foundation_identity", None) is not None
 
     def zeva_foundation_parameters(self):
         """Policy backbone only; VAE and the frozen language encoder stay out.
@@ -1157,7 +1175,7 @@ class FastWAM(torch.nn.Module):
     def prepare_zeva_joint_training_precision(self) -> None:
         """Compatibility alias for callers using the original joint recipe."""
         if not self.zeva_joint_foundation:
-            raise ValueError("FP32 joint training preparation requires ego_joint_warmup")
+            raise ValueError("FP32 joint training preparation requires a joint predictive recipe")
         self.prepare_zeva_training_precision()
 
     def configure_zeva_trainable_state(self) -> None:
@@ -1177,6 +1195,10 @@ class FastWAM(torch.nn.Module):
             if hasattr(adapter, "behavior_effect_projector"):
                 adapter.behavior_effect_projector.train()
                 adapter.behavior_effect_projector.requires_grad_(True)
+            if self.zeva_joint_foundation:
+                self.mot.train().requires_grad_(True)
+                if self.proprio_encoder is not None:
+                    self.proprio_encoder.train().requires_grad_(True)
             return
         if stage == "pim_adapter":
             self.zeva_prompt_encoder.train()
@@ -2195,21 +2217,30 @@ class FastWAM(torch.nn.Module):
                                    base_checkpoint_sha256: str = "", cte_checkpoint_sha256: str = ""):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Cannot save a Zeva addon before attaching it")
-        from fastwam.zeva.checkpoint import JOINT_FOUNDATION_SCHEMA, addon_layout_metadata, checkpoint_sha256
+        from fastwam.zeva.checkpoint import FOUNDATION_CONTRACT_SCHEMA, JOINT_FOUNDATION_SCHEMA, addon_layout_metadata, checkpoint_sha256, checkpoint_requires_foundation
         path = Path(path)
-        training_metadata = {"foundation_mode": self.zeva_foundation_mode}
+        training_metadata = {
+            "foundation_contract_schema": FOUNDATION_CONTRACT_SCHEMA,
+            "foundation_mode": self.zeva_foundation_mode,
+            "foundation_checkpoint_required": self.zeva_requires_foundation_checkpoint,
+        }
+        if getattr(self, "zeva_foundation_parent_identity", None) is not None:
+            training_metadata["foundation_parent_identity"] = self.zeva_foundation_parent_identity
+        if getattr(self, "zeva_pim_memory_contract", None) is not None:
+            training_metadata["pim_memory_contract"] = self.zeva_pim_memory_contract
         if getattr(self, "zeva_trainable_precision", None) == "float32":
             if any(p.requires_grad and p.dtype != torch.float32 for p in self.parameters()):
                 raise ValueError("prepared Zeva training parameters no longer have FP32 precision")
             training_metadata["trainable_precision"] = "float32"
         foundation_identity = None
-        if self.zeva_joint_foundation:
+        if self.zeva_requires_foundation_checkpoint:
             foundation_path = path.with_name(path.stem.removesuffix("_addon") + "_foundation.pt")
             if foundation_path == path:
                 raise ValueError("addon path collides with its foundation checkpoint")
             foundation = {
                 "schema": JOINT_FOUNDATION_SCHEMA,
-                "training_recipe": "ego_joint_warmup",
+                "training_recipe": getattr(self, "zeva_training_recipe", "frozen_parent"),
+                "training_stage": self.zeva_training_stage,
                 **training_metadata,
                 "step": int(step),
                 "base_checkpoint_sha256": base_checkpoint_sha256,
@@ -2242,6 +2273,7 @@ class FastWAM(torch.nn.Module):
         }
         if foundation_identity is not None:
             payload["foundation_checkpoint"] = foundation_identity
+        checkpoint_requires_foundation(payload)
         temporary = path.with_suffix(".tmp")
         torch.save(payload, temporary)
         temporary.replace(path)
@@ -2251,13 +2283,19 @@ class FastWAM(torch.nn.Module):
         payload = torch.load(path, map_location="cpu", weights_only=False)
         checkpoint_foundation_mode(payload)
         expected = {
-            "schema": JOINT_FOUNDATION_SCHEMA, "training_recipe": "ego_joint_warmup",
+            "schema": JOINT_FOUNDATION_SCHEMA, "training_recipe": addon_payload["training_recipe"],
             "step": addon_payload["step"],
             "base_checkpoint_sha256": addon_payload["base_checkpoint_sha256"],
             "cte_checkpoint_sha256": addon_payload["cte_checkpoint_sha256"],
             "task_context_identity": addon_payload.get("task_context_identity"),
         }
-        for name in ("foundation_mode", "trainable_precision"):
+        for name in ("foundation_contract_schema", "foundation_mode", "trainable_precision"):
+            if name in addon_payload:
+                expected[name] = addon_payload[name]
+        if "foundation_checkpoint_required" in addon_payload:
+            expected.update({"training_stage": addon_payload["training_stage"],
+                             "foundation_checkpoint_required": addon_payload["foundation_checkpoint_required"]})
+        for name in ("foundation_parent_identity", "pim_memory_contract"):
             if name in addon_payload:
                 expected[name] = addon_payload[name]
         for name, value in expected.items():
@@ -2265,18 +2303,25 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(f"joint foundation checkpoint lineage mismatch: {name}")
         if ("proprio_encoder" in payload) != (self.proprio_encoder is not None):
             raise ValueError("joint foundation checkpoint proprio architecture mismatch")
+        if getattr(self, "zeva_trainable_precision", None) == "float32":
+            # Preserve a trained FP32 parent even when Stage2B freezes it.
+            # Otherwise loading into a BF16 destination erases small updates.
+            with torch.no_grad():
+                for parameter in self.zeva_foundation_parameters():
+                    parameter.data = parameter.data.float()
         self.mot.load_state_dict(payload["mot"], strict=True)
         if self.proprio_encoder is not None:
             self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
         self.zeva_foundation_identity = dict(addon_payload["foundation_checkpoint"])
+        self.zeva_foundation_parent_identity = addon_payload.get("foundation_parent_identity")
 
     def load_zeva_addon_checkpoint(self, path, *, base_checkpoint_sha256: Optional[str] = None,
                                    cte_checkpoint_sha256: Optional[str] = None,
                                    load_scope: str = "all"):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Cannot load a Zeva addon before attaching it")
-        from fastwam.zeva.checkpoint import load_addon_checkpoint
-        return load_addon_checkpoint(
+        from fastwam.zeva.checkpoint import load_addon_checkpoint, checkpoint_requires_foundation, checkpoint_sha256
+        payload = load_addon_checkpoint(
             path, self.zeva_prompt_encoder, self.zeva_behavior_prefix_adapter,
             base_checkpoint_sha256=base_checkpoint_sha256,
             cte_checkpoint_sha256=cte_checkpoint_sha256,
@@ -2285,7 +2330,18 @@ class FastWAM(torch.nn.Module):
             target_training_stage=self.zeva_training_stage,
             target_training_recipe=getattr(self, "zeva_training_recipe", "frozen_parent"),
             foundation_loader=self._load_zeva_joint_foundation,
+            pim_memory_contract=getattr(self, "zeva_pim_memory_contract", None),
+            allow_pim_compression_override=getattr(self, "zeva_allow_pim_compression_override", False),
+            loaded_foundation_identity=getattr(self, "zeva_foundation_identity", None),
         )
+        if load_scope == "policy_injection" and checkpoint_requires_foundation(payload):
+            self.zeva_foundation_parent_identity = {
+                "addon_sha256": checkpoint_sha256(path),
+                "foundation_sha256": payload["foundation_checkpoint"]["sha256"],
+                "training_stage": payload["training_stage"],
+                "training_recipe": payload["training_recipe"],
+            }
+        return payload
 
     def zeva_parameter_report(self) -> dict[str, object]:
         trainable = [name for name, p in self.named_parameters() if p.requires_grad]
@@ -2318,6 +2374,8 @@ class FastWAM(torch.nn.Module):
                 allowed += ("video_expert.", "action_expert.", "mot.", "dit.", "proprio_encoder.")
         else:
             raise RuntimeError(f"unsupported Zeva training stage: {stage}")
+        if stage == "policy_injection" and self.zeva_joint_foundation:
+            allowed += ("video_expert.", "action_expert.", "mot.", "dit.", "proprio_encoder.")
         invalid = [
             name
             for name in trainable
@@ -2339,8 +2397,21 @@ class FastWAM(torch.nn.Module):
 
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
+        restoring_foundation = (getattr(self, "zeva_foundation_identity", None) is not None
+                                or getattr(self, "zeva_foundation_parent_identity", None) is not None)
+        if restoring_foundation:
+            # A legacy video-only/partial checkpoint must not erase lineage
+            # while leaving trained action/proprio weights in the model.
+            # Validate every destination before any load_state_dict can copy.
+            if "mot" not in payload:
+                raise ValueError("restoring a loaded foundation requires a complete mot/proprio base checkpoint; rebuild the model for legacy partial initialization")
+            _validate_complete_state_dict(self.mot, payload["mot"], name="mot")
+            if ("proprio_encoder" in payload) != (self.proprio_encoder is not None):
+                raise ValueError("restoring the original base requires matching complete proprio_encoder weights")
+            if self.proprio_encoder is not None:
+                _validate_complete_state_dict(self.proprio_encoder, payload["proprio_encoder"], name="proprio_encoder")
         if "mot" in payload:
-            self.mot.load_state_dict(payload["mot"], strict=False)
+            self.mot.load_state_dict(payload["mot"], strict=restoring_foundation)
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
             self.video_expert.load_state_dict(payload["dit"], strict=False)
@@ -2356,6 +2427,10 @@ class FastWAM(torch.nn.Module):
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
+        # Loading the original base explicitly discards a previously loaded
+        # addon bundle's provenance; a later addon must restore its own pair.
+        self.zeva_foundation_identity = None
+        self.zeva_foundation_parent_identity = None
         return payload
 
     def forward(self, *args, **kwargs):

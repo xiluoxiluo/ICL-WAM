@@ -35,7 +35,8 @@ from fastwam.zeva.prepared_stage2 import (
 )
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.static_task_context import task_context_identity
-from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT, HISTORY_KINDS
+from fastwam.zeva.cross_attempt_cache import (CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT,
+                                            LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT, HISTORY_KINDS)
 from fastwam.zeva.ego_boundary_cache import EgoBoundaryCache
 from fastwam.zeva.ego_cte_training import require_ego_checkpoint_ready
 from fastwam.zeva.ego_task_memory import episode_task_instructions, validate_ego_task_language_static_context
@@ -261,8 +262,11 @@ def main(cfg: DictConfig) -> None:
     if cross_attempt:
         if not bool(zeva.memory.get("cross_attempt_only", False)) or int(zeva.memory.pim_max_entries) != top_k:
             raise ValueError("cross-attempt training/serving memory capacity must agree")
+        uniform_indexing = str(zeva.memory.get("uniform_indexing", "legacy_floor"))
+        predictive_cache_format = (EGO_CROSS_ATTEMPT_CACHE_FORMAT if uniform_indexing == "reference_round"
+                                   else LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT)
         pim_expected.update({
-            "format": EGO_CROSS_ATTEMPT_CACHE_FORMAT if predictive else CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
+            "format": predictive_cache_format if predictive else CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
             "source_subset": "train-only", "split": "train",
             "max_past_attempts": int(zeva.memory.max_past_attempts),
             "max_entries_per_attempt": int(zeva.memory.max_entries_per_attempt),
@@ -272,9 +276,16 @@ def main(cfg: DictConfig) -> None:
         if predictive:
             pim_expected.update({"memory_semantics": "predicted_effect_trace", "effect_source": "current_prediction",
                                  "executed_horizon": 24})
+            if uniform_indexing == "reference_round":
+                pim_expected.update({"uniform_indexing": "reference_round", "history_compression": "uniform"})
     pim = PreparedPIMCache(pim_root, expected=pim_expected)
     if predictive and pim._cross_attempt.splits != boundary.splits:
         raise ValueError("prepared PIM cache must use the exact CTE/boundary episode split")
+    if predictive:
+        pim._cross_attempt.validate_training_curriculum(
+            history_pairing=str(zeva.prepared_stage2.get("history_pairing", "legacy_candidates")),
+            allow_reduced_curriculum=zeva.prepared_stage2.get("allow_reduced_curriculum", False),
+        )
     static_context = StaticEpisodeContextCache(static_path)
     static_expected = {
         "cte_checkpoint_sha256": cte_sha,
@@ -299,6 +310,7 @@ def main(cfg: DictConfig) -> None:
             static_context, cache=boundary, bank_path=bank_path, feature_path=feature_path,
             encoder_path=encoder_path, head_path=head_path, expected_metadata=static_expected,
             top_k=int(zeva.task_context.top_k),
+            train_query_exclusion=str(zeva.task_context.get("train_query_exclusion", "leave_one_episode_out")),
         )
     for key, expected in static_expected.items():
         if static_context.metadata.get(key) != expected:
@@ -329,6 +341,11 @@ def main(cfg: DictConfig) -> None:
         if not cross_attempt:
             raise ValueError("explicit prepared validation split requires the cross-attempt schema")
         validation_pim = PreparedPIMCache(str(validation_path), expected={**pim_expected, "split": "validation"})
+        if predictive:
+            validation_pim._cross_attempt.validate_training_curriculum(
+                history_pairing=str(zeva.prepared_stage2.get("history_pairing", "legacy_candidates")),
+                allow_reduced_curriculum=zeva.prepared_stage2.get("allow_reduced_curriculum", False),
+            )
         split_hash = pim.manifest["metadata_sha256"]["episode_splits.json"]
         if validation_pim.manifest["metadata_sha256"]["episode_splits.json"] != split_hash:
             raise ValueError("train and validation prepared caches use different episode splits")
@@ -353,7 +370,9 @@ def main(cfg: DictConfig) -> None:
             if not predictive and pim.manifest["history_weights"].get("empty", 0.0) != 0.0:
                 raise ValueError("frozen-parent training requires nonempty histories")
             if predictive:
-                print("History curriculum: optimizer-step 5:2:1, then 5:2:1:2; available modes:", pim.manifest["globally_available_history_kinds"])
+                label = "explicit reduced ablation" if pim._cross_attempt.reduced_curriculum else "reference full 5:2:1 then 5:2:1:2"
+                print(f"History curriculum: {label}; pairing={pim._cross_attempt.history_pairing}; available modes:",
+                      pim.manifest["globally_available_history_kinds"])
             elif int(os.environ.get("RANK", "0")) == 0:
                 _print_cross_attempt_probe(pim, seed=int(cfg.seed))
             dropout = None

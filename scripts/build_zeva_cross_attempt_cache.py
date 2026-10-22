@@ -6,8 +6,9 @@ Example:
     --output /data/pim_cross_train --split train
 
 Use the emitted episode_splits.json with --episode-splits when building the
-validation cache. Conditions are optional and must be real metadata supplied
-as an episode-ID -> condition string JSON mapping; no condition is inferred.
+validation cache. Predictive reference caches require real condition metadata
+as an episode-ID -> condition string JSON mapping. Missing history modes need
+the explicit --allow-reduced-curriculum ablation; no condition is inferred.
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ import torch
 from safetensors.torch import load_file
 
 from fastwam.zeva.cross_attempt_cache import (
-    CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT, CrossAttemptPIMCache, HISTORY_KINDS,
+    CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT,
+    CrossAttemptPIMCache, HISTORY_KINDS,
     build_episode_pairings, file_sha256, validate_episode_splits,
 )
 from fastwam.zeva.ego_boundary_cache import EGO_BOUNDARY_CACHE_FORMAT, EgoBoundaryCache
@@ -58,6 +60,9 @@ def build_cache(
     validation_fraction: float = 0.1, seed: int = 42, max_past_attempts: int = 3,
     max_entries_per_attempt: int = 64, bit_size: int = 4,
     history_weights: dict[str, float] | None = None,
+    uniform_indexing: str | None = None,
+    history_pairing: str | None = None,
+    allow_reduced_curriculum: bool | None = None,
 ) -> dict[str, Any]:
     phase_cache, output, semantic_map = phase_cache.resolve(), output.resolve(), semantic_map.resolve()
     if output.exists():
@@ -69,6 +74,21 @@ def build_cache(
     semantic = SemanticTaskMap.load(semantic_map)
     source_values = json.loads((phase_cache / "manifest.json").read_text())
     current_prediction = source_values.get("schema_version") == EGO_BOUNDARY_CACHE_FORMAT
+    uniform_indexing = uniform_indexing or ("reference_round" if current_prediction else "legacy_floor")
+    if uniform_indexing not in {"reference_round", "legacy_floor"}:
+        raise ValueError("unknown PIM uniform_indexing")
+    if not current_prediction and uniform_indexing != "legacy_floor":
+        raise ValueError("reference_round caches require predictive Zeva-Ego features")
+    reference_cache = current_prediction and uniform_indexing == "reference_round"
+    history_pairing = history_pairing or ("reference_nearest" if reference_cache else "legacy_candidates")
+    if history_pairing not in {"reference_nearest", "legacy_candidates"}:
+        raise ValueError("unknown PIM history_pairing")
+    if not reference_cache and history_pairing != "legacy_candidates":
+        raise ValueError("reference_nearest requires a predictive reference_round cache")
+    if allow_reduced_curriculum is None:
+        allow_reduced_curriculum = not reference_cache
+    if type(allow_reduced_curriculum) is not bool:
+        raise ValueError("allow_reduced_curriculum must be boolean")
     ego_source = EgoBoundaryCache(phase_cache) if current_prediction else None
     if current_prediction:
         source_manifest = ego_source.manifest
@@ -108,6 +128,8 @@ def build_cache(
         raise ValueError("conditions must cover every query and training episode")
     if any(not isinstance(value, str) or not value for value in condition_map.values()):
         raise ValueError("condition values must be non-empty strings")
+    if current_prediction and not allow_reduced_curriculum and conditions is None:
+        raise ValueError("Reference PIM curriculum requires real --conditions metadata; use --allow-reduced-curriculum only for an explicit non-reference ablation")
     weights = history_weights or {"matched": 5.0, "far": 2.0, "cross_condition": 1.0, "empty": 0.0}
     if set(weights) - set(HISTORY_KINDS):
         raise ValueError("unknown history mixture kind")
@@ -250,7 +272,10 @@ def build_cache(
         history_meta = [{"episode_id": episode, "task_id": tasks[episode], "split": "train",
                          "condition": condition_map.get(episode), "initial_phase": initial_phases[episode]}
                         for episode in history_ids]
-        pairings = build_episode_pairings(query_meta, history_meta, max_histories=max_past_attempts, use_conditions=conditions is not None)
+        pairings = build_episode_pairings(
+            query_meta, history_meta, max_histories=max_past_attempts, use_conditions=conditions is not None,
+            history_pairing=history_pairing, allow_reduced_curriculum=allow_reduced_curriculum,
+        )
         h = len(history_ids)
         for name, shape, dtype in (
             ("history_phases", (h, max_entries_per_attempt, dp), np.float32),
@@ -261,7 +286,7 @@ def build_cache(
             arrays[name][:] = 0
         for index, episode in enumerate(history_ids):
             trace = effects[episode]
-            selected = uniform_history_indices(len(trace), max_entries_per_attempt)
+            selected = uniform_history_indices(len(trace), max_entries_per_attempt, rounding=uniform_indexing)
             arrays["history_phases"][index, :len(selected)] = np.stack([trace[i][0] for i in selected])
             arrays["history_effects"][index, :len(selected)] = np.stack([trace[i][1] for i in selected])
             arrays["history_mask"][index, :len(selected)] = 1
@@ -279,7 +304,11 @@ def build_cache(
         for name, value in metadata.items():
             (temporary / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
         manifest = {
-            "format": EGO_CROSS_ATTEMPT_CACHE_FORMAT if current_prediction else CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
+            "format": ((EGO_CROSS_ATTEMPT_CACHE_FORMAT if uniform_indexing == "reference_round"
+                        else LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT) if current_prediction
+                       else CROSS_ATTEMPT_CACHE_FORMAT), "pim_variant": "cross_attempt",
+            "history_compression": "uniform", "uniform_indexing": uniform_indexing,
+            "history_pairing": history_pairing, "allow_reduced_curriculum": allow_reduced_curriculum,
             "retrieval_mode": "cross_attempt", "source_subset": "train-only", "split": split,
             "history_semantics": "full_episode_prefix", "query_step_unit": "raw_action_step",
             "history_source_semantics": "other_train_episode", "candidate_semantics": "complete_episode_uniform",
@@ -306,6 +335,7 @@ def build_cache(
             if not global_kinds:
                 raise ValueError("no nonempty history kind is available for every query episode")
             manifest.update(globally_available_history_kinds=global_kinds,
+                            reduced_curriculum=global_kinds != list(HISTORY_KINDS[:3]),
                             memory_semantics="predicted_effect_trace", effect_source="current_prediction",
                             executed_horizon=source_manifest.executed_horizon,
                             cte_input_type=source_manifest.cte_input_type,
@@ -340,6 +370,12 @@ def main() -> None:
     parser.add_argument("--max-past-attempts", type=int, default=3)
     parser.add_argument("--max-entries-per-attempt", type=int, default=64)
     parser.add_argument("--bit-size", type=int, default=4)
+    parser.add_argument("--uniform-indexing", choices=("reference_round", "legacy_floor"),
+                        help="Predictive default is reference_round; legacy_floor only replays old caches")
+    parser.add_argument("--history-pairing", choices=("reference_nearest", "legacy_candidates"),
+                        help="Predictive v3 defaults to one fixed nearest/farthest episode per mode")
+    parser.add_argument("--allow-reduced-curriculum", action="store_true", default=None,
+                        help="Explicit non-reference ablation permitting missing real condition/history modes")
     parser.add_argument("--history-weights", type=json.loads,
                         help='JSON weights, e.g. {"matched":5,"far":2,"cross_condition":1,"empty":0}; train requires empty=0')
     args = parser.parse_args()

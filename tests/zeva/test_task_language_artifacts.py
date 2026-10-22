@@ -134,6 +134,47 @@ def test_static_context_uses_predicted_task_and_excludes_self_from_mean_and_supp
         assert len(payload["retrieval_sources"][i]["top_k"]) == len(available)
 
 
+def test_reference_training_context_uses_the_same_train_memory_as_inference(artifacts, tmp_path):
+    from fastwam.zeva.task_language import TaskLanguageMemory
+
+    cache, paths, metadata = artifacts
+    target = tmp_path / "reference_static.pt"
+    build_ego_task_language_context_cache(cache=cache, output_path=target, expected_metadata=metadata,
+                                         top_k=5, batch_size=3, train_query_exclusion="none", **paths)
+    static = StaticEpisodeContextCache(target)
+    query = validate_ego_task_language_static_context(
+        static, cache=cache, expected_metadata=metadata, train_query_exclusion="none", **paths)
+    memory = TaskLanguageMemory.load(paths["bank_path"], paths["head_path"], encoder_path=paths["encoder_path"])
+    expected = memory.retrieve(query["features"])
+    payload = torch.load(target, weights_only=False)
+    torch.testing.assert_close(payload["task_contexts"], expected.values)
+    assert static.metadata["train_query_exclusion"] == "none"
+    assert static.metadata["validation_query_sources"] == "train_only"
+    for row, identity in enumerate(query["episode_ids"]):
+        sources = payload["retrieval_sources"][row]["top_k"]
+        assert all(item["episode_id"] in cache.splits["train"] for item in sources)
+        # In this small fixture each task has fewer than five demos, so the
+        # reference includes the query's own train demo in its fixed task bank.
+        if identity in cache.splits["train"]:
+            assert identity in {item["episode_id"] for item in sources}
+    # The intentionally contradictory held-out GT task still cannot route
+    # language queries or supply a validation trajectory to the memory.
+    assert payload["retrieval_sources"][-1]["predicted_task"] == "0"
+    assert cache.episodes["episode-7"]["task_id"] == "1"
+    with pytest.raises(ValueError, match="train_query_exclusion"):
+        validate_ego_task_language_static_context(
+            static, cache=cache, expected_metadata=metadata, train_query_exclusion="leave_one_episode_out", **paths)
+
+
+def test_unknown_training_exclusion_is_rejected_before_artifact_creation(artifacts, tmp_path):
+    cache, paths, metadata = artifacts
+    output = tmp_path / "invalid_exclusion.pt"
+    with pytest.raises(ValueError, match="train_query_exclusion"):
+        build_ego_task_language_context_cache(cache=cache, output_path=output, expected_metadata=metadata,
+                                             train_query_exclusion="ground_truth_task", **paths)
+    assert not output.exists()
+
+
 def test_classifier_selection_cannot_consume_cte_heldout_episode(artifacts, tmp_path):
     cache, paths, metadata = artifacts
     checkpoint = torch.load(paths["head_path"], weights_only=False)

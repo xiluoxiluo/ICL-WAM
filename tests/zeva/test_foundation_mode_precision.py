@@ -26,7 +26,7 @@ POLICY_TASK = "robotwin_zeva_ego_policy_3cam_384"
 
 def _compose(task=PIM_TASK, *overrides):
     with initialize_config_dir(version_base="1.3", config_dir=str(Path("configs").resolve())):
-        return compose(config_name="train", overrides=[f"task={task}", *overrides])
+        return compose(config_name="train", overrides=[f"task={task}", "output_dir=/tmp/iclwam-config-test", *overrides])
 
 
 def test_foundation_mode_is_the_only_protocol_difference():
@@ -107,10 +107,11 @@ def _tiny_runtime_model(monkeypatch, cfg):
 
 
 @pytest.mark.parametrize("task,mode", [
-    (POLICY_TASK, "frozen"), (PIM_TASK, "frozen"), (PIM_TASK, "joint"),
+    (POLICY_TASK, "frozen"), (POLICY_TASK, "joint"),
+    (PIM_TASK, "frozen"), (PIM_TASK, "joint"),
 ])
 def test_hydra_runtime_constructor_amp_updates_and_checkpoint_precision(monkeypatch, tmp_path, task, mode):
-    cfg = _compose(task, *([f"foundation_mode={mode}"] if task == PIM_TASK else []))
+    cfg = _compose(task, f"foundation_mode={mode}")
     model = _tiny_runtime_model(monkeypatch, cfg)
     model.configure_zeva_trainable_state()
     model.prepare_zeva_training_precision()

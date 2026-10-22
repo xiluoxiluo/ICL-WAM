@@ -18,8 +18,10 @@ import torch
 
 
 CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v1"
-EGO_CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v2"
-CROSS_ATTEMPT_CACHE_FORMATS = (CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT)
+LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v2"
+EGO_CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v3"
+CROSS_ATTEMPT_CACHE_FORMATS = (CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT,
+                             EGO_CROSS_ATTEMPT_CACHE_FORMAT)
 HISTORY_KINDS = ("matched", "far", "cross_condition", "empty")
 
 
@@ -57,10 +59,16 @@ def build_episode_pairings(
     *,
     max_histories: int,
     use_conditions: bool,
+    history_pairing: str = "legacy_candidates",
+    allow_reduced_curriculum: bool = True,
 ) -> dict[str, dict[str, list[int]]]:
     """Pair initial phases only; later query outcomes/actions cannot affect it."""
     if max_histories < 1:
         raise ValueError("max_histories must be positive")
+    if history_pairing not in {"reference_nearest", "legacy_candidates"}:
+        raise ValueError("unknown PIM history_pairing")
+    if not allow_reduced_curriculum and not use_conditions:
+        raise ValueError("Reference PIM curriculum requires real condition metadata")
     if any(row.get("split") != "train" for row in histories):
         raise ValueError("PIM history sources must be train-only")
     if len({row["episode_id"] for row in histories}) != len(histories):
@@ -93,10 +101,13 @@ def build_episode_pairings(
         across = sorted(cross, key=lambda item: (-item[0], item[1]))
         if not matched and not across:
             raise ValueError(f"no other complete train episode for query {episode_id}")
+        if not allow_reduced_curriculum and (not matched or not across):
+            raise ValueError(f"Reference PIM curriculum needs same- and cross-condition train histories for {episode_id}")
+        keep = 1 if history_pairing == "reference_nearest" else max_histories
         result[episode_id] = {
-            "matched": [item[2] for item in matched[:max_histories]],
-            "far": [item[2] for item in far[:max_histories]],
-            "cross_condition": [item[2] for item in across[:max_histories]],
+            "matched": [item[2] for item in matched[:keep]],
+            "far": [item[2] for item in far[:keep]],
+            "cross_condition": [item[2] for item in across[:keep]],
         }
     return result
 
@@ -114,7 +125,25 @@ class CrossAttemptPIMCache:
                 raise ValueError(f"prepared PIM identity mismatch for {key}: expected={value!r}, actual={self.manifest.get(key)!r}")
         if self.manifest.get("pim_variant") != "cross_attempt" or self.manifest.get("source_subset") != "train-only":
             raise ValueError("cross-attempt cache requires explicit train-only provenance")
-        self.current_prediction = self.manifest["format"] == EGO_CROSS_ATTEMPT_CACHE_FORMAT
+        self.current_prediction = self.manifest["format"] in {
+            EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT}
+        self.uniform_indexing = self.manifest.get("uniform_indexing", "legacy_floor")
+        self.history_pairing = self.manifest.get("history_pairing", "legacy_candidates")
+        self.allow_reduced_curriculum = self.manifest.get("allow_reduced_curriculum", True)
+        if self.history_pairing not in {"reference_nearest", "legacy_candidates"}:
+            raise ValueError("unknown PIM history_pairing")
+        if type(self.allow_reduced_curriculum) is not bool:
+            raise ValueError("allow_reduced_curriculum must be boolean")
+        if self.manifest["format"] == EGO_CROSS_ATTEMPT_CACHE_FORMAT:
+            if (self.uniform_indexing != "reference_round"
+                    or self.manifest.get("history_compression") != "uniform"):
+                raise ValueError("PIM cache v3 requires explicit uniform/reference_round history compression")
+            if "history_pairing" not in self.manifest or "allow_reduced_curriculum" not in self.manifest:
+                raise ValueError("PIM cache v3 must declare its pairing and curriculum policy")
+        elif self.uniform_indexing != "legacy_floor":
+            raise ValueError("Legacy PIM cache formats require legacy_floor indexing")
+        elif self.history_pairing != "legacy_candidates":
+            raise ValueError("Legacy PIM cache formats require legacy_candidates pairing")
         if self.current_prediction:
             for key, required in {"memory_semantics": "predicted_effect_trace", "effect_source": "current_prediction",
                                   "executed_horizon": 24, "cte_input_type": "rgb_multiview"}.items():
@@ -139,6 +168,8 @@ class CrossAttemptPIMCache:
             raise ValueError("query cache split must be train or validation")
         self.seed = int(self.manifest.get("seed", 42))
         self.use_conditions = bool(self.manifest["use_conditions"])
+        if self.current_prediction and not self.allow_reduced_curriculum and not self.use_conditions:
+            raise ValueError("Reference PIM curriculum requires real condition metadata")
 
         def read_metadata(name: str):
             path = self.root / name
@@ -182,6 +213,8 @@ class CrossAttemptPIMCache:
             for kind, indices in self.pairings[episode_id].items():
                 if kind not in HISTORY_KINDS[:3] or len(indices) > self.max_histories or len(set(indices)) != len(indices):
                     raise ValueError("invalid cross-attempt pairing")
+                if self.history_pairing == "reference_nearest" and len(indices) > 1:
+                    raise ValueError("reference_nearest must select exactly one fixed partner per available mode")
                 for index in indices:
                     if not isinstance(index, int) or not 0 <= index < len(self.history_episodes):
                         raise ValueError("history source index out of range")
@@ -198,6 +231,14 @@ class CrossAttemptPIMCache:
             global_kinds = [kind for kind in HISTORY_KINDS[:3] if all(row[kind] for row in self.pairings.values())]
             if not global_kinds or self.manifest.get("globally_available_history_kinds") != global_kinds:
                 raise ValueError("globally available history kinds do not match pairing provenance")
+            reduced = global_kinds != list(HISTORY_KINDS[:3])
+            if self.manifest["format"] == EGO_CROSS_ATTEMPT_CACHE_FORMAT and self.manifest.get("reduced_curriculum") is not reduced:
+                raise ValueError("PIM cache reduced_curriculum does not match its available history modes")
+            if reduced and not self.allow_reduced_curriculum:
+                raise ValueError("Reference PIM curriculum requires all three history modes for every query")
+            self.reduced_curriculum = reduced
+        else:
+            self.reduced_curriculum = None
         self.weights = {kind: float(self.manifest["history_weights"].get(kind, 0.0)) for kind in HISTORY_KINDS}
         if any(not np.isfinite(weight) or weight < 0 for weight in self.weights.values()) or sum(self.weights.values()) <= 0:
             raise ValueError("invalid history mixture weights")
@@ -238,6 +279,17 @@ class CrossAttemptPIMCache:
     def __len__(self) -> int:
         return self.num_queries
 
+    def validate_training_curriculum(self, *, history_pairing: str, allow_reduced_curriculum: bool) -> None:
+        """Require the training config to opt into any non-reference reduction."""
+        if not self.current_prediction:
+            raise ValueError("predictive curriculum requires a predicted-effect PIM cache")
+        if history_pairing != self.history_pairing:
+            raise ValueError("prepared PIM history_pairing differs from the selected training recipe")
+        if type(allow_reduced_curriculum) is not bool:
+            raise ValueError("allow_reduced_curriculum must be boolean")
+        if self.reduced_curriculum and not allow_reduced_curriculum:
+            raise ValueError("Reduced PIM curriculum requires explicit prepared_stage2.allow_reduced_curriculum=true")
+
     def get(self, index: int, *, history_kind: str | None = None, history_count: int | None = None,
             generator: torch.Generator | None = None) -> dict[str, Any]:
         index = int(index)
@@ -270,7 +322,8 @@ class CrossAttemptPIMCache:
             count = int(history_count) if history_count is not None else int(torch.randint(1, len(candidates) + 1, (), generator=generator).item())
             if not 1 <= count <= min(self.max_histories, len(candidates)):
                 raise ValueError("invalid requested history count")
-            order = torch.randperm(len(candidates), generator=generator)[:count].tolist()
+            order = (list(range(count)) if self.history_pairing == "reference_nearest"
+                     else torch.randperm(len(candidates), generator=generator)[:count].tolist())
             selected = [candidates[i] for i in order]
         phases = np.zeros((self.top_k, self.phase_dim), dtype=np.float32)
         effects = np.zeros((self.top_k, self.effect_dim), dtype=np.float32)
@@ -314,7 +367,7 @@ class CrossAttemptPIMCache:
         the PIM-only warmup boundary or independently choose microbatch modes.
         """
         if not self.current_prediction:
-            raise ValueError("optimizer-step history schedule requires predicted-effect cache v2")
+            raise ValueError("optimizer-step history schedule requires a predicted-effect cache (v2 legacy or v3 reference)")
         result = self.get(index, history_kind="empty")
         kinds = self.manifest["globally_available_history_kinds"]
         bundles = {"pim_history_phases": [], "pim_history_effects": [],
@@ -322,9 +375,9 @@ class CrossAttemptPIMCache:
         available = []
         for kind_index, kind in enumerate(HISTORY_KINDS[:3]):
             enabled = kind in kinds
-            # Candidate identity is query-local and stable across workers,
-            # prefetch depth and resume. Only optimizer-step mode selection
-            # varies during the new curriculum; legacy get() stays stochastic.
+            # The reference cache has one fixed partner per episode/mode.
+            # Legacy top-N candidates retain their query-local seeded draw.
+            # Both stay stable across workers, prefetch depth and resume.
             generator = torch.Generator().manual_seed(self.seed + 3 * int(index) + kind_index)
             candidate = self.get(index, history_kind=kind, history_count=1, generator=generator) if enabled else result
             available.append(enabled)
