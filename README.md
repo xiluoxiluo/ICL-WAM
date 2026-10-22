@@ -4,6 +4,8 @@
 
 本项目按 [Zeva `feature/zeva_ego` 的 README 与实际训练/评测代码](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101) 实现CTE、EAP和PIM并接到FastWAM。**新默认遵循“除必要WAM适配，其余按Zeva-Ego设计对齐”**；底座、video/action接口、joint动作/时间尺度与语言输入空间保持明确边界。逐项修复与证据见 [对齐审计](docs/zeva_ego_alignment_audit.md)；可执行命令见 [训练与RoboTwin评测指南](docs/zeva_ego_training_evaluation.md)。公开数据清单或分类器训练配方缺失的部分明确标注，不声称已经逐条复现参考实验。
 
+**离线训练推荐从 [`scripts/train/`](scripts/train/README.md) 开始。** `01`–`11` 覆盖环境检查、文本预计算、CTE、所有新缓存/语言检索组件及 Stage2A/B；`12_run_all.sh` 支持完整流程、`--from/--to` 和 `--dry-run`。默认复用旧脚本中的真实数据/权重路径，集中在 `_env.sh`，使用单进程CTE与16卡Stage2，并提供独立 `STAGE2A_FOUNDATION_MODE` / `STAGE2B_FOUNDATION_MODE` 开关和完整state续训入口。严格CTE所需的有序 task subset 与真实 episode conditions 仍需提供。
+
 主要变化：
 
 - **预测式 CTE**：三路独立 RGB224 + 三流 Mamba，读取当前观察和上一段实际执行的24步 joint14动作，预测下一边界的视觉变化；不再把4-step transition、16-step completed effect当成参考分支的语义。
