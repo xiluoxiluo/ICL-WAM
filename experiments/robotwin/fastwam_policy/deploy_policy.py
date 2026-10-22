@@ -45,6 +45,7 @@ from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.static_task_context import (
     StaticTaskContextRetriever, StaticTaskContextSession, task_context_identity,
 )
+from fastwam.zeva.task_language import TaskLanguageMemory, task_language_identity
 
 logger = logging.getLogger(__name__)
 
@@ -250,10 +251,40 @@ class WorldActionRobotWinPolicy:
         task_context_cfg = model_cfg_copy.get("zeva", {}).get("task_context", {})
         self.task_context_bank = None
         self._static_task_context_session = None
+        self._task_language_memory = None
+        self._task_language_instruction = None
+        self._task_language_result = None
         self._last_task_context_retrieval = None
         self.task_context_mode = str(task_context_cfg.get("mode", "static"))
         self.task_context_top_k = int(task_context_cfg.get("top_k", 5))
-        if requested_zeva_mode not in {"base", "pim_shadow"} and self.task_context_mode == "bank":
+        if requested_zeva_mode not in {"base", "pim_shadow"} and self.task_context_mode == "task_language":
+            for name in ("bank_path", "retrieval_checkpoint", "language_encoder_path"):
+                if _is_none_like(task_context_cfg.get(name)):
+                    raise ValueError(f"task-language context requires zeva.task_context.{name}")
+            if _is_none_like(cte_checkpoint):
+                raise ValueError("task-language context requires the matching CTE checkpoint")
+            if float(task_context_cfg.get("temperature", 1.0)) != 1.0:
+                raise ValueError("task-language top-5 retrieval uses the reference unscaled cosine softmax")
+            bank_path = str(task_context_cfg["bank_path"])
+            head_path = str(task_context_cfg["retrieval_checkpoint"])
+            encoder_path = str(task_context_cfg["language_encoder_path"])
+            self._task_language_memory = TaskLanguageMemory.load(
+                bank_path, head_path, encoder_path=encoder_path,
+                top_k=self.task_context_top_k, device=device,
+                expected={
+                    "cte_checkpoint_sha256": checkpoint_sha256(str(cte_checkpoint)),
+                    "dataset_stats_sha256": checkpoint_sha256(dataset_stats_path),
+                    "memory_semantics": "predicted_effect_trace", "effect_source": "current_prediction",
+                    "cte_variant": "zeva_ego",
+                },
+            )
+            if (self.model.zeva_prompt_encoder is None
+                    or self._task_language_memory.bank.value_dim != self.model.zeva_prompt_encoder.config.global_dim):
+                raise ValueError("task-language memory value_dim must match the Zeva prompt encoder")
+            self.model.zeva_task_context_identity = task_language_identity(
+                bank_path, head_path, encoder_path, top_k=self.task_context_top_k,
+            )
+        elif requested_zeva_mode not in {"base", "pim_shadow"} and self.task_context_mode == "bank":
             if self.model.zeva_prompt_encoder is None:
                 raise ValueError("task-context bank requires an enabled Zeva prompt encoder")
             bank_path = task_context_cfg.get("bank_path")
@@ -304,7 +335,7 @@ class WorldActionRobotWinPolicy:
                 "static", bank_path, head_path, self.task_context_top_k,
             )
         elif requested_zeva_mode not in {"base", "pim_shadow"} and self.task_context_mode != "pooling":
-            raise ValueError("zeva.task_context.mode must be pooling, bank, or static")
+            raise ValueError("zeva.task_context.mode must be pooling, bank, static, or task_language")
 
         self.zeva_mode = requested_zeva_mode
         self.cross_memory_enabled = bool(cross_memory_enabled)
@@ -319,6 +350,7 @@ class WorldActionRobotWinPolicy:
             "cte_sha256": checkpoint_sha256(cte_checkpoint) if cte_checkpoint else None,
             "addon_sha256": checkpoint_sha256(addon_checkpoint) if addon_checkpoint else None,
             "task_context": getattr(self.model, "zeva_task_context_identity", None),
+            "training_recipe": str(getattr(self.model, "zeva_training_recipe", "frozen_parent")),
             **_prefix_metadata(self.model),
         }
         self.cte = None
@@ -374,9 +406,12 @@ class WorldActionRobotWinPolicy:
                 if zeva_memory_cfg.get("memory_semantics") != "predicted_effect_trace":
                     raise ValueError("Zeva-Ego CTE requires explicit predicted_effect_trace runtime memory")
                 if requested_zeva_mode != "pim_shadow":
-                    if self._static_task_context_session is None:
-                        raise ValueError("formal Zeva-Ego deployment requires the trained static task-memory retriever")
-                    bank = self._static_task_context_session.retriever.bank
+                    if self._task_language_memory is not None:
+                        bank = self._task_language_memory.bank
+                    elif self._static_task_context_session is not None:
+                        bank = self._static_task_context_session.retriever.bank
+                    else:
+                        raise ValueError("formal Zeva-Ego deployment requires a trained task-memory retriever")
                     if bank.metadata.get("semantic_task_map_sha256") != cte_payload["semantic_task_map_sha256"]:
                         raise ValueError("static task-memory semantic map differs from CTE training")
                     train_episodes = set(cte_payload["episode_splits"]["train"])
@@ -479,11 +514,14 @@ class WorldActionRobotWinPolicy:
                     f"Unsupported CTE input type {cte_input_type!r}; expected rgb_frame or wan_vae_latent"
                 )
             if addon_checkpoint and requested_zeva_mode in {"zeva_stage2", "pim_on"}:
-                self.model.load_zeva_addon_checkpoint(
+                addon_payload = self.model.load_zeva_addon_checkpoint(
                     str(addon_checkpoint),
                     base_checkpoint_sha256=checkpoint_sha256(checkpoint_path),
                     cte_checkpoint_sha256=checkpoint_sha256(cte_checkpoint),
                 )
+                self.checkpoint_identity["training_recipe"] = addon_payload.get("training_recipe", "frozen_parent")
+                if addon_payload.get("foundation_checkpoint") is not None:
+                    self.checkpoint_identity["foundation_sha256"] = addon_payload["foundation_checkpoint"]["sha256"]
             pim = PersistentInteractionMemory(
                 PersistentInteractionMemoryConfig(
                     phase_dim=cte_cfg.phase_dim,
@@ -685,6 +723,21 @@ class WorldActionRobotWinPolicy:
         self._transition_actions.clear()
         return phase, predicted_effect
 
+    @torch.no_grad()
+    def _resolve_task_language(self, instruction: str):
+        """Resolve once per attempt from raw instruction alone.
+
+        No image, online CTE state, current episode identity or environment
+        task label is exposed to the frozen task-language classifier.
+        """
+        if getattr(self, "_task_language_result", None) is None:
+            features = self._task_language_memory.encoder.encode(instruction, device=self.model.device)
+            self._task_language_result = self._task_language_memory.retrieve(features)
+            self._task_language_instruction = instruction
+        elif instruction != self._task_language_instruction:
+            raise ValueError("task-language instruction changed within an attempt; reset before changing tasks")
+        return self._task_language_result
+
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
         state_vector = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
@@ -711,6 +764,14 @@ class WorldActionRobotWinPolicy:
                     task_tokens = torch.zeros(
                         (1, task_dim), device=self.model.device, dtype=self.model.torch_dtype
                     )
+                elif getattr(self, "_task_language_memory", None) is not None:
+                    task_context_result = self._resolve_task_language(instruction)
+                    task_tokens = task_context_result.values
+                    self._last_task_context_retrieval = {
+                        "indices": task_context_result.indices.cpu(),
+                        "scores": task_context_result.scores.cpu(),
+                        "sources": task_context_result.sources,
+                    }
                 elif self._static_task_context_session is not None:
                     task_context_result = self._static_task_context_session.resolve(
                         self.model, image_tensor, context, _context_mask, instruction,
@@ -979,6 +1040,10 @@ class WorldActionRobotWinPolicy:
             "evaluation_slot": {"index": getattr(self, "evaluation_slot_index", 0), "count": getattr(self, "evaluation_slot_count", 1)},
             "memory_semantics": "predicted_effect_trace" if getattr(self, "_ego_cte", False) else "completed_effect_trace",
             "checkpoint_identity": self.checkpoint_identity,
+            "training_recipe": self.checkpoint_identity.get("training_recipe", "frozen_parent"),
+            "task_context_mode": getattr(self, "task_context_mode", "static"),
+            "task_language_predictions": (getattr(getattr(self, "_task_language_memory", None), "last_diagnostics", [])
+                                          if getattr(self, "_task_language_result", None) is not None else []),
             "cte_schema": getattr(self, "cte_schema", None),
             "prior_variant": getattr(getattr(getattr(self.model, "zeva_behavior_prefix_adapter", None), "config", None), "prior_variant", "legacy_bit"),
             **_prefix_metadata(self.model),
@@ -1065,6 +1130,7 @@ class WorldActionRobotWinPolicy:
     def reset(self) -> None:
         if getattr(self, "_static_task_context_session", None) is not None:
             self._static_task_context_session.reset()
+        self._task_language_instruction = self._task_language_result = None
         self._last_task_context_retrieval = None
         self.pending_actions.clear()
         self.episode_count += 1
@@ -1088,6 +1154,7 @@ class WorldActionRobotWinPolicy:
         """Reset transient CTE/BIT while preserving episode PIM and seed schedule."""
         if getattr(self, "_static_task_context_session", None) is not None:
             self._static_task_context_session.reset()
+        self._task_language_instruction = self._task_language_result = None
         self._last_task_context_retrieval = None
         attempt_id = int(attempt_id)
         if attempt_id < 0:
@@ -1197,6 +1264,7 @@ def get_model(usr_args: Dict[str, Any]):
     for key, config_key in (
         ("task_context_bank", "bank_path"),
         ("task_context_retrieval_checkpoint", "retrieval_checkpoint"),
+        ("task_language_encoder", "language_encoder_path"),
         ("task_context_top_k", "top_k"),
         ("task_context_mode", "mode"),
     ):

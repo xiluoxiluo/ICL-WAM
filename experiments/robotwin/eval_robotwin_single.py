@@ -281,6 +281,7 @@ def main(cfg: DictConfig):
     for key, config_key in (
         ("task_context_bank", "bank_path"),
         ("task_context_retrieval_checkpoint", "retrieval_checkpoint"),
+        ("task_language_encoder", "language_encoder_path"),
         ("task_context_top_k", "top_k"),
         ("task_context_mode", "mode"),
     ):

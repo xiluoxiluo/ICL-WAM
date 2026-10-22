@@ -16,6 +16,8 @@ def main() -> None:
     parser.add_argument("--addon-checkpoint")
     parser.add_argument("--task-context-bank")
     parser.add_argument("--task-context-retrieval-checkpoint")
+    parser.add_argument("--task-language-encoder")
+    parser.add_argument("--task-context-mode", choices=("task_language", "static", "bank", "pooling"))
     parser.add_argument("--task-context-top-k", type=int)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--model-seed", "--model-rng-seed", type=int, default=20260907)
@@ -71,18 +73,25 @@ def main() -> None:
         cmd.append(f"EVALUATION.fixed_instruction={json.dumps(args.instruction)}")
     if args.mode in {"zeva_stage2", "pim_on"}:
         cmd.append(f"EVALUATION.addon_checkpoint={args.addon_checkpoint}")
+    context_mode = args.task_context_mode or str(cfg.model.zeva.task_context.mode)
+    if args.task_context_mode is None and context_mode != "task_language" and args.task_context_bank:
+        context_mode = "static" if args.task_context_retrieval_checkpoint else "bank"
+    if context_mode == "task_language" and args.mode in {"zeva_stage2", "pim_on"}:
+        if not all((args.task_context_bank, args.task_context_retrieval_checkpoint, args.task_language_encoder)):
+            parser.error("task_language requires --task-context-bank, --task-context-retrieval-checkpoint and --task-language-encoder")
+    cmd.append(f"model.zeva.task_context.mode={context_mode}")
     if args.task_context_bank:
         cmd.extend([
-            "model.zeva.task_context.mode=bank",
             f"model.zeva.task_context.bank_path={args.task_context_bank}",
         ])
     if args.task_context_retrieval_checkpoint:
         if not args.task_context_bank:
             parser.error("--task-context-retrieval-checkpoint requires --task-context-bank")
         cmd.extend([
-            "model.zeva.task_context.mode=static",
             f"model.zeva.task_context.retrieval_checkpoint={args.task_context_retrieval_checkpoint}",
         ])
+    if args.task_language_encoder:
+        cmd.append(f"model.zeva.task_context.language_encoder_path={args.task_language_encoder}")
     task_context_top_k = args.task_context_top_k
     if task_context_top_k is None and args.task_context_retrieval_checkpoint:
         task_context_top_k = 5

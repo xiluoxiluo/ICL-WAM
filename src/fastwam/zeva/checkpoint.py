@@ -9,6 +9,50 @@ import torch
 
 from .schemas import CacheManifest
 
+JOINT_FOUNDATION_SCHEMA = "iclwam_joint_foundation_v1"
+
+
+def resolve_joint_foundation_checkpoint(
+    addon_path: str | Path, payload: dict | None = None, *, verify_hash: bool = True,
+) -> Path | None:
+    """Resolve the required sibling weights of a jointly trained addon.
+
+    Paths are bundle-relative basenames, so copying the pair to another host
+    preserves its identity. A joint addon can never silently use the original
+    base instead of its updated policy backbone.
+    """
+    addon_path = Path(addon_path)
+    if payload is None:
+        payload = torch.load(addon_path, map_location="cpu", weights_only=False)
+    identity = payload.get("foundation_checkpoint")
+    joint = payload.get("training_recipe") == "ego_joint_warmup"
+    if not joint:
+        if identity is not None:
+            raise ValueError("foundation checkpoint metadata requires ego_joint_warmup")
+        return None
+    if (payload.get("training_stage") != "pim_adapter"
+            or payload.get("addon_schema") != "zeva_ego_prediction_v1"):
+        raise ValueError("joint foundation bundle requires predictive Stage2B")
+    if not isinstance(identity, dict) or identity.get("schema") != JOINT_FOUNDATION_SCHEMA:
+        raise ValueError("joint addon is missing its required foundation checkpoint identity")
+    filename = identity.get("filename")
+    if (not isinstance(filename, str) or not filename or Path(filename).name != filename
+            or filename in {".", ".."} or "\\" in filename):
+        raise ValueError("foundation checkpoint filename must be a bundle-relative basename")
+    if identity.get("step") != payload.get("step"):
+        raise ValueError("foundation checkpoint/addon step mismatch")
+    if identity.get("base_checkpoint_sha256") != payload.get("base_checkpoint_sha256"):
+        raise ValueError("foundation checkpoint/addon base parent mismatch")
+    digest = identity.get("sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise ValueError("foundation checkpoint requires a SHA256 identity")
+    path = addon_path.parent / filename
+    if path == addon_path or not path.is_file():
+        raise FileNotFoundError(f"joint addon requires its foundation checkpoint: {path}")
+    if verify_hash and checkpoint_sha256(path) != digest:
+        raise ValueError("foundation checkpoint SHA256 mismatch")
+    return path
+
 
 def checkpoint_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
@@ -192,8 +236,18 @@ def load_addon_checkpoint(
     map_location: str = "cpu",
     load_scope: str = "all",
     target_training_stage: str | None = None,
+    target_training_recipe: str | None = None,
+    foundation_loader=None,
 ) -> dict:
     payload = torch.load(path, map_location=map_location, weights_only=False)
+    foundation_path = resolve_joint_foundation_checkpoint(path, payload)
+    if load_scope == "all" and target_training_recipe is not None:
+        target_joint = target_training_recipe == "ego_joint_warmup"
+        checkpoint_joint = payload.get("training_recipe") == "ego_joint_warmup"
+        if target_joint != checkpoint_joint:
+            raise ValueError("joint/frozen foundation recipe mismatch; use the matching complete checkpoint bundle")
+    if foundation_path is not None and foundation_loader is None:
+        raise ValueError("joint addon requires the complete FastWAM foundation loader")
     if payload.get("task_context_identity") != task_context_identity:
         raise ValueError("addon checkpoint task-context artifacts or retrieval settings mismatch")
     for name, expected in (("base_checkpoint_sha256", base_checkpoint_sha256), ("cte_checkpoint_sha256", cte_checkpoint_sha256)):
@@ -266,4 +320,6 @@ def load_addon_checkpoint(
             )
     else:
         raise ValueError("load_scope must be 'all', 'policy_injection', or 'policy_warmstart'")
+    if foundation_path is not None:
+        foundation_loader(foundation_path, payload)
     return payload

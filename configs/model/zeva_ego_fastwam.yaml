@@ -47,19 +47,22 @@ zeva:
     beta_phase: 0.5
     beta_effect: 0.5
   task_context:
-    mode: static
+    mode: task_language
     bank_path: null
+    language_encoder_path: null
+    language_feature_cache_path: null
+    # Legacy image+text readout paths remain available only for mode=static.
     readout_cache_path: null
     query_readout_cache_path: null
-    retrieval_checkpoint: null
+    retrieval_checkpoint: null  # frozen task-language classifier in the new mode
     static_episode_cache_path: null
     build_stage: bank
     top_k: 5
     key_dim: ${model.zeva.cte.retrieval_dim}
     value_dim: 256
-    temperature: 0.07
+    temperature: 1.0  # reference top-5 cosine softmax has no temperature scaling
     retrieval:
-      input_dim: ${model.video_dit_config.hidden_dim}
+      input_dim: ${model.video_dit_config.text_dim}
       hidden_dim: 1024
       output_dim: ${model.zeva.cte.retrieval_dim}
       dropout: 0.1

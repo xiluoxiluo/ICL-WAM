@@ -26,7 +26,8 @@ from experiments.robotwin.multiattempt import (
 )
 
 
-def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect_source: str) -> dict:
+def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect_source: str,
+                     task_context_mode: str | None = None) -> dict:
     """Resolve reader capacity without importing or instantiating the policy."""
     from hydra import compose, initialize_config_dir
 
@@ -35,6 +36,7 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
             f"task={task}", *overrides,
             f"model.zeva.adapter.prefix_layout={prefix_layout}",
             f"model.zeva.adapter.effect_source={effect_source}",
+            *([] if task_context_mode is None else [f"model.zeva.task_context.mode={task_context_mode}"]),
         ])
     zeva = cfg.model.zeva
     top_k = int(zeva.memory.pim_top_k)
@@ -45,6 +47,13 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
         raise ValueError("Evaluation reader variant and cross_attempt_only configuration disagree")
     semantics = str(zeva.memory.get("memory_semantics", "completed_effect_trace"))
     prior = str(zeva.adapter.get("prior_variant", "legacy_bit"))
+    recipe = str(zeva.get("training_recipe", "frozen_parent"))
+    task_context_mode = str(zeva.task_context.get("mode", "static"))
+    if recipe == "ego_joint_warmup":
+        if bool(zeva.get("freeze_fastwam", True)) or task_context_mode != "task_language":
+            raise ValueError("joint foundation evaluation requires freeze_fastwam=false and task_language retrieval")
+    if task_context_mode == "task_language" and float(zeva.task_context.get("temperature", 1.0)) != 1.0:
+        raise ValueError("task-language retrieval uses the reference temperature=1.0")
     if effect_source == "current_prediction":
         if (prefix_layout != "zeva_ego" or prior != "zeva_ego" or semantics != "predicted_effect_trace"
                 or str(zeva.cte.get("variant", "legacy")) != "zeva_ego"
@@ -64,8 +73,26 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
         "pim_top_k": top_k,
         "memory_semantics": semantics,
         "prior_variant": prior,
+        "training_recipe": recipe,
+        "task_context_mode": task_context_mode,
         "skip_get_obs_within_replan": boundary_observations,
     }
+
+
+def _foundation_artifact(addon_path: str, training_recipe: str) -> dict:
+    """Validate a real checkpoint bundle before launching the simulator."""
+    import torch
+    sys.path.insert(0, str(ROOT / "src"))
+    from fastwam.zeva.checkpoint import resolve_joint_foundation_checkpoint
+
+    payload = torch.load(addon_path, map_location="cpu", weights_only=False)
+    if payload.get("training_recipe", "frozen_parent") != training_recipe:
+        raise ValueError("Addon training recipe differs from the selected task; use the matching joint/frozen task config")
+    foundation = resolve_joint_foundation_checkpoint(addon_path, payload=payload, verify_hash=True)
+    if foundation is None:
+        return {}
+    return {"foundation_checkpoint": str(foundation),
+            "foundation_sha256": payload["foundation_checkpoint"]["sha256"]}
 
 
 def _verify_rng_handoff(
@@ -121,7 +148,12 @@ def main() -> None:
     parser.add_argument("--new-task-context-bank")
     parser.add_argument("--old-task-context-retrieval-checkpoint")
     parser.add_argument("--new-task-context-retrieval-checkpoint")
-    parser.add_argument("--task-context-mode", choices=("static", "bank", "pooling"), default="static")
+    parser.add_argument("--task-language-encoder")
+    parser.add_argument("--old-task-language-encoder")
+    parser.add_argument("--new-task-language-encoder")
+    parser.add_argument("--task-context-mode", choices=("static", "bank", "pooling", "task_language"), help="Shared override; otherwise use each task config")
+    parser.add_argument("--old-task-context-mode", choices=("static", "bank", "pooling", "task_language"))
+    parser.add_argument("--new-task-context-mode", choices=("static", "bank", "pooling", "task_language"))
     parser.add_argument("--task-context-top-k", type=int, default=5)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--conditions", nargs="+", choices=("base", "old", "new_off", "new_on"), default=["base", "new_off", "new_on"])
@@ -152,6 +184,8 @@ def main() -> None:
             parser.error("--override cannot change the frozen evaluation protocol")
         if key in {"model.zeva.adapter.prefix_layout", "model.zeva.adapter.effect_source"}:
             parser.error("Use --old/--new-prefix-layout and --old/--new-effect-source for prefix contracts")
+        if key in {f"model.zeva.task_context.{field}" for field in ("mode", "bank_path", "retrieval_checkpoint", "language_encoder_path", "top_k")}:
+            parser.error("Use explicit task-context / task-language CLI options for retrieval artifacts")
     required = ["checkpoint", "dataset_stats"]
     if "old" in args.conditions:
         required.append("old_addon_checkpoint")
@@ -165,16 +199,35 @@ def main() -> None:
         if not args.dry_run and not path.is_file():
             parser.error(f"Missing artifact: {path}")
         setattr(args, name, str(path))
+    contracts = {}
+    for condition in args.conditions:
+        new = condition in {"new_off", "new_on"}
+        family = "new" if new else "old"
+        context_mode = getattr(args, f"{family}_task_context_mode") or args.task_context_mode
+        try:
+            contracts[condition] = _policy_contract(
+                args.new_task_config if new else args.old_task_config, args.override,
+                args.new_prefix_layout if new else args.old_prefix_layout,
+                args.new_effect_source if new else args.old_effect_source,
+                task_context_mode=context_mode,
+            )
+            if condition == "base":
+                contracts[condition]["skip_get_obs_within_replan"] = True
+        except ValueError as exc:
+            parser.error(f"Invalid {condition} policy configuration: {exc}")
     condition_assets = {}
     for condition in args.conditions:
         if condition == "base":
             continue
         family = "new" if condition in {"new_on", "new_off"} else "old"
+        context_mode = contracts[condition]["task_context_mode"]
         names = ["cte_checkpoint"]
-        if args.task_context_mode in {"bank", "static"}:
+        if context_mode in {"bank", "static", "task_language"}:
             names.append("task_context_bank")
-        if args.task_context_mode == "static":
+        if context_mode in {"static", "task_language"}:
             names.append("task_context_retrieval_checkpoint")
+        if context_mode == "task_language":
+            names.append("task_language_encoder")
         assets = {}
         for name in names:
             value = getattr(args, f"{family}_{name}") or getattr(args, name)
@@ -184,6 +237,14 @@ def main() -> None:
             if not args.dry_run and not path.is_file():
                 parser.error(f"Missing {condition} artifact: {path}")
             assets[name] = str(path)
+        if not args.dry_run:
+            try:
+                bundle = _foundation_artifact(getattr(args, f"{family}_addon_checkpoint"), contracts[condition]["training_recipe"])
+            except (ValueError, FileNotFoundError) as exc:
+                parser.error(f"Invalid {condition} checkpoint bundle: {exc}")
+            assets.update(bundle)
+            if bundle:
+                contracts[condition]["foundation_sha256"] = bundle["foundation_sha256"]
         condition_assets[condition] = assets
     expected_sha = args.expected_manifest_sha256
     if Path(args.manifest).expanduser().resolve() == (ROOT / "configs/robotwin_cross_attempt_10x20.json").resolve():
@@ -202,19 +263,6 @@ def main() -> None:
         manifest["episodes"] = [row for row in source["episodes"] if row["task"] in args.tasks]
         manifest["parent_manifest_sha256"] = source_sha
         tasks = sorted(args.tasks)
-    contracts = {}
-    for condition in args.conditions:
-        new = condition in {"new_off", "new_on"}
-        try:
-            contracts[condition] = _policy_contract(
-                args.new_task_config if new else args.old_task_config, args.override,
-                args.new_prefix_layout if new else args.old_prefix_layout,
-                args.new_effect_source if new else args.old_effect_source,
-            )
-            if condition == "base":
-                contracts[condition]["skip_get_obs_within_replan"] = True
-        except ValueError as exc:
-            parser.error(f"Invalid {condition} policy configuration: {exc}")
     output = Path(args.output_dir).expanduser().resolve()
     if output.exists():
         parser.error("Output directory must be fresh and must not exist; partial runs cannot be resumed")
@@ -296,13 +344,15 @@ def main() -> None:
                 command.extend([
                     setting("EVALUATION.cte_checkpoint", assets["cte_checkpoint"]),
                     setting("EVALUATION.addon_checkpoint", addon),
-                    setting("model.zeva.task_context.mode", args.task_context_mode),
+                    setting("model.zeva.task_context.mode", contract["task_context_mode"]),
                     setting("model.zeva.task_context.top_k", args.task_context_top_k),
                 ])
                 if assets.get("task_context_bank"):
                     command.append(setting("model.zeva.task_context.bank_path", assets["task_context_bank"]))
                 if assets.get("task_context_retrieval_checkpoint"):
                     command.append(setting("model.zeva.task_context.retrieval_checkpoint", assets["task_context_retrieval_checkpoint"]))
+                if assets.get("task_language_encoder"):
+                    command.append(setting("model.zeva.task_context.language_encoder_path", assets["task_language_encoder"]))
             command.extend(args.override)
             command.extend([
                 setting("model.zeva.adapter.prefix_layout", contract["prefix_layout"]),
@@ -323,7 +373,7 @@ def main() -> None:
         "model_rng_protocol": args.model_rng_protocol,
         "policy_contracts": contracts,
         "policy_artifacts": condition_assets,
-        "artifact_validation": "skipped_dry_run" if args.dry_run else "paths_exist; runtime verifies checkpoint/cache identities",
+        "artifact_validation": "skipped_dry_run" if args.dry_run else "paths and foundation bundle verified; runtime verifies CTE/retrieval identities",
         "commands": commands,
     }
     (output / "command_plan.json").write_text(json.dumps(plan, indent=2) + "\n")

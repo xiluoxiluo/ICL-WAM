@@ -27,6 +27,263 @@ from .task_context import TaskContextBank
 EGO_QUERY_READOUT_FORMAT = "zeva_ego_initial_query_readouts_v1"
 
 
+def episode_task_instructions(base, cache) -> dict[str, str]:
+    """Read raw task text from metadata only, without image/action access.
+
+    This mirrors LeRobot's task-index lookup, not the FastWAM video prompt.
+    A static episode context requires one instruction throughout an episode.
+    Semantic task labels are checked for artifact integrity but never passed
+    into the language classifier as query inputs.
+    """
+    sources = base.lerobot_dataset.multi_dataset._datasets
+    if len(sources) != 1:
+        raise ValueError("Task-language artifacts require exactly one RoboTwin dataset root")
+    source = sources[0]
+    table = source.hf_dataset.with_format(None)
+    required = ("episode_index", "frame_index", "task_index")
+    if not set(required).issubset(table.column_names):
+        raise ValueError("Task-language metadata needs episode_index, frame_index and task_index")
+    table = table.select_columns(list(required))
+    output = {}
+    for identity in ordered_episode_ids(cache):
+        record = cache.episodes[identity]
+        start, length = int(record["dataset_start"]), int(record["episode_length"])
+        rows = table[start:start + length]
+        if len(rows["task_index"]) != length:
+            raise ValueError("Task-language episode extends beyond source metadata")
+        episode_index = int(record["episode_index"])
+        if (identity != f"{source.root}::episode-{episode_index}"
+                or any(int(value) != episode_index for value in rows["episode_index"])
+                or list(map(int, rows["frame_index"])) != list(range(length))):
+            raise ValueError("Task-language source episode/frame identity differs from boundary cache")
+        raw_indices = list(map(int, rows["task_index"]))
+        semantic = str(base.resolve_semantic_task_id(episode_index=episode_index,
+                                                     raw_task_index=raw_indices[0], strict=True))
+        if semantic != str(record["task_id"]):
+            raise ValueError("Task-language source semantic task differs from boundary cache")
+        texts = {str(source.meta.tasks[index]) for index in set(raw_indices)}
+        if len(texts) != 1:
+            raise ValueError("Task-language static context requires a fixed instruction within each episode")
+        override = getattr(base, "override_instruction", None)
+        instruction = str(override) if override is not None else next(iter(texts))
+        if not instruction.strip():
+            raise ValueError("Task-language queries cannot use empty task instructions")
+        output[identity] = instruction
+    return output
+
+
+def _language_bank_metadata(metadata: dict[str, Any], *, encoder_sha256: str) -> dict[str, Any]:
+    from .task_language import TASK_LANGUAGE_FEATURE_KIND
+
+    if "base_checkpoint_sha256" in metadata:
+        raise ValueError("Task-language query artifacts must not depend on a mutable foundation checkpoint")
+    return {
+        **metadata, "key_space": BEHAVIOR_KEY_SPACE, "value_space": BEHAVIOR_VALUE_SPACE,
+        "readout_kind": TASK_LANGUAGE_FEATURE_KIND, "query_mode": "task_language", "split": "train",
+        "foundation_independent_query": True, "encoder_sha256": encoder_sha256,
+        "history_semantics": "full_episode_prefix", "memory_semantics": "predicted_effect_trace",
+        "pooling_rule": "complete_transition_starts_mean_then_l2_keys_and_values",
+        "retrieval_trace_space": "cte_task_head_raw_v1",
+    }
+
+
+def save_ego_task_language_artifacts(cache, features: dict[str, Tensor], *, instructions: dict[str, str],
+                                      bank_path: str | Path, feature_path: str | Path,
+                                      encoder_path: str | Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Save a train-only CTE bank plus pure-language queries for both splits."""
+    from .task_language import FEATURE_FORMAT, TASK_LANGUAGE_FEATURE_KIND
+
+    bank_path, feature_path, encoder_path = (Path(path).expanduser().resolve()
+                                             for path in (bank_path, feature_path, encoder_path))
+    if len({bank_path, feature_path, encoder_path}) != 3 or bank_path.exists() or feature_path.exists():
+        raise ValueError("Language bank/features need distinct unused paths separate from the encoder")
+    if not encoder_path.is_file():
+        raise FileNotFoundError(f"Frozen task-language encoder artifact is missing: {encoder_path}")
+    ids = ordered_episode_ids(cache)
+    if set(features) != set(ids) or set(instructions) != set(ids):
+        raise ValueError("Pure-language queries must cover exactly the CTE train and validation episodes")
+    values = torch.stack([features[identity].detach().float().cpu() for identity in ids])
+    if values.ndim != 2 or values.shape[1] < 1 or not bool(torch.isfinite(values).all()):
+        raise ValueError("Task-language features must be finite float32 [episode,feature]")
+    if any(not isinstance(instructions[identity], str) or not instructions[identity].strip() for identity in ids):
+        raise ValueError("Each language query requires a nonempty raw instruction")
+    entries = pool_train_behavior_entries(cache, instructions)
+    encoder_sha = checkpoint_sha256(encoder_path)
+    full_metadata = {
+        **_language_bank_metadata(metadata, encoder_sha256=encoder_sha),
+        "num_episodes": len(entries), "num_query_episodes": len(ids), "language_feature_dim": values.shape[1],
+        "semantic_task_count": len({entry["task_id"] for entry in entries}),
+    }
+    bank = TaskContextBank(entries, key_dim=cache.manifest.retrieval_dim, value_dim=cache.manifest.global_dim,
+                           temperature=1.0, metadata=full_metadata)
+    for path in (bank_path, feature_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = [path.with_name(f".{path.name}.building-{os.getpid()}") for path in (bank_path, feature_path)]
+    try:
+        bank.save(temporary[0])
+        payload = {
+            "format": FEATURE_FORMAT, "feature_kind": TASK_LANGUAGE_FEATURE_KIND,
+            "source_feature": "task_language", "bank_sha256": checkpoint_sha256(temporary[0]),
+            "encoder_sha256": encoder_sha, "episode_ids": ids,
+            "task_ids": [str(cache.episodes[identity]["task_id"]) for identity in ids],
+            "instructions": [instructions[identity] for identity in ids], "features": values,
+            "episode_splits": cache.splits, "metadata": full_metadata,
+        }
+        torch.save(payload, temporary[1])
+        load_ego_task_language_features(temporary[1], temporary[0], encoder_path, cache,
+                                         expected_metadata=metadata)
+        for source, destination in zip(temporary, (bank_path, feature_path), strict=True):
+            source.replace(destination)
+    finally:
+        for path in temporary:
+            path.unlink(missing_ok=True)
+    return {"train_episodes": len(entries), "query_episodes": len(ids),
+            "language_feature_dim": values.shape[1], "bank_sha256": checkpoint_sha256(bank_path),
+            "language_feature_cache_sha256": checkpoint_sha256(feature_path)}
+
+
+def load_ego_task_language_features(path: str | Path, bank_path: str | Path,
+                                     encoder_path: str | Path, cache, *,
+                                     expected_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    from .task_language import FEATURE_FORMAT, TASK_LANGUAGE_FEATURE_KIND
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if (payload.get("format") != FEATURE_FORMAT or payload.get("feature_kind") != TASK_LANGUAGE_FEATURE_KIND
+            or payload.get("source_feature") != "task_language"):
+        raise ValueError("Expected task-only frozen input-embedding feature cache")
+    encoder_sha = checkpoint_sha256(encoder_path)
+    for key, expected in (("bank_sha256", checkpoint_sha256(bank_path)),
+                          ("encoder_sha256", encoder_sha), ("episode_splits", cache.splits)):
+        if payload.get(key) != expected:
+            raise ValueError(f"Task-language feature identity mismatch: {key}")
+    ids, features = payload.get("episode_ids"), payload.get("features")
+    if not isinstance(ids, list) or len(set(ids)) != len(ids) or set(ids) != set(cache.episodes):
+        raise ValueError("Task-language feature cache must cover every CTE query episode exactly once")
+    if (not isinstance(features, Tensor) or features.ndim != 2 or features.shape[0] != len(ids)
+            or features.dtype != torch.float32 or not bool(torch.isfinite(features).all())):
+        raise ValueError("Invalid task-language feature tensor")
+    tasks, instructions = payload.get("task_ids"), payload.get("instructions")
+    if tasks != [str(cache.episodes[identity]["task_id"]) for identity in ids]:
+        raise ValueError("Task-language task labels disagree with CTE episode metadata")
+    if (not isinstance(instructions, list) or len(instructions) != len(ids)
+            or any(not isinstance(value, str) or not value.strip() for value in instructions)):
+        raise ValueError("Task-language feature cache requires one raw instruction per episode")
+    expected = _language_bank_metadata(dict(expected_metadata or {}), encoder_sha256=encoder_sha)
+    bank = TaskContextBank.load(bank_path, expected_key_dim=cache.manifest.retrieval_dim,
+                                expected_value_dim=cache.manifest.global_dim)
+    validate_behavior_bank(bank, expected)
+    if bank.temperature != 1.0:
+        raise ValueError("Reference task-scoped cosine/softmax retrieval uses temperature=1.0")
+    if {entry["episode_id"] for entry in bank.entries} != set(cache.splits["train"]):
+        raise ValueError("Task-language memory must contain exactly the CTE training episodes")
+    for key, value in expected.items():
+        if payload.get("metadata", {}).get(key) != value:
+            raise ValueError(f"Task-language feature metadata mismatch: {key}")
+    if features.shape[1] != bank.metadata.get("language_feature_dim"):
+        raise ValueError("Task-language feature dimension differs from the bank/encoder contract")
+    return payload
+
+
+def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, feature_path: str | Path,
+                                           encoder_path: str | Path, head_path: str | Path,
+                                           output_path: str | Path, expected_metadata: dict[str, Any],
+                                           top_k: int = 5, device: str | torch.device = "cpu",
+                                           batch_size: int = 512) -> dict[str, Any]:
+    """Classify language, then aggregate that task's train demos without GT scope."""
+    from .task_language import TaskLanguageMemory, task_language_identity
+
+    inputs = tuple(Path(path).expanduser().resolve() for path in (bank_path, feature_path, encoder_path, head_path))
+    output_path = Path(output_path).expanduser().resolve()
+    if output_path in inputs or output_path.exists() or batch_size < 1:
+        raise ValueError("Task-language static contexts need a positive batch and an unused output path")
+    bank_path, feature_path, encoder_path, head_path = inputs
+    query = load_ego_task_language_features(feature_path, bank_path, encoder_path, cache,
+                                            expected_metadata=expected_metadata)
+    checkpoint = torch.load(head_path, map_location="cpu", weights_only=False)
+    if checkpoint.get("feature_cache_sha256") != checkpoint_sha256(feature_path):
+        raise ValueError("Language classifier was trained with a different feature artifact")
+    train, validation = set(checkpoint.get("train_episode_ids", [])), set(checkpoint.get("validation_episode_ids", []))
+    if train & validation or train | validation != set(cache.splits["train"]):
+        raise ValueError("Language classifier train/selection episodes must stay inside the CTE training split")
+    memory = TaskLanguageMemory.load(bank_path, head_path, encoder_path=encoder_path, top_k=top_k,
+                                     device=device, expected=expected_metadata)
+    contexts, indices, scores, sources = [], [], [], []
+    ids, train_ids = query["episode_ids"], set(cache.splits["train"])
+    with torch.no_grad():
+        for start in range(0, len(ids), batch_size):
+            stop = min(start + batch_size, len(ids))
+            exclusions = [identity if identity in train_ids else None for identity in ids[start:stop]]
+            result = memory.retrieve(query["features"][start:stop].to(device), exclude_episode_ids=exclusions)
+            contexts.append(result.values.float().cpu())
+            indices.append(result.indices.cpu())
+            scores.append(result.scores.float().cpu())
+            sources.extend(result.sources)
+    identity = task_language_identity(bank_path, head_path, encoder_path, top_k=top_k)
+    metadata = {
+        **memory.bank.metadata, "bank_sha256": checkpoint_sha256(bank_path),
+        "retrieval_checkpoint_sha256": checkpoint_sha256(head_path),
+        "language_encoder_sha256": identity["language_encoder_sha256"],
+        "language_feature_cache_sha256": checkpoint_sha256(feature_path), "top_k": top_k, "temperature": 1.0,
+        "query_scope": "train_and_validation_task_language_only", "task_context_identity": identity,
+        "train_query_exclusion": "leave_one_episode_out_in_task_mean_and_candidates",
+        "validation_query_sources": "train_only", "scope_selection": "predicted_task_only",
+    }
+    payload = {"format": STATIC_CONTEXT_FORMAT, "episode_ids": ids, "task_contexts": torch.cat(contexts),
+               "retrieval_indices": torch.cat(indices), "retrieval_scores": torch.cat(scores),
+               "retrieval_sources": sources, "episode_splits": cache.splits, "metadata": metadata}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.building-{os.getpid()}")
+    try:
+        torch.save(payload, temporary)
+        checked = StaticEpisodeContextCache(temporary)
+        if set(checked.episode_ids) != set(cache.episodes):
+            raise ValueError("Task-language static cache omitted held-out query episodes")
+        temporary.replace(output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {"episodes": len(ids), "train_queries": len(train_ids),
+            "validation_queries": len(cache.splits["validation"]), "top_k": top_k,
+            "static_cache_sha256": checkpoint_sha256(output_path)}
+
+
+def validate_ego_task_language_static_context(static_context: StaticEpisodeContextCache, *, cache,
+                                               bank_path: str | Path, feature_path: str | Path,
+                                               encoder_path: str | Path, head_path: str | Path,
+                                               expected_metadata: dict[str, Any], top_k: int = 5) -> dict[str, Any]:
+    """Validate immutable query artifacts independently of a trainable foundation."""
+    from .task_language import TASK_LANGUAGE_FEATURE_KIND, task_language_identity
+
+    query = load_ego_task_language_features(feature_path, bank_path, encoder_path, cache,
+                                            expected_metadata=expected_metadata)
+    identity = task_language_identity(bank_path, head_path, encoder_path, top_k=top_k)
+    expected = {
+        **expected_metadata, "bank_sha256": identity["bank_sha256"],
+        "retrieval_checkpoint_sha256": identity["head_sha256"],
+        "language_encoder_sha256": identity["language_encoder_sha256"],
+        "language_feature_cache_sha256": checkpoint_sha256(feature_path), "top_k": top_k, "temperature": 1.0,
+        "readout_kind": TASK_LANGUAGE_FEATURE_KIND, "query_mode": "task_language",
+        "foundation_independent_query": True, "scope_selection": "predicted_task_only",
+        "train_query_exclusion": "leave_one_episode_out_in_task_mean_and_candidates",
+        "validation_query_sources": "train_only",
+        "task_context_identity": identity,
+    }
+    for key, value in expected.items():
+        if static_context.metadata.get(key) != value:
+            raise ValueError(f"Task-language static-context identity mismatch: {key}")
+    if "base_checkpoint_sha256" in static_context.metadata:
+        raise ValueError("Task-language static queries cannot depend on a mutable foundation checkpoint")
+    if set(static_context.episode_ids) != set(cache.episodes):
+        raise ValueError("Task-language static context must cover the exact CTE train/validation queries")
+    checkpoint = torch.load(head_path, map_location="cpu", weights_only=False)
+    if (checkpoint.get("source_feature") != "task_language"
+            or checkpoint.get("feature_cache_sha256") != checkpoint_sha256(feature_path)):
+        raise ValueError("Static task-language context does not use the expected trained classifier")
+    train, validation = set(checkpoint.get("train_episode_ids", [])), set(checkpoint.get("validation_episode_ids", []))
+    if train & validation or train | validation != set(cache.splits["train"]):
+        raise ValueError("Language classifier train/selection episodes must stay inside the CTE training split")
+    return query
+
+
 def ordered_episode_ids(cache) -> list[str]:
     return sorted(cache.episodes, key=lambda identity: (int(cache.episodes[identity]["dataset_start"]), identity))
 

@@ -4,17 +4,20 @@ defaults:
   - _self_
 
 # Reference PIM steps/seed/group LRs; effective batch is explicitly reported
-# by the launcher. FastWAM remains frozen (a deliberate architecture adapter).
+# by the launcher. After warmup, update FastWAM foundation + EAP + PIM.
 learning_rate: 5.0e-5
 gradient_accumulation_steps: 64  # batch1 x accumulation64 x 4 GPUs = reference256
 max_steps: 2000
 seed: 20260919
 lr_scheduler_type: constant
 zeva_eap_learning_rate: 1.0e-5
+zeva_foundation_learning_rate: 1.0e-6
 zeva_pim_warmup_steps: 500
 
 model:
+  mot_checkpoint_mixed_attn: true
   zeva:
     training_stage: pim_adapter
-    training_recipe: ego_adapter_warmup
+    training_recipe: ego_joint_warmup
+    freeze_fastwam: false
     policy_checkpoint: null  # required: new predictive Stage2A

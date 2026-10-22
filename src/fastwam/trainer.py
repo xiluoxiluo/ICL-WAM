@@ -12,7 +12,7 @@ import time
 import numpy as np
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DistributedType, GradientAccumulationPlugin
+from accelerate.utils import DistributedDataParallelKwargs, DistributedType, GradientAccumulationPlugin
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, LambdaLR, LinearLR, SequentialLR
@@ -69,7 +69,8 @@ class Wan22Trainer:
         if self.zeva_training:
             logger.info("Zeva training stage: %s", self.zeva_training_stage)
         self.zeva_training_recipe = str(getattr(self.model, "zeva_training_recipe", "frozen_parent"))
-        self.ego_curriculum = self.zeva_training and self.zeva_training_recipe == "ego_adapter_warmup"
+        self.ego_curriculum = self.zeva_training and self.zeva_training_recipe in {"ego_adapter_warmup", "ego_joint_warmup"}
+        self.joint_foundation_training = self.zeva_training and self.zeva_training_recipe == "ego_joint_warmup"
         self.predictive_zeva = self.zeva_training and getattr(
             getattr(getattr(self.model, "zeva_behavior_prefix_adapter", None), "config", None),
             "effect_source", "latest_completed",
@@ -91,7 +92,7 @@ class Wan22Trainer:
         self.ego_available_history_kinds = ()
         if self.ego_curriculum:
             if getattr(self.train_dataset, "history_schedule", None) != "ego_optimizer_step":
-                raise ValueError("ego_adapter_warmup requires optimizer-step history candidates")
+                raise ValueError("ego warmup recipes require optimizer-step history candidates")
             self.ego_available_history_kinds = tuple(self.train_dataset.pim.manifest["globally_available_history_kinds"])
             if self.ego_warmup_steps < 1:
                 raise ValueError("zeva_pim_warmup_steps must be positive")
@@ -103,6 +104,12 @@ class Wan22Trainer:
             )} if self.predictive_zeva else {"gradient_accumulation_steps": self.gradient_accumulation_steps}),
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
+            # Action-only training does not use the video output head or the
+            # final video post-attention branch. Discover those unused weights
+            # while keeping a static trainable set across the LR-only warmup.
+            kwargs_handlers=([DistributedDataParallelKwargs(
+                find_unused_parameters=True, broadcast_buffers=False,
+            )] if self.joint_foundation_training else []),
         )
         
         deepspeed_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
@@ -136,6 +143,10 @@ class Wan22Trainer:
                 self._initialize_policy_stage_from_warmstart()
             elif self.zeva_training_stage == "pim_adapter":
                 self._initialize_pim_stage_from_policy_checkpoint()
+        if self.joint_foundation_training:
+            self.model.prepare_zeva_joint_training_precision()
+            logger.info("Joint training uses FP32 trainable parameters/Adam states with %s autocast; frozen encoders retain their dtype",
+                        self.mixed_precision)
         if self.zeva_training:
             if self.zeva_training_stage == "policy_injection":
                 trainable_params = list(self.model.zeva_trainable_parameters())
@@ -151,8 +162,17 @@ class Wan22Trainer:
                         {"params": pim_params, "lr": self.learning_rate, "name": "pim"},
                         {"params": eap_params, "lr": float(cfg.get("zeva_eap_learning_rate", 1e-5)), "name": "eap"},
                     ]
-                    logger.info("Predictive PIM: %d PIM-only steps, then PIM+EAP; FastWAM frozen; effective batch=%d",
-                                self.ego_warmup_steps, self.batch_size * self.gradient_accumulation_steps * self.accelerator.num_processes)
+                    if self.joint_foundation_training:
+                        foundation_params = self.model.zeva_foundation_parameters()
+                        foundation_lr = float(cfg.get("zeva_foundation_learning_rate", 1e-6))
+                        if not math.isfinite(foundation_lr) or foundation_lr <= 0:
+                            raise ValueError("zeva_foundation_learning_rate must be finite and positive")
+                        trainable_params += foundation_params
+                        optimizer_params.append({"params": foundation_params, "lr": foundation_lr, "name": "foundation"})
+                    logger.info("Predictive PIM: %d PIM-only steps, then %s; effective batch=%d",
+                                self.ego_warmup_steps,
+                                "foundation+EAP+PIM" if self.joint_foundation_training else "PIM+EAP with frozen FastWAM",
+                                self.batch_size * self.gradient_accumulation_steps * self.accelerator.num_processes)
                     logger.info("Real available history kinds: %s (5:2:1, then 5:2:1:2 with empty)", self.ego_available_history_kinds)
                 elif (
                     getattr(adapter.config, "pim_variant", "legacy") == "cross_attempt"
@@ -203,11 +223,13 @@ class Wan22Trainer:
             sum(p.numel() for p in trainable_params),
             sum(p.numel() for p in self.model.parameters() if not p.requires_grad),
         )
+        if len({id(parameter) for parameter in trainable_params}) != len(trainable_params):
+            raise ValueError("optimizer groups contain duplicate trainable parameters")
         self.optimizer = torch.optim.AdamW(
             optimizer_params,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
-            betas=(0.9, 0.95),
+            betas=(0.9, 0.999) if self.joint_foundation_training else (0.9, 0.95),
         )
         
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
@@ -216,13 +238,16 @@ class Wan22Trainer:
         warmup_steps = int(total_train_steps * 0.05)
         if self.ego_curriculum:
             if str(cfg.lr_scheduler_type) != "constant":
-                raise ValueError("ego_adapter_warmup uses constant group LRs after PIM-only warmup")
+                raise ValueError("ego warmup recipes use constant group LRs after PIM-only warmup")
             if total_train_steps <= self.ego_warmup_steps:
                 raise ValueError("formal predictive PIM training must continue past warmup")
-            self.scheduler = LambdaLR(self.optimizer, lr_lambda=[
+            lr_factors = [
                 lambda step: 1.0,
                 lambda step: eap_lr_factor(step, self.ego_warmup_steps),
-            ])
+            ]
+            if self.joint_foundation_training:
+                lr_factors.append(lambda step: eap_lr_factor(step, self.ego_warmup_steps))
+            self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_factors)
         else:
             self.scheduler = self._build_scheduler(
                 scheduler_type=cfg.lr_scheduler_type,
@@ -250,8 +275,8 @@ class Wan22Trainer:
         ensure_dir(self.eval_dir)
         self._zeva_metrics_file = None
         if self.zeva_training and self.accelerator.is_main_process:
-            # Stage 2 is an addon-only artifact; keep the resolved config and
-            # scalar trace beside it for reproducibility and gate diagnostics.
+            # Joint Stage2 additionally saves a foundation sidecar. Keep the
+            # resolved config and scalar trace beside the weight bundle.
             OmegaConf.save(
                 config=self.cfg,
                 f=os.path.join(self.output_dir, "config.yaml"),
@@ -651,9 +676,11 @@ class Wan22Trainer:
             keys.update(("learning_rate", "weight_decay", "max_grad_norm", "lr_scheduler_type",
                          "max_steps", "num_epochs", "seed", "batch_size",
                          "gradient_accumulation_steps", "mixed_precision"))
-        if expected == "ego_adapter_warmup":
+        if expected in {"ego_adapter_warmup", "ego_joint_warmup"}:
             keys.update(("zeva_pim_warmup_steps", "zeva_eap_learning_rate", "learning_rate", "seed",
                          "gradient_accumulation_steps", "batch_size"))
+        if expected == "ego_joint_warmup":
+            keys.add("zeva_foundation_learning_rate")
         saved = payload.get("config", {})
         for key in sorted(keys):
             if saved.get(key) != self.cfg.get(key):
@@ -1130,9 +1157,9 @@ class Wan22Trainer:
         self.accelerator.wait_for_everyone()
 
         if self.zeva_training:
-            # Saving Accelerator's complete model state here would duplicate
-            # the frozen Wan/Action/MoT/VAE weights.  Zeva needs only the
-            # addon optimizer/scheduler for a resumable Stage 2 run.
+            # Weights were saved above: addon-only for frozen recipes, or an
+            # addon plus the complete policy-backbone sidecar for joint mode.
+            # VAE/text/CTE stay frozen and are not duplicated here.
             if self.accelerator.is_main_process:
                 torch.save(
                     {

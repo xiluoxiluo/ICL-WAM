@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .wan_video_dit import flash_attention, modulate, rope_apply
 from fastwam.utils.logging_config import get_logger
@@ -25,9 +26,9 @@ class MoT(nn.Module):
 
         self.mixtures = nn.ModuleDict(mixtures)
         self.expert_order = list(self.mixtures.keys())
-        if mot_checkpoint_mixed_attn:
-            raise ValueError("Wan MoT gradient checkpointing is not supported by the compiled tensor core.")
-        self.mot_checkpoint_mixed_attn = False
+        # Supported for the causal video-prefill/action-cache tensor path.
+        # The compiled joint video/action training core remains separate.
+        self.mot_checkpoint_mixed_attn = bool(mot_checkpoint_mixed_attn)
         self.compile_training_layers = False
 
         first_expert = self.mixtures[self.expert_order[0]]
@@ -531,6 +532,30 @@ class MoT(nn.Module):
             )
         return x
 
+    def _run_cached_tensor_layer(self, function, *args):
+        if self.mot_checkpoint_mixed_attn and self.training and torch.is_grad_enabled():
+            if self.compile_training_layers:
+                raise ValueError("cached-action gradient checkpointing cannot be combined with compiled training layers")
+            # Non-reentrant checkpointing records the autograd graph, supports
+            # DDP's unused-parameter discovery, and preserves dropout RNG.
+            return checkpoint(function, *args, use_reentrant=False, preserve_rng_state=True)
+        return function(*args)
+
+    def _prefill_video_tensor_layer(self, block, x, freqs, t_mod, context, context_mask, attention_mask):
+        q, k, v, residual, gate_msa, shift_mlp, scale_mlp, gate_mlp, _ = self._build_expert_attention_io(
+            expert=self.mixtures["video"], block=block, x=x, freqs=freqs, t_mod=t_mod,
+        )
+        mixed = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads,
+                                ctx_mask=attention_mask.to(device=q.device))
+        updated = self._apply_expert_post_block_tensor(
+            block=block, residual_x=residual, mixed_attn_out=mixed, gate_msa=gate_msa,
+            shift_mlp=shift_mlp, scale_mlp=scale_mlp, gate_mlp=gate_mlp,
+            context=context, context_mask=context_mask,
+        )
+        # These are tensor outputs, not mutated external caches. Recomputing a
+        # layer in backward cannot append duplicate history or detach video K/V.
+        return updated, k, v
+
     def prefill_video_cache_tensor(
         self,
         video_tokens: torch.Tensor,
@@ -547,46 +572,30 @@ class MoT(nn.Module):
         cache_v_list: list[torch.Tensor] = []
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
-            (
-                q,
-                k,
-                v,
-                residual_x,
-                gate_msa,
-                shift_mlp,
-                scale_mlp,
-                gate_mlp,
-                _use_gradient_checkpointing,
-            ) = self._build_expert_attention_io(
-                expert=expert,
-                block=block,
-                x=x,
-                freqs=video_freqs,
-                t_mod=video_t_mod,
-            )
-            mixed = flash_attention(
-                q=q,
-                k=k,
-                v=v,
-                num_heads=self.num_heads,
-                ctx_mask=video_attention_mask.to(device=q.device),
-            )
-            x = self._apply_expert_post_block_tensor(
-                block=block,
-                residual_x=residual_x,
-                mixed_attn_out=mixed,
-                gate_msa=gate_msa,
-                shift_mlp=shift_mlp,
-                scale_mlp=scale_mlp,
-                gate_mlp=gate_mlp,
-                context=video_context,
-                context_mask=video_context_mask,
+            x, k, v = self._run_cached_tensor_layer(
+                self._prefill_video_tensor_layer, block, x, video_freqs, video_t_mod,
+                video_context, video_context_mask, video_attention_mask,
             )
             cache_k_list.append(k)
             cache_v_list.append(v)
         if return_hidden:
             return cache_k_list, cache_v_list, x
         return cache_k_list, cache_v_list
+
+    def _action_cache_tensor_layer(self, block, x, freqs, t_mod, context, context_mask,
+                                   video_k, video_v, attention_mask):
+        q, k, v, residual, gate_msa, shift_mlp, scale_mlp, gate_mlp, _ = self._build_expert_attention_io(
+            expert=self.mixtures["action"], block=block, x=x, freqs=freqs, t_mod=t_mod,
+        )
+        mixed = flash_attention(
+            q=q, k=torch.cat([video_k, k], dim=1), v=torch.cat([video_v, v], dim=1),
+            num_heads=self.num_heads, ctx_mask=attention_mask.to(device=q.device),
+        )
+        return self._apply_expert_post_block_tensor(
+            block=block, residual_x=residual, mixed_attn_out=mixed, gate_msa=gate_msa,
+            shift_mlp=shift_mlp, scale_mlp=scale_mlp, gate_mlp=gate_mlp,
+            context=context, context_mask=context_mask,
+        )
 
     def forward_action_with_video_cache_tensor(
         self,
@@ -603,40 +612,10 @@ class MoT(nn.Module):
         x = action_tokens
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
-            (
-                q_action,
-                k_action,
-                v_action,
-                residual_x,
-                gate_msa,
-                shift_mlp,
-                scale_mlp,
-                gate_mlp,
-                _use_gradient_checkpointing,
-            ) = self._build_expert_attention_io(
-                expert=expert,
-                block=block,
-                x=x,
-                freqs=action_freqs,
-                t_mod=action_t_mod,
-            )
-            mixed = flash_attention(
-                q=q_action,
-                k=torch.cat([video_cache_k[layer_idx], k_action], dim=1),
-                v=torch.cat([video_cache_v[layer_idx], v_action], dim=1),
-                num_heads=self.num_heads,
-                ctx_mask=action_attention_mask.to(device=q_action.device),
-            )
-            x = self._apply_expert_post_block_tensor(
-                block=block,
-                residual_x=residual_x,
-                mixed_attn_out=mixed,
-                gate_msa=gate_msa,
-                shift_mlp=shift_mlp,
-                scale_mlp=scale_mlp,
-                gate_mlp=gate_mlp,
-                context=action_context,
-                context_mask=action_context_mask,
+            x = self._run_cached_tensor_layer(
+                self._action_cache_tensor_layer, block, x, action_freqs, action_t_mod,
+                action_context, action_context_mask, video_cache_k[layer_idx], video_cache_v[layer_idx],
+                action_attention_mask,
             )
         return x
 
@@ -739,6 +718,8 @@ class MoT(nn.Module):
         action_context_mask: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mot_checkpoint_mixed_attn and self.training and torch.is_grad_enabled():
+            raise ValueError("MoT gradient checkpointing supports the cached-action path, not joint video/action core training")
         if self.training and self.compile_training_layers and not hasattr(self, "_compiled_joint_layer"):
             self._compiled_joint_layer = torch.compile(
                 self._forward_joint_layer,

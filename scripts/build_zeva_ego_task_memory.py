@@ -1,8 +1,10 @@
 """Build train-only task memory, then static contexts for train + validation.
 
-Use task_context.build_stage=bank first, train the existing static retrieval
-head with train_zeva_task_context_retrieval.py, then build_stage=static_context.
-Both stages retain the exact CTE episode split and boundary-cache identity.
+Use task_context.build_stage=bank first. In task_language mode this exports
+the frozen input-embedding encoder and raw-instruction features; train its
+classifier with train_zeva_task_language.py, then build_stage=static_context.
+Legacy static mode retains initial-image/text retrieval. Both modes retain
+the exact CTE episode split and boundary-cache identity.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from fastwam.zeva.ego_cte_training import require_ego_checkpoint_ready, sha256_f
 from fastwam.zeva.ego_episode_data import EGO_CAMERA_KEYS, RoboTwinEgoEpisodeDataset
 from fastwam.zeva.ego_task_memory import (
     build_ego_static_context_cache, ordered_episode_ids, save_ego_task_memory,
+    build_ego_task_language_context_cache, episode_task_instructions, save_ego_task_language_artifacts,
 )
 
 
@@ -93,6 +96,9 @@ def build(cfg: DictConfig) -> dict:
         raise ValueError("This split-aware task-memory builder uses one process; do not launch multi-rank torchrun")
     zeva, data = cfg.model.zeva, cfg.data.train
     tc = zeva.task_context
+    task_language = str(tc.get("mode", "static")) == "task_language"
+    if str(tc.get("mode", "static")) not in {"static", "task_language"}:
+        raise ValueError("Predictive task-memory builder supports static or task_language mode")
     stage = str(tc.get("build_stage", "bank"))
     if stage not in {"bank", "static_context"}:
         raise ValueError("task_context.build_stage must be bank or static_context")
@@ -100,12 +106,20 @@ def build(cfg: DictConfig) -> dict:
         raise ValueError("New task memory requires the predictive multiview Zeva-Ego CTE")
     cache_path = _path(zeva.cache.path, "model.zeva.cache.path", existing=True)
     cte_path = _path(zeva.cte.checkpoint, "model.zeva.cte.checkpoint", existing=True)
-    base_path = _path(cfg.get("ckpt"), "ckpt (frozen FastWAM base)", existing=True)
+    base_path = None if task_language else _path(cfg.get("ckpt"), "ckpt (frozen FastWAM base)", existing=True)
     stats_path = _path(data.pretrained_norm_stats, "data.train.pretrained_norm_stats", existing=True)
     semantic_path = _path(data.semantic_task_map_path, "data.train.semantic_task_map_path", existing=True)
     bank_path = _path(tc.bank_path, "task_context.bank_path", existing=stage == "static_context")
-    train_readout_path = _path(tc.readout_cache_path, "task_context.readout_cache_path", existing=stage == "static_context")
-    query_path = _path(tc.query_readout_cache_path, "task_context.query_readout_cache_path", existing=stage == "static_context")
+    if task_language:
+        encoder_path = _path(tc.get("language_encoder_path"), "task_context.language_encoder_path",
+                             existing=stage == "static_context")
+        feature_path = _path(tc.get("language_feature_cache_path"), "task_context.language_feature_cache_path",
+                             existing=stage == "static_context")
+        if float(tc.temperature) != 1.0:
+            raise ValueError("Zeva-Ego task-language retrieval requires temperature=1.0")
+    else:
+        train_readout_path = _path(tc.readout_cache_path, "task_context.readout_cache_path", existing=stage == "static_context")
+        query_path = _path(tc.query_readout_cache_path, "task_context.query_readout_cache_path", existing=stage == "static_context")
     cache = EgoBoundaryCache(cache_path)
     checkpoint = torch.load(cte_path, map_location="cpu", weights_only=False)
     require_ego_checkpoint_ready(checkpoint)
@@ -128,22 +142,68 @@ def build(cfg: DictConfig) -> dict:
     if dataset_paths != [str(Path(path).expanduser().resolve()) for path in cached_paths]:
         raise ValueError("Readout dataset paths differ from the CTE boundary cache")
     metadata = {
-        "base_checkpoint_sha256": checkpoint_sha256(base_path), "cte_checkpoint_sha256": cte_sha,
+        "cte_checkpoint_sha256": cte_sha,
         "dataset_stats_sha256": stats_sha, "semantic_task_map_sha256": semantic_sha,
         "phase_cache_manifest_sha256": sha256_file(cache_path / "manifest.json"),
         "episode_splits_sha256": sha256_file(cache_path / "episode_splits.json"),
-        "video_size": video_size, "context_len": int(cfg.model.tokenizer_max_len),
         "dataset_dirs": dataset_paths, "camera_keys": list(EGO_CAMERA_KEYS),
         "executed_horizon": 24, "action_dim": 14, "history_semantics": "full_episode_prefix",
         "memory_semantics": "predicted_effect_trace", "cte_variant": "zeva_ego", "effect_source": "current_prediction",
         "pooling_rule": "complete_transition_starts_mean_then_l2_keys_and_values",
         "retrieval_trace_space": "cte_task_head_raw_v1",
     }
+    if not task_language:
+        metadata.update({"base_checkpoint_sha256": checkpoint_sha256(base_path),
+                         "video_size": video_size, "context_len": int(cfg.model.tokenizer_max_len)})
     del checkpoint
     configured_device = cfg.get("device")
     device = torch.device(str(configured_device) if configured_device not in (None, "", "None", "null")
                           else "cuda" if torch.cuda.is_available() else "cpu")
-    if stage == "static_context":
+    if task_language:
+        from fastwam.zeva.task_language import (
+            FrozenTaskLanguageEncoder, export_task_language_encoder_from_fastwam_config,
+        )
+
+        if stage == "static_context":
+            head_path = _path(tc.retrieval_checkpoint, "task_context.retrieval_checkpoint", existing=True)
+            output = _path(tc.static_episode_cache_path, "task_context.static_episode_cache_path")
+            result = build_ego_task_language_context_cache(
+                cache=cache, bank_path=bank_path, feature_path=feature_path, encoder_path=encoder_path,
+                head_path=head_path, output_path=output, expected_metadata=metadata,
+                top_k=int(tc.top_k), device=device, batch_size=int(tc.get("static_context_batch_size", 512)),
+            )
+        else:
+            if bank_path.exists() or feature_path.exists():
+                raise ValueError("Task-language bank/features require unused output paths")
+            if not bool(data.get("is_training_set", False)) or float(data.get("val_set_proportion", -1)) != 0:
+                raise ValueError("Read all CTE source episodes with is_training_set=true and val_set_proportion=0")
+            if int(data.global_sample_stride) != 1:
+                raise ValueError("Task-language metadata requires source stride1")
+            # Only Arrow metadata is read; cached policy embeddings, RGB and
+            # FastWAM model construction are unnecessary for language queries.
+            source_cfg = OmegaConf.create(OmegaConf.to_container(data, resolve=True))
+            source_cfg.use_text_embed_cache = False
+            base = instantiate(source_cfg)
+            instructions = episode_task_instructions(base, cache)
+            if not encoder_path.exists():
+                export_task_language_encoder_from_fastwam_config(
+                    cfg.model, encoder_path, max_length=int(tc.get("language_max_length", 200)),
+                )
+            encoder = FrozenTaskLanguageEncoder.load(encoder_path)
+            ids = ordered_episode_ids(cache)
+            feature_batch = int(tc.get("language_feature_batch_size", 256))
+            if feature_batch < 1:
+                raise ValueError("language_feature_batch_size must be positive")
+            features = {}
+            for start in range(0, len(ids), feature_batch):
+                selected = ids[start:start + feature_batch]
+                encoded = encoder.encode([instructions[identity] for identity in selected], device="cpu")
+                features.update(zip(selected, encoded, strict=True))
+            result = save_ego_task_language_artifacts(
+                cache, features, instructions=instructions, bank_path=bank_path, feature_path=feature_path,
+                encoder_path=encoder_path, metadata={**metadata, "builder": Path(__file__).name},
+            )
+    elif stage == "static_context":
         head_path = _path(tc.retrieval_checkpoint, "task_context.retrieval_checkpoint", existing=True)
         output = _path(tc.static_episode_cache_path, "task_context.static_episode_cache_path")
         result = build_ego_static_context_cache(cache=cache, bank_path=bank_path, train_readout_path=train_readout_path,

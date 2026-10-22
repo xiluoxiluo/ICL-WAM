@@ -42,7 +42,9 @@ def test_manifest_uses_per_condition_layout_and_configured_reader_capacity(
     monkeypatch.setattr(sys, "argv", [
         "eval", "--checkpoint", "base.pt", "--dataset-stats", "stats.json",
         "--cte-checkpoint", "cte.pt", "--old-addon-checkpoint", "old.pt",
-        "--new-addon-checkpoint", "new.pt", "--task-context-mode", "pooling",
+        "--new-addon-checkpoint", "new.pt", "--old-task-context-mode", "pooling",
+        "--new-task-context-bank", "bank.pt", "--new-task-context-retrieval-checkpoint", "classifier.pt",
+        "--new-task-language-encoder", "language.pt",
         "--old-task-config", old_task, "--conditions", "old", "new_off", "new_on",
         "--output-dir", str(tmp_path / "run"), "--dry-run",
     ])
@@ -57,6 +59,7 @@ def test_manifest_uses_per_condition_layout_and_configured_reader_capacity(
         "prefix_layout": "zeva_ego", "effect_source": "current_prediction",
         "pim_variant": "cross_attempt", "pim_top_k": 192,
         "memory_semantics": "predicted_effect_trace", "prior_variant": "zeva_ego",
+        "training_recipe": "ego_joint_warmup", "task_context_mode": "task_language",
         "skip_get_obs_within_replan": True,
     }
     for item in plan["commands"]:
@@ -107,6 +110,7 @@ def test_manifest_uses_condition_specific_cte_and_context_artifacts(tmp_path, mo
         "--old-task-context-bank", "old_bank.pt", "--new-task-context-bank", "new_bank.pt",
         "--old-task-context-retrieval-checkpoint", "old_head.pt",
         "--new-task-context-retrieval-checkpoint", "new_head.pt",
+        "--new-task-language-encoder", "new_language.pt",
         "--conditions", "old", "new_off", "new_on", "--output-dir", str(tmp_path / "run"), "--dry-run",
     ])
     main()
@@ -119,3 +123,6 @@ def test_manifest_uses_condition_specific_cte_and_context_artifacts(tmp_path, mo
         assert Path(json.loads(fields["EVALUATION.cte_checkpoint"])).name == f"{family}_cte.pt"
         assert Path(json.loads(fields["model.zeva.task_context.bank_path"])).name == f"{family}_bank.pt"
         assert Path(json.loads(fields["model.zeva.task_context.retrieval_checkpoint"])).name == f"{family}_head.pt"
+        assert json.loads(fields["model.zeva.task_context.mode"]) == ("static" if family == "old" else "task_language")
+        if family == "new":
+            assert Path(json.loads(fields["model.zeva.task_context.language_encoder_path"])).name == "new_language.pt"

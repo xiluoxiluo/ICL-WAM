@@ -1,8 +1,8 @@
-# ICL-WAM：按 Zeva-Ego 重新对齐 CTE、预测 effect 与 RoboTwin PIM 评测
+# ICL-WAM：Zeva-Ego 预测 CTE、语言检索、联合训练与 RoboTwin PIM 评测
 
 本指南对应新的 `current_prediction` 路径。参考代码固定到 [Zeva `feature/zeva_ego` 的 `bae85ad753d3afe4f2e56762373d48ac0267e101`](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101)，不依赖分支持续变化后的实现。此前只有独立 prefix 的版本使用 `latest_completed`，其 [旧指南](zeva_ego_cross_attempt.md) 保留用于复现。
 
-**这次必须重新训练 CTE，并重建依赖它的缓存、task memory、retrieval head、Stage2A 和 Stage2B。** 原来的 4-step transition / 16-step completed-effect CTE 与当前预测任务不同，不能靠修改 YAML 或 checkpoint metadata 转换。已有 FastWAM base、原始数据、相同归一化统计、语义任务表及语言 embedding cache 可以复用。
+当前默认在上一版预测 CTE 基础上，再把 **Stage2B foundation 联合更新**及**纯语言 task-scoped retrieval**对齐参考。若已按提交 `5344a78` 训练预测CTE，可复用该CTE及其boundary/PIM缓存；需要重建语言检索产物，并重新训练Stage2A、Stage2B。若仍使用更早的4-step transition / 16-step completed-effect CTE，则须先训练新的预测CTE，不能靠修改YAML或checkpoint metadata转换。已有FastWAM base、原始数据、相同归一化统计、语义任务表及匹配的policy文本embedding cache可以复用。
 
 ## 1. 实际参考了哪些内容
 
@@ -12,7 +12,8 @@
 | [CTE / EAP 实现](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/src/openpi/zeva/cte_eap.py)、[CTE 训练器](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/train_cte.py) | 三路 RGB、三流因果 Mamba、上一段已执行动作、EMA 视觉变化目标、epoch 训练与独立验证。EAP prior 由 phase 查询 global 产生的 8 个 waypoint。 |
 | [CTE artifact 导出](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/export_cte_artifacts.py) | task memory 仅用 train episodes；仅池化有完整下一段执行目标的状态；raw task-head / phase 分别求均值后再做 L2 归一化。在线当前预测 trace 与 task prototype 的池化范围明确区分。 |
 | [数据合同](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/README_DATASET.md) | episode 级 train/validation 分离，明确相机、动作尺度、真实执行长度；保留 FastWAM 的 joint14，不能混用参考 pi0.5 的 relative-EEF16 统计。 |
-| [PIM policy](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/src/openpi/zeva/pim_policy.py)、[PIM 训练](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/train_cross_attempt_pim.py) | 保存每个真实决策边界的预测 effect；当前 attempt 结束后提交历史。训练先 PIM-only，再 EAP+PIM；历史模式按 optimizer step 索引固定循环。 |
+| [PIM policy](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/src/openpi/zeva/pim_policy.py)、[PIM 训练](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/train_cross_attempt_pim.py) | 保存每个真实决策边界的预测effect；当前attempt结束后提交历史。先PIM-only，再foundation+EAP+PIM；学习率分别1e-6 / 1e-5 / 5e-5，历史模式按optimizer step固定循环。 |
+| [TaskLanguageMemory](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/src/openpi/zeva/cte_eap_policy.py) | 冻结纯语言输入特征和分类器；预测task后，用同任务CTE mean key查询同任务train demos。top-5 cosine softmax不除以0.07。 |
 | [评测指南](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/README_EVALUATION.md)、[checkpoint 包合同](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/README_CHECKPOINT.md) | 冻结 10×20 manifest、最多四次尝试、成功即停、固定分母、8 个连续 RNG slot、reset / video / artifact 身份审计。参考发布权重属于 pi0.5，不能直接当 FastWAM addon 加载。 |
 
 ### 保留的 FastWAM 适配边界
@@ -24,13 +25,13 @@
 | CTE 图像 | 三路独立 RGB224 | 同样三路独立 RGB224；不使用 Wan VAE latent 或融合图像裁块 |
 | policy 图像 | 参考 pi0.5 输入 | 保持 FastWAM 的三相机融合图 384×320 |
 | phase / effect / global | raw interaction256 / predicted effect256 / task context256 | 对齐；检索 key128、辅助 phase head128 不与 raw phase 混淆 |
-| Stage2B 第500步后 | foundation + EAP + PIM 都更新 | EAP + PIM 更新，FastWAM 底座冻结 |
-| task retrieval query | frozen task-language classifier 先预测 task，再在该 task 的 train demos 内检索 | 保留冻结 FastWAM 初始 image+text hidden readout，训练 retrieval head 后检索 train bank |
+| Stage2B 第500步后 | foundation + EAP + PIM 都更新 | 对齐；更新FastWAM MoT/video/action及动作路径使用的proprio参数，CTE/VAE/文本编码器冻结 |
+| task retrieval query | frozen task-language classifier 先预测task，再在该task的train demos内检索 | 对齐同一推理机制；输入特征来自固定Wan文本输入embedding表，分类器须在本地重训 |
 | 连续模型随机流 | 参考模型及其 CUDA 随机实现 | 显式 CPU Torch 初始动作噪声流，记录 `torch_continuous_slot_v1` |
 
-保持底座冻结使静态检索特征和独立 addon 权重保持一致。它是有意保留的适配差异，不是完整复现参考底座联合微调。以后若解冻 FastWAM，需要同时版本化底座权重、检索读出身份和发布包。
+联合训练不改变检索输入：语言encoder、分类器和train bank各自固化并绑定SHA256，均不读正在更新的video/action hidden states。部署按addon中记录的相对文件名自动加载配对foundation权重，缺失或身份不匹配时明确报错。
 
-参考当前 CTE/EAP policy 的 `TaskLanguageMemory` 使用语言分类与 task-scoped 检索，见 [cte_eap_policy.py](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/src/openpi/zeva/cte_eap_policy.py)。本项目继续使用已有 FastWAM initial-readout retrieval head；不会在推理中输入真实 task label 或 episode ID 来挑选任务。这里对齐的是 CTE 表征、train-only prototype 和因果时序，检索 query 的来源保留为 FastWAM 适配。
+参考分支发布了语言分类器的consumer/MLP实现，并从既有handoff加载分类器；没有发布可直接照搬到FastWAM的独立分类器训练入口。因此这里**按相同的推理机制重建本地分类器**，采用Wan的固定输入embedding和本项目CTE key space。下文分类器的2000步、batch32等是本项目重建配方，不声称是Zeva原分类器的公开训练配方，也不使用不兼容的pi0.5权重。
 
 ## 2. 当前 context 怎样影响 action
 
@@ -40,7 +41,7 @@
 z_t, e_hat_t = CTE.step(I_t, A_(t-1), attempt_local_state)
 target_effect_t = stop_gradient(EMA_vision(I_(t+1)) - EMA_vision(I_t))
 c_t = PIM_readout(z_t, phases_from_completed_attempts, predicted_effects_from_completed_attempts)
-g_t = static_task_context + U(c_t)
+g_t = frozen_language_retrieved_context + U(c_t)
 prefix = [G(g_t), E(e_hat_t), P(c_t)]
 prior_mean, prior_std = EAP_prior(g_t, z_t)
 ```
@@ -49,7 +50,7 @@ prior_mean, prior_std = EAP_prior(g_t, z_t)
 
 第一次重规划已经有有效 `e_hat_t`，无需等待16步 completed effect。生成动作后将 `(z_t,e_hat_t)` 追加到当前 pending trace；当前 query 不读取自身新条目。attempt 结束后才把 trace 提交 PIM；新 episode 清空所有尝试历史。每个历史 attempt 均匀保留至多64条，最多读取3个已结束 attempt。末尾不足24步不制造额外 CTE target，终止后也不额外预测一条不存在的下一次决策。
 
-`new_off` 关闭 `U(c_t)` 和独立 `P(c_t)`，仍保留当前预测 effect、静态 global、phase 和 EAP。它表示**同一新 Stage2B 权重关闭 PIM**；由于 EAP 在后半段训练中更新过，它不再等同于最初 Stage2A 权重。
+`new_off` 关闭 `U(c_t)` 和独立 `P(c_t)`，仍保留当前预测effect、语言检索global、phase和EAP。它表示**同一新Stage2B addon及微调foundation关闭PIM**；foundation和EAP均已在后半段更新，不等同于最初Stage2A或原始FastWAM base。
 
 新路径没有参与输出的标量 `pim_gate`。应观察实际 action 变化、prefix 有效性、attention 读出与成功率，不能继续用旧 gate 数值判断记忆是否有效。
 
@@ -68,7 +69,7 @@ ICLWAM_STATS=/absolute/path/to/robotw_stats.json
 ICLWAM_TASKS=/absolute/path/to/semantic_task_map.json
 ICLWAM_TEXT=/absolute/path/to/text_embeds_cache
 ICLWAM_BASE=/absolute/path/to/fastwam_base.pt
-ICLWAM_RUN=/absolute/path/to/runs/iclwam_predictive_v1
+ICLWAM_RUN=/absolute/path/to/runs/iclwam_joint_language_v1
 
 DATA_ARGS=(
   "data.train.dataset_dirs=[$ICLWAM_DATA]"
@@ -125,15 +126,15 @@ python scripts/train_zeva_ego_cte.py \
 
 ## 5. 重建 boundary cache、task memory 与 PIM cache
 
-先设置新产物路径。以下命令按顺序执行，不要覆盖旧实验目录。
+先设置新产物路径。以下命令是全新构建流程，按顺序执行，不要覆盖旧实验目录。复用 `5344a78` 预测版产物时，将CTE、BOUNDARY、PIM_TRAIN、PIM_VAL变量指向已有且身份匹配的产物，并跳过对应训练/builder；语言encoder/features/bank/classifier/static使用新的空路径重建。
 
 ```bash
 ICLWAM_CTE="$ICLWAM_RUN/cte/cte_epoch_080.pt"
 ICLWAM_BOUNDARY="$ICLWAM_RUN/boundary_cache"
 ICLWAM_BANK="$ICLWAM_RUN/task_memory.pt"
-ICLWAM_READOUT="$ICLWAM_RUN/train_readouts.pt"
-ICLWAM_QUERY="$ICLWAM_RUN/query_readouts.pt"
-ICLWAM_HEAD="$ICLWAM_RUN/retrieval_head.pt"
+ICLWAM_LANGUAGE_ENCODER="$ICLWAM_RUN/task_language_encoder.pt"
+ICLWAM_LANGUAGE_FEATURES="$ICLWAM_RUN/task_language_features.pt"
+ICLWAM_HEAD="$ICLWAM_RUN/task_language_classifier.pt"
 ICLWAM_STATIC="$ICLWAM_RUN/static_contexts.pt"
 ICLWAM_PIM_TRAIN="$ICLWAM_RUN/pim_train"
 ICLWAM_PIM_VAL="$ICLWAM_RUN/pim_validation"
@@ -143,8 +144,8 @@ ARTIFACT_ARGS=(
   "model.zeva.cte.checkpoint=$ICLWAM_CTE"
   "model.zeva.cache.path=$ICLWAM_BOUNDARY"
   "model.zeva.task_context.bank_path=$ICLWAM_BANK"
-  "model.zeva.task_context.readout_cache_path=$ICLWAM_READOUT"
-  "model.zeva.task_context.query_readout_cache_path=$ICLWAM_QUERY"
+  "model.zeva.task_context.language_encoder_path=$ICLWAM_LANGUAGE_ENCODER"
+  "model.zeva.task_context.language_feature_cache_path=$ICLWAM_LANGUAGE_FEATURES"
   "model.zeva.task_context.retrieval_checkpoint=$ICLWAM_HEAD"
   "model.zeva.task_context.static_episode_cache_path=$ICLWAM_STATIC"
 )
@@ -152,7 +153,8 @@ ARTIFACT_ARGS=(
 python scripts/build_zeva_ego_boundary_cache.py \
   task=robotwin_zeva_ego_policy_3cam_384 "${DATA_ARGS[@]}" "${ARTIFACT_ARGS[@]}"
 
-# 若相同模型/指令的文本cache已存在，可复用；否则先生成。
+# policy仍需要原有文本cache；若相同模型/指令的cache存在，可复用。
+# task-language分类器只使用独立导出的input embedding，不使用此policy cache。
 python scripts/precompute_text_embeds.py \
   task=robotwin_zeva_ego_policy_3cam_384 "${DATA_ARGS[@]}" data.val=null +overwrite=false
 
@@ -160,7 +162,7 @@ python scripts/build_zeva_ego_task_memory.py \
   task=robotwin_zeva_ego_policy_3cam_384 "${DATA_ARGS[@]}" "${ARTIFACT_ARGS[@]}" \
   model.zeva.task_context.build_stage=bank
 
-python scripts/train_zeva_task_context_retrieval.py \
+python scripts/train_zeva_task_language.py \
   task=robotwin_zeva_ego_policy_3cam_384 "${DATA_ARGS[@]}" "${ARTIFACT_ARGS[@]}"
 
 python scripts/build_zeva_ego_task_memory.py \
@@ -187,11 +189,29 @@ key_e   = L2Normalize(mean(task_head(z_t) for t in S_e))  # 128
 value_e = L2Normalize(mean(z_t for t in S_e))            # 256
 ```
 
-归一化发生在轨迹均值之后；不能先把每个 `task_head(z_t)` 归一化再求均值。partial final decision 可以保留在在线/PIM预测历史中，但不进入上述prototype池化。bank metadata明确记录该规则，旧bank不能混用。检索时在train bank中以归一化query与key计算cosine，按temperature0.07对top-K分数softmax后加权value；返回的加权context不再强制单位化。
+归一化发生在轨迹均值之后；不能先把每个 `task_head(z_t)` 归一化再求均值。partial final decision 可以保留在在线/PIM预测历史中，但不进入上述prototype池化。bank metadata明确记录该规则，旧image+text bank需按新查询合同重建；不是给旧bank改一个mode字符串。
 
-`build_stage=bank` 同时输出标准 **train-only readout cache** 和独立的 **all-query readout cache**。前者供现有retrieval-head训练入口使用；后者包含全部train/validation初始image+instruction查询，避免为了给validation提供static context而把其未来轨迹放入bank。`build_stage=static_context` 对train查询排除自身episode，对validation查询仅检索train bank。retrieval head 的训练与内部选择episode也只能来自CTE train split，并与Stage1的held-out validation保持隔离；默认内部20%选择集不改变CTE split。
+### 语言分类器与检索
 
-bank与两个readout产物绑定base/CTE/stats/semantic map、boundary manifest和episode split身份；static context进一步绑定train/all-query readout与head的SHA256。PIM的历史源同样仅限其他train episodes；两个Stage2查询split与Stage1保持一致。bank/readout构建为单进程GPU入口，static context可在CPU或GPU执行；新入口不接收多rank `torchrun`。
+`build_stage=bank` 导出固定tokenizer快照和文本**输入embedding表**，并从原始episode metadata读取instruction，生成包含train/validation查询的独立语言特征文件；不解码RGB，也不实例化FastWAM DiT/VAE或执行完整T5。输入先去首尾空白、把下划线和换行换为空格，再补末尾换行；最多200个token，按attention mask对输入embedding求均值。这个encoder快照在离线构建、分类器训练与在线部署间共用，不随foundation更新。
+
+`train_zeva_task_language.py` 仅从CTE train split选择样本，再按episode划分内部80%训练/20%选择集。类别prototype只由该内部训练子集的CTE keys构建；CTE held-out validation不参与分类器梯度、prototype或checkpoint选择。归一化MLP映射到128维，按与冻结task prototypes的相似度做交叉熵；默认2000步、batch32、AdamW LR1e-4/weight decay1e-4，以内部选择集top-1、再以loss选择checkpoint。训练loss的temperature0.07只用于分类器学习，不是下面检索聚合的温度。
+
+在线只接收instruction，依次计算：
+
+```text
+language_feature = masked_mean(frozen_input_embeddings(instruction))
+predicted_task = argmax(classifier(language_feature) @ task_prototypes.T)
+query = L2Normalize(mean(train_bank.keys[predicted_task]))
+supports = top5_cosine(query, train_bank.keys[predicted_task])
+task_context = softmax(supports.cosine_scores) @ supports.values
+```
+
+分类器的候选类别限制在bank预先声明的task集合，而不是由当前评测episode的真实task标签缩小。top-5聚合temperature为1，返回的加权context不再强制单位化；不足5个合格support时只用真实条目。该路径不接收在线task标签、episode ID、图像或phase。每次attempt缓存语言检索结果；retry清空缓存后仍由相同instruction重新计算。
+
+`build_stage=static_context` 对train查询执行leave-one-episode-out：既从同任务mean-key query中移除自身，也从support候选中移除自身；validation仅查询train bank。离线GT task只用于监督分类器和建立bank metadata，static context仍由语言预测task决定。bank、features、encoder、classifier和static context绑定CTE/stats/semantic map、boundary/split及各自SHA256，prepared训练还会检查原始instruction与feature cache一致。旧的image+text retrieval head不能混入新路径。
+
+上述语言bank/features/classifier/static构建支持CPU，不需要加载FastWAM base；语言输入embedding资产必须可用。统一命令中的`ckpt`供后续policy训练使用。PIM历史源同样仅限其他train episodes；Stage2查询split与Stage1保持一致。artifact入口均为单进程，不接收多rank `torchrun`。
 
 若有真实Clean/Randomized条件标签，两个PIM builder都额外传相同的 `--conditions /absolute/path/to/episode_conditions.json`，格式为 `{canonical_episode_id: condition_string}`。没有真实条件文件时不会伪造cross-condition，manifest记录所有query共同可用的模式；调度从固定循环中删除实际不可用的模式条目。内部名称 `far` 对应参考的 `same_condition_far`。
 
@@ -219,24 +239,34 @@ torchrun --standalone --nproc_per_node=4 scripts/train_zeva_fastwam_prepared.py 
   output_dir="$ICLWAM_RUN/stage2b"
 ```
 
-Stage2A训练global/effect投影、EAP prior和action-prior adapter；PIM关闭。默认5000步是本项目的初始预算，不是已验证最优值。旧Stage2A不能作为新预测版warmstart或parent，因为phase/effect维度、prior结构和CTE身份都变了。
+Stage2A保持FastWAM冻结，训练global/effect投影、EAP prior和action-prior adapter；PIM关闭。默认5000步是本项目的初始预算，不是已验证最优值。本轮语言检索改变了global context来源及artifact identity，因此应在新语言static contexts上重训Stage2A；旧image+text Stage2A不能改metadata冒充新parent。已有预测CTE的维度和训练任务没有再次改变。
 
-Stage2B默认2000个optimizer updates、seed20260919、weight decay1e-4、clip1：
+Stage2B默认 `training_recipe=ego_joint_warmup`、`freeze_fastwam=false`，2000个optimizer updates、seed20260919、AdamW betas=(0.9,0.999)、weight decay1e-4、clip1：
 
 | 更新阶段 | 参数 / LR | 每轮固定循环中的历史模式次数 |
 | --- | --- | --- |
-| 前500次更新 | PIM reader、`U`、`P`：5e-5；EAP LR=0 | 依次 matched×5、far×2、cross×1，无empty |
-| 后1500次更新 | PIM：5e-5；EAP：1e-5；FastWAM仍冻结 | 依次 matched×5、far×2、cross×1、empty×2 |
+| 前500次更新 | PIM reader、`U`、`P`：5e-5；EAP与foundation LR=0 | 依次 matched×5、far×2、cross×1，无empty |
+| 后1500次更新 | PIM：5e-5；EAP：1e-5；foundation：1e-6 | 依次 matched×5、far×2、cross×1、empty×2 |
 
-每个非空训练样本只取一个previous attempt，均匀压缩至多64条；部署仍允许三次历史。模式沿参考实现用 `active_schedule[optimizer_step % len(active_schedule)]` 选择；先删除不可用的真实历史模式，再按从0开始的全局optimizer step索引，进入后半段也不重置step。所有rank和梯度累积microbatch共享该mode；dataset worker仅预取候选，不决定warmup进度。模式选择不使用额外随机数，保留的 `seed` 参数仅用于接口兼容；训练seed仍控制数据顺序和噪声。LR=0阶段只对有效更新的PIM参数做梯度裁剪。空模式保留current predicted effect，后半段仍可训练EAP。
+foundation参数组包括MoT中的video/action experts及动作路径使用的proprio encoder；VAE、完整文本编码器、CTE和语言检索始终冻结。训练损失仍为action path + EAP prior；不增加video生成loss，未参与该损失的video output head等参数不会凭空得到更新。foundation和EAP从开始就在optimizer中，warmup仅通过LR=0控制，避免中途改变DDP trainable集合。video输入投影移出了`no_grad`区域；VAE编码仍在`no_grad`中。
+
+每个非空训练样本只取一个previous attempt，均匀压缩至多64条；部署仍允许三次历史。模式沿参考实现用 `active_schedule[optimizer_step % len(active_schedule)]` 选择；先删除不可用的真实历史模式，再按从0开始的全局optimizer step索引，进入后半段也不重置step。所有rank和梯度累积microbatch共享该mode；dataset worker仅预取候选，不决定warmup进度。模式选择不使用额外随机数，保留的 `seed` 参数仅用于接口兼容；训练seed仍控制数据顺序和噪声。LR=0阶段只裁剪有效更新的PIM参数，之后联合裁剪。空模式保留current predicted effect，后半段仍训练foundation和EAP。
 
 上面的4GPU配置为batch1 × accumulation64 × world4 = 256。若改为单GPU且需相同effective batch，设置 `gradient_accumulation_steps=256`；多GPU数或microbatch变化时相应调整。程序记录实际effective batch，不应把不同batch的实验说成完全相同的配方。EAP损失按参考采用坐标求和后的Gaussian NLL，系数0.01；prior训练dropout0.4，推理scale0.5。
+
+联合训练在创建optimizer前把可训练参数保留为FP32，再以bf16 autocast计算，避免1e-6级更新被bf16参数舍入吞掉。默认开启video prefill/action cache逐层non-reentrant gradient checkpointing，保持反传和dropout RNG一致；不能同时启用compiled training layers。普通DDP每卡仍保存完整参数、梯度与optimizer state，4GPU命令只是batch配方示例，不代表已验证4×80GB可容纳当前模型。请先在实际模型上测量峰值显存；增加accumulation不能消除模型状态的显存开销。
 
 每250步做独立离线验证，每500步保存。Stage2B验证使用固定非空历史模式，并为on/off复用同一flow noise/time。关注 `val_memory_gain`、`memory/prior_mean_delta_rms`、各prefix有效性/幅值和实际执行动作差异。它们用于诊断，不能替代RoboTwin成功率。
 
 Stage2续训使用 `resume=/.../checkpoints/state/step_XXXXXX`；新配方校验warmup、学习率、seed、batch、accumulation、精度和总步数，绑定train/validation cache身份，恢复数据位置和每个rank的Python/NumPy/Torch RNG，并检查world size和完整checkpoint标记。候选历史按query身份确定，DataLoader预取不改变它。DDP尾部先按完整global batch补齐再应用恢复偏移，保持连续训练与续训的样本顺序。梯度累积跨数据epoch边界继续，不在epoch尾提前产生不足effective batch的更新。
 
 新预测训练支持单进程或普通DDP，精度为默认bf16或`no`；明确拒绝当前未保存分片优化器状态的DeepSpeed/FSDP，以及未保存scaler的fp16配置。仅加载addon权重不能恢复优化器/RNG；新预测路径的`resume`要求完整state目录，不能传单个addon文件。这不改变旧版配置的加载行为。
+
+### 联合训练checkpoint与上一版对照
+
+每次保存联合训练权重时生成一对文件：`step_XXXXXX_addon.pt` 与 `step_XXXXXX_foundation.pt`。后者包含MoT/video/action和proprio状态，不重复保存冻结的VAE/文本/CTE；前者记录foundation文件名、SHA256、step与原始base身份。搬移或部署时必须把两者一起复制到同一目录，不能任意替换其中一个。`--checkpoint`仍指向原始FastWAM base；加载addon时自动用配对foundation覆盖policy主干。续训同时恢复该主干及optimizer/scheduler/RNG。
+
+复现上一版“预测CTE + image/text static retrieval + 冻结foundation”的Stage2B时使用独立task `robotwin_zeva_ego_pim_frozen_3cam_384` 和它自己的旧bank/head/static/Stage2A，并设置 `model.zeva.task_context.readout_cache_path=/absolute/path/to/old_train_readouts.pt`，recipe仍为 `ego_adapter_warmup`。该readout cache只供旧prepared训练预检，部署旧模型不需要它。不要在新joint task下加载旧frozen addon；新模式会拒绝这种混用。
 
 ## 7. RoboTwin PIM evaluation
 
@@ -248,6 +278,7 @@ python scripts/eval_zeva_robotwin_manifest.py \
   --new-cte-checkpoint "$ICLWAM_CTE" --new-addon-checkpoint "$ICLWAM_STAGE2B" \
   --new-task-context-bank "$ICLWAM_BANK" \
   --new-task-context-retrieval-checkpoint "$ICLWAM_HEAD" \
+  --new-task-language-encoder "$ICLWAM_LANGUAGE_ENCODER" \
   --conditions base new_off new_on \
   --new-task-config robotwin_zeva_ego_pim_3cam_384 \
   --new-prefix-layout zeva_ego --new-effect-source current_prediction \
@@ -261,14 +292,16 @@ python scripts/eval_zeva_robotwin_manifest.py \
 
 上例显式写出当前默认的新task、effect来源和RNG协议。`--model-rng-seed` 是 `--model-seed` 的别名，`--effect-source` 是 `--new-effect-source` 的兼容别名。回放旧采样规则才使用 `--model-rng-protocol request_seed_stream_v1`；它每个task重建request-seed流，不是参考的连续slot协议。`--pim-diagnostic-interval 10` 用于测量局部同噪声action差异，会增加memory-on推理耗时；比较部署速度时使用 `--pim-diagnostic-interval 0` 并单独保留诊断实验。
 
-加入旧版对照时，增加 `old` condition，并提供它**自己的** `--old-cte-checkpoint`、`--old-addon-checkpoint`、`--old-task-context-bank`、`--old-task-context-retrieval-checkpoint`。旧版默认task为 `robotwin_zeva_fastwam_cross_attempt_3cam_384`，默认三token `zeva_ego` 布局、`--old-effect-source latest_completed`；更早的合并token模型需显式 `--old-prefix-layout legacy_merged`，原top-4 reader还需 `--old-task-config robotwin_zeva_fastwam_pim_3cam_384`。不能把新CTE的phase/effect256维或新bank喂给旧phase/effect128维模型。原共享 `--cte-checkpoint`、`--task-context-bank`、`--task-context-retrieval-checkpoint` 仍可作为未指定对应old/new路径时的fallback；`new_off` 与 `new_on` 始终使用相同的新模型组合。
+加入旧版对照时，增加 `old` condition，并提供它**自己的** `--old-cte-checkpoint`、`--old-addon-checkpoint`、`--old-task-context-bank`、`--old-task-context-retrieval-checkpoint`。若对比上一版预测CTE/frozen foundation，另加 `--old-task-config robotwin_zeva_ego_pim_frozen_3cam_384 --old-effect-source current_prediction`；old保留static image+text retrieval，新模型为task_language。更早版本的默认old task仍为 `robotwin_zeva_fastwam_cross_attempt_3cam_384`，默认三token `zeva_ego` 布局及 `--old-effect-source latest_completed`；合并token模型需显式 `--old-prefix-layout legacy_merged`，原top-4 reader还需 `--old-task-config robotwin_zeva_fastwam_pim_3cam_384`。不能把新CTE的phase/effect256维或新bank喂给旧phase/effect128维模型。
+
+共享 `--cte-checkpoint`、`--task-context-bank`、`--task-context-retrieval-checkpoint`、`--task-language-encoder` 仍可作为对应old/new路径未指定时的fallback。每个condition的mode从各自task读取，也可用 `--old-task-context-mode` / `--new-task-context-mode` 显式选择；joint只允许task_language。`new_off` 与 `new_on` 始终使用相同的新addon、微调foundation、CTE和语言检索组合。正式runner在启动仿真前检查foundation sidecar和recipe；frozen plan、slot RNG身份及attempt审计均记录foundation和encoder/classifier/bank的SHA256，防止实际评测了错误底座。
 
 ### 固定协议
 
 1. 使用仓库内冻结的10任务×20scene seed及完整seen指令manifest和 `demo_randomized`。本项目源文件SHA256固定为 `588a85f45dc961ccf3b4ecba3a1651eeb126c4a8368d8ac7f7485c3aa4e145cf`；它转换了schema并记录joint14/H32/replan24，因此与Zeva原文件的 `1b9dbf74bd9d9b8871647a00d6557f84884685d4459065f004bd600a86b1679b` 不同。当前资产的expert有效性检查失败会中止，不换seed。
 2. 一个episode至多4个attempt；失败后用同一scene seed、同一instruction重建环境，成功即停。每个episode开始PIM为空，retry保留此前attempt的预测trace并重置CTE状态。
 3. 排序后的task按index modulo8分配slot。每个condition有独立的8个slot随机流；每次重规划只抽一次 `[1,32,14]` CPU float32初始动作噪声，同slot跨task连续。当前runner在 `--gpu-id` 指定的GPU上顺序执行slot/task并持久化状态；8个逻辑slot不表示自动启动8GPU并行。
-4. task的全部rollout正常结束后才原子写出RNG状态；runner先核对完整checkpoint组合、任务顺序和日志末尾snapshot，再执行下一个task。完整run结束后才对全部attempt日志和视频统一审计。失败的部分run不能续跑或重用目录。protocol、checkpoint、CTE、bank/head、slot、scene/instruction、reset scope、draw计数和视频路径参与审计；完整通过后才生成`COMPLETE`。
+4. task的全部rollout正常结束后才原子写出RNG状态；runner先核对完整checkpoint组合、任务顺序和日志末尾snapshot，再执行下一个task。完整run结束后才对全部attempt日志和视频统一审计。失败的部分run不能续跑或重用目录。protocol、recipe、checkpoint/foundation、CTE、bank/classifier/language encoder、slot、scene/instruction、reset scope、draw计数和视频路径参与审计；完整通过后才生成`COMPLETE`。
 5. 报告第1/2/3/4次以内至少成功一次的累计 solved / total / rate，分母始终是全部200episode。没有第4次attempt的早期成功episode仍计为成功，不用“实际执行了第4次的次数”作分母。
 
 8-slot连续协议与参考对齐，但CPU Torch噪声不能宣称与参考CUDA/pi0.5噪声逐元素相同。不同条件的早期成功/重试次数不同，也会改变之后episode在连续流中的offset；因此整轮on/off是同manifest、预算、slot初始seed和权重的协议对照。**同一重规划点的paired诊断**才严格复用同一初始动作噪声，且不额外推进随机流。
@@ -296,9 +329,11 @@ runner的 `--expected-manifest-sha256` 校验输入的**源文件**；reporter�
 
 ## 8. 已验证范围与结果解释
 
-本次在 CPU 环境（PyTorch 2.7.1、Accelerate 1.12.0）执行 `OMP_NUM_THREADS=1 PYTHONPATH=src python -m pytest -q tests/zeva`，结果为 **301 passed**；另有1条旧 scheduler 的弃用 warning。新Hydra入口配置解析和全部变更Python文件的语法检查通过。
+本次在CPU环境（PyTorch 2.7.1、Accelerate 1.12.0）执行 `OMP_NUM_THREADS=1 PYTHONPATH=src python -m pytest -q tests/zeva`，结果为 **340 passed、1 skipped**；skip是受限环境无法创建loopback socket的双进程DDP测试，另有1条旧scheduler弃用warning。同一DDP测试已在允许本机loopback的执行中单独通过。新Hydra入口配置解析和全部变更Python文件的语法检查通过。
 
 CPU测试覆盖CTE batch/streaming一致、过去动作shift、未来图像/动作不泄漏、EMA与BN、尾部mask、损失数值、episode无放回/划分、readiness拒绝、task memory隔离、预测cache到部署生命周期，以及真实小型WanVideoDiT/ActionDiT/MoT中的梯度与动作扰动。另有连续slot RNG、fresh output、manifest身份、固定分母、reset/video审计和mock runner状态机测试。
+
+本轮新增验证包括：warmup时foundation/EAP不变、联合阶段video输入投影/action/proprio实际更新、CTE/文本/VAE保持冻结；BF16 autocast下FP32主干能保留1e-6更新；恢复完整bundle、Adam moments、scheduler和RNG后下一步loss及参数与连续训练逐元素相同；activation checkpoint开关不改变loss/梯度/RNG；双rank经过warmup/joint/empty-PIM后权重一致。语言检索使用真实小型tokenizer快照与分类器端到端验证，故意令held-out GT task与instruction不同仍按语言预测路由，改变CTE validation特征不影响分类器训练，LOO同时影响mean-key与support，旧artifact/encoder漂移及foundation缺失或错误均被拒绝。
 
 这些验证说明实现能把context接到action且遵守数据/时间/评测合同。**本次修改没有实际运行80epoch GPU训练，也没有运行200episode RoboTwin仿真；没有新的成功率结果。** 正式运行仍需CUDA/Mamba、真实数据、FastWAM权重、RoboTwin资产和视频渲染环境。
 

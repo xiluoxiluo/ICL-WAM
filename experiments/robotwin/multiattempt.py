@@ -229,6 +229,26 @@ def audit_protocol_trace(manifest: dict[str, Any], rows: list[dict[str, Any]]) -
                 for key in ("prefix_layout", "effect_source", "memory_semantics", "prior_variant"):
                     if row.get(key) != contracts[condition][key]:
                         raise ValueError(f"Runtime {key} differs from the frozen policy contract")
+                for key in ("training_recipe", "task_context_mode"):
+                    if key in contracts[condition] and row.get(key) != contracts[condition][key]:
+                        raise ValueError(f"Runtime {key} differs from the frozen policy contract")
+                if contracts[condition].get("training_recipe") == "ego_joint_warmup":
+                    _sha256(hashes.get("foundation_sha256"), "joint foundation SHA256")
+                    if hashes.get("training_recipe") != "ego_joint_warmup":
+                        raise ValueError("Joint model identity does not declare its training recipe")
+                    frozen_foundation = contracts[condition].get("foundation_sha256")
+                    if frozen_foundation is not None and hashes["foundation_sha256"] != frozen_foundation:
+                        raise ValueError("Loaded foundation differs from the frozen evaluation checkpoint bundle")
+                if contracts[condition].get("task_context_mode") == "task_language":
+                    task_identity = hashes.get("task_context")
+                    if not isinstance(task_identity, dict) or task_identity.get("mode") != "task_language":
+                        raise ValueError("Task-language evaluation requires a matching retrieval identity")
+                    for key in ("bank_sha256", "head_sha256", "language_encoder_sha256"):
+                        _sha256(task_identity.get(key), key)
+                    if (task_identity.get("readout_kind") != "frozen_task_input_embedding_mean_v1"
+                            or task_identity.get("query_scope") != "language_predicted_task"
+                            or task_identity.get("temperature") != 1.0):
+                        raise ValueError("Task-language retrieval contract differs from the frozen reference semantics")
         before, after = row.get("seed_stream_before"), row.get("seed_stream")
         for snapshot in (before, after):
             if not isinstance(snapshot, dict) or snapshot.get("protocol") != protocol["model_rng_protocol"]:

@@ -317,6 +317,7 @@ def test_evaluation_wrapper_selects_static_head_and_default_top_five(monkeypatch
         "eval", "--task", "test", "--seed", "0", "--ckpt", "base.pt",
         "--cte-checkpoint", "cte.pt", "--addon-checkpoint", "addon.pt",
         "--task-context-bank", "bank.pt", "--task-context-retrieval-checkpoint", "head.pt",
+        "--sim-task", "robotwin_zeva_ego_pim_frozen_3cam_384",
     ])
     commands = []
     monkeypatch.setattr(subprocess, "call", lambda cmd, cwd: commands.append(cmd) or 0)

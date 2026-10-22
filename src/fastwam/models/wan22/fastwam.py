@@ -1,4 +1,6 @@
 from typing import Any, Optional, Sequence, Union
+from contextlib import nullcontext
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -91,10 +93,12 @@ class FastWAM(torch.nn.Module):
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
         self.compile_training_denoise = bool(compile_training_denoise)
+        if self.compile_training_denoise and self.mot.mot_checkpoint_mixed_attn:
+            raise ValueError("cached-action gradient checkpointing cannot be combined with compiled training layers")
         self.mot.compile_training_layers = self.compile_training_denoise
 
-        # Optional Zeva addon.  It is deliberately outside the frozen FastWAM
-        # experts and is only populated by the Zeva runtime configuration.
+        # Optional Zeva addon, separate from the pretrained policy backbone;
+        # the training recipe controls whether that backbone is updated.
         self.zeva_enabled = False
         self.zeva_prompt_encoder = None
         self.zeva_behavior_prefix_adapter = None
@@ -242,8 +246,8 @@ class FastWAM(torch.nn.Module):
     ) -> torch.Tensor:
         """Clean initial-image/text readout, with no action, proprio, or addon.
 
-        Mirrors Zeva's mean of final vision hidden states at diffusion time
-        zero. FastWAM's video MoT stream supplies the corresponding states.
+        This is the legacy FastWAM image+text retrieval adaptation. The newer
+        task-language route does not call into the changing policy backbone.
         """
         if input_image.ndim != 4 or input_image.shape[1] != 3:
             raise ValueError("initial image must be [B,3,H,W]")
@@ -1086,11 +1090,45 @@ class FastWAM(torch.nn.Module):
                 list(self.zeva_prompt_encoder.parameters())
                 + list(adapter.pim_adapter_parameters())
                 + (list(adapter.policy_injection_parameters())
-                   if getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_adapter_warmup" else [])
+                   if getattr(self, "zeva_training_recipe", "frozen_parent") in {"ego_adapter_warmup", "ego_joint_warmup"} else [])
+                + (self.zeva_foundation_parameters() if self.zeva_joint_foundation else [])
             )
         raise RuntimeError(
             f"unsupported Zeva training stage: {self.zeva_training_stage}"
         )
+
+    @property
+    def zeva_joint_foundation(self) -> bool:
+        return (self.zeva_training_stage == "pim_adapter"
+                and getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_joint_warmup")
+
+    def zeva_foundation_parameters(self):
+        """Policy backbone only; VAE and the frozen language encoder stay out.
+
+        Video/action experts are shared aliases inside MoT. Iterating MoT
+        once avoids duplicate optimizer entries and stores both experts.
+        """
+        parameters = list(self.mot.parameters())
+        if self.proprio_encoder is not None:
+            parameters.extend(self.proprio_encoder.parameters())
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise AssertionError("duplicate FastWAM foundation optimizer parameter")
+        return parameters
+
+    def prepare_zeva_joint_training_precision(self) -> None:
+        """Keep FP32 trainable weights for small-LR updates under AMP.
+
+        Call before optimizer/DDP construction. Direct AdamW updates of bf16
+        weights can round away a 1e-6 foundation update; bf16 autocast still
+        controls compute while FP32 parameters retain accumulated updates.
+        Frozen VAE/text parameters retain their original inference dtype.
+        """
+        if not self.zeva_joint_foundation:
+            raise ValueError("FP32 joint training preparation requires ego_joint_warmup")
+        with torch.no_grad():
+            for parameter in self.parameters():
+                if parameter.requires_grad:
+                    parameter.data = parameter.data.float()
 
     def configure_zeva_trainable_state(self) -> None:
         if not self.zeva_enabled:
@@ -1118,7 +1156,7 @@ class FastWAM(torch.nn.Module):
                 parameter.requires_grad_(True)
             if getattr(adapter.config, "pim_variant", "legacy") == "cross_attempt":
                 adapter.pim_to_global.train()
-            if getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_adapter_warmup":
+            if getattr(self, "zeva_training_recipe", "frozen_parent") in {"ego_adapter_warmup", "ego_joint_warmup"}:
                 # Keep a static DDP parameter graph. The optimizer gives EAP
                 # LR=0 during warmup, then its explicit lower learning rate.
                 for parameter in adapter.policy_injection_parameters():
@@ -1127,6 +1165,14 @@ class FastWAM(torch.nn.Module):
                 adapter.action_prior_adapter.train()
                 adapter.behavior_global_projector.train()
                 adapter.behavior_effect_projector.train()
+            if self.zeva_joint_foundation:
+                # A static DDP graph spans warmup and joint training; the
+                # foundation group has LR=0 for the first warmup updates.
+                self.mot.train()
+                self.mot.requires_grad_(True)
+                if self.proprio_encoder is not None:
+                    self.proprio_encoder.train()
+                    self.proprio_encoder.requires_grad_(True)
             return
         raise RuntimeError(f"unsupported Zeva training stage: {stage}")
 
@@ -1262,7 +1308,7 @@ class FastWAM(torch.nn.Module):
         zeva_current_effect: Optional[torch.Tensor] = None,
         zeva_current_effect_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Train only the Zeva residual against FastWAM action flow matching."""
+        """Train Zeva conditioning and, for the joint recipe, the policy backbone."""
         if input_image.ndim != 4 or input_image.shape[1] != 3:
             raise ValueError("input_image must be [B,3,H,W]")
         if clean_action.ndim != 3 or clean_action.shape[0] != input_image.shape[0]:
@@ -1307,9 +1353,8 @@ class FastWAM(torch.nn.Module):
             getattr(self, "zeva_injection_mode", "memory_residual") == "exact_zeva"
         )
 
-        # VAE and physical video-token preparation remain no-grad.  Exact-Zeva
-        # Behavior Prefix construction and MoT cache prefill happen outside this
-        # block so gradients can traverse the frozen policy back to Stage2A/B.
+        # The VAE is always frozen. Joint training must retain gradients through
+        # video patch/text/time projections as well as through the MoT blocks.
         with torch.no_grad():
             image_video = input_image.to(
                 self.device, dtype=self.torch_dtype
@@ -1322,6 +1367,7 @@ class FastWAM(torch.nn.Module):
                 device=self.device,
                 dtype=first_frame_latents.dtype,
             )
+        with nullcontext() if self.zeva_joint_foundation else torch.no_grad():
             (
                 video_tokens, _tv, video_t_mod, video_context, video_context_mask,
                 video_freqs, _fv, _hv, _wv, tokens_per_frame,
@@ -1375,8 +1421,8 @@ class FastWAM(torch.nn.Module):
         )
 
         if exact_zeva:
-            # Frozen parameters != no-grad.  Zeva post-training requires:
-            # action loss -> frozen MoT -> Behavior Prefix -> trainable addon.
+            # Preserve the whole action-loss graph through the video K/V
+            # prefill, for both frozen-backbone addon and joint training.
             video_cache_k, video_cache_v = self.mot.prefill_video_cache_tensor(
                 video_tokens=video_tokens, video_freqs=video_freqs,
                 video_t_mod=video_t_mod, video_context=video_context,
@@ -2114,8 +2160,33 @@ class FastWAM(torch.nn.Module):
                                    base_checkpoint_sha256: str = "", cte_checkpoint_sha256: str = ""):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
             raise RuntimeError("Cannot save a Zeva addon before attaching it")
-        from fastwam.zeva.checkpoint import addon_layout_metadata
-        torch.save({
+        from fastwam.zeva.checkpoint import JOINT_FOUNDATION_SCHEMA, addon_layout_metadata, checkpoint_sha256
+        path = Path(path)
+        foundation_identity = None
+        if self.zeva_joint_foundation:
+            foundation_path = path.with_name(path.stem.removesuffix("_addon") + "_foundation.pt")
+            if foundation_path == path:
+                raise ValueError("addon path collides with its foundation checkpoint")
+            foundation = {
+                "schema": JOINT_FOUNDATION_SCHEMA,
+                "training_recipe": "ego_joint_warmup",
+                "step": int(step),
+                "base_checkpoint_sha256": base_checkpoint_sha256,
+                "cte_checkpoint_sha256": cte_checkpoint_sha256,
+                "task_context_identity": getattr(self, "zeva_task_context_identity", None),
+                "mot": self.mot.state_dict(),
+            }
+            if self.proprio_encoder is not None:
+                foundation["proprio_encoder"] = self.proprio_encoder.state_dict()
+            temporary = foundation_path.with_suffix(".tmp")
+            torch.save(foundation, temporary)
+            temporary.replace(foundation_path)
+            foundation_identity = {
+                "schema": JOINT_FOUNDATION_SCHEMA, "filename": foundation_path.name,
+                "sha256": checkpoint_sha256(foundation_path), "step": int(step),
+                "base_checkpoint_sha256": base_checkpoint_sha256,
+            }
+        payload = {
             "causal_prompt_encoder": self.zeva_prompt_encoder.state_dict(),
             "behavior_prefix_adapter": self.zeva_behavior_prefix_adapter.state_dict(),
             "pim_gate": self.zeva_behavior_prefix_adapter.pim_gate.detach().cpu(),
@@ -2126,7 +2197,32 @@ class FastWAM(torch.nn.Module):
             "base_checkpoint_sha256": base_checkpoint_sha256,
             "cte_checkpoint_sha256": cte_checkpoint_sha256,
             "task_context_identity": getattr(self, "zeva_task_context_identity", None),
-        }, path)
+        }
+        if foundation_identity is not None:
+            payload["foundation_checkpoint"] = foundation_identity
+        temporary = path.with_suffix(".tmp")
+        torch.save(payload, temporary)
+        temporary.replace(path)
+
+    def _load_zeva_joint_foundation(self, path: Path, addon_payload: dict) -> None:
+        from fastwam.zeva.checkpoint import JOINT_FOUNDATION_SCHEMA
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        expected = {
+            "schema": JOINT_FOUNDATION_SCHEMA, "training_recipe": "ego_joint_warmup",
+            "step": addon_payload["step"],
+            "base_checkpoint_sha256": addon_payload["base_checkpoint_sha256"],
+            "cte_checkpoint_sha256": addon_payload["cte_checkpoint_sha256"],
+            "task_context_identity": addon_payload.get("task_context_identity"),
+        }
+        for name, value in expected.items():
+            if payload.get(name) != value:
+                raise ValueError(f"joint foundation checkpoint lineage mismatch: {name}")
+        if ("proprio_encoder" in payload) != (self.proprio_encoder is not None):
+            raise ValueError("joint foundation checkpoint proprio architecture mismatch")
+        self.mot.load_state_dict(payload["mot"], strict=True)
+        if self.proprio_encoder is not None:
+            self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
+        self.zeva_foundation_identity = dict(addon_payload["foundation_checkpoint"])
 
     def load_zeva_addon_checkpoint(self, path, *, base_checkpoint_sha256: Optional[str] = None,
                                    cte_checkpoint_sha256: Optional[str] = None,
@@ -2141,6 +2237,8 @@ class FastWAM(torch.nn.Module):
             task_context_identity=getattr(self, "zeva_task_context_identity", None),
             load_scope=load_scope,
             target_training_stage=self.zeva_training_stage,
+            target_training_recipe=getattr(self, "zeva_training_recipe", "frozen_parent"),
+            foundation_loader=self._load_zeva_joint_foundation,
         )
 
     def zeva_parameter_report(self) -> dict[str, object]:
@@ -2163,13 +2261,15 @@ class FastWAM(torch.nn.Module):
                 allowed += ("zeva_behavior_prefix_adapter.pim_to_global.",)
             elif getattr(self.zeva_behavior_prefix_adapter.config, "prefix_layout", "legacy_merged") == "legacy_merged":
                 allowed += ("zeva_behavior_prefix_adapter.pim_gate",)
-            if getattr(self, "zeva_training_recipe", "frozen_parent") == "ego_adapter_warmup":
+            if getattr(self, "zeva_training_recipe", "frozen_parent") in {"ego_adapter_warmup", "ego_joint_warmup"}:
                 allowed += (
                     "zeva_behavior_prefix_adapter.prior.",
                     "zeva_behavior_prefix_adapter.action_prior_adapter.",
                     "zeva_behavior_prefix_adapter.behavior_global_projector.",
                     "zeva_behavior_prefix_adapter.behavior_effect_projector.",
                 )
+            if self.zeva_joint_foundation:
+                allowed += ("video_expert.", "action_expert.", "mot.", "dit.", "proprio_encoder.")
         else:
             raise RuntimeError(f"unsupported Zeva training stage: {stage}")
         invalid = [
@@ -2221,8 +2321,8 @@ class FastWAM(torch.nn.Module):
 
         Keeping prompt construction and the conditioned action loss behind the
         module's forward entry preserves DDP/DeepSpeed forward hooks. Frozen
-        video/VAE work remains bounded by ``forward_zeva_action_train``'s
-        no-grad region.
+        VAE work remains bounded by ``forward_zeva_action_train``'s no-grad
+        region; the joint recipe preserves the policy-backbone graph.
         """
         if not self.zeva_enabled or self.zeva_prompt_encoder is None:
             raise RuntimeError("Zeva Stage 2 forward requires an attached addon")
@@ -2251,8 +2351,8 @@ class FastWAM(torch.nn.Module):
         task_dim = int(self.zeva_prompt_encoder.config.global_dim)
         task_mode = str(getattr(self, "zeva_task_context_mode", "static"))
         if sample.get("task_context") is None:
-            if task_mode == "static":
-                raise ValueError("formal Zeva training requires static task_context")
+            if task_mode in {"static", "task_language"}:
+                raise ValueError(f"formal Zeva training requires precomputed {task_mode} task_context")
             if task_mode != "pooling":
                 raise ValueError(f"unsupported Zeva task_context mode: {task_mode}")
             task_tokens = task_tokens_from_context(context, context_mask, task_dim)

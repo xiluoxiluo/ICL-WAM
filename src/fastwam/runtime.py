@@ -228,12 +228,16 @@ def create_fastwam(
             )
         model.set_zeva_training_stage(training_stage)
         model.zeva_training_recipe = str(zeva.get("training_recipe", "frozen_parent"))
-        if model.zeva_training_recipe not in {"frozen_parent", "ego_adapter_warmup"}:
+        if model.zeva_training_recipe not in {"frozen_parent", "ego_adapter_warmup", "ego_joint_warmup"}:
             raise ValueError("unsupported Zeva training_recipe")
-        if model.zeva_training_recipe == "ego_adapter_warmup":
+        if model.zeva_training_recipe in {"ego_adapter_warmup", "ego_joint_warmup"}:
             if (training_stage != "pim_adapter" or prompt_variant != "cross_attempt"
                     or getattr(policy_adapter.config, "effect_source", None) != "current_prediction"):
-                raise ValueError("ego_adapter_warmup requires predictive cross-attempt Stage2B")
+                raise ValueError("ego warmup recipes require predictive cross-attempt Stage2B")
+        if model.zeva_training_recipe == "ego_joint_warmup" and bool(zeva.get("freeze_fastwam", True)):
+            raise ValueError("ego_joint_warmup requires zeva.freeze_fastwam=false")
+        if model.zeva_training_recipe == "ego_joint_warmup" and model.zeva_task_context_mode != "task_language":
+            raise ValueError("ego_joint_warmup requires frozen task_language retrieval independent of the changing foundation")
     return model
 
 

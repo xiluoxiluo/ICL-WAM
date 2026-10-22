@@ -38,6 +38,7 @@ from fastwam.zeva.static_task_context import task_context_identity
 from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT, HISTORY_KINDS
 from fastwam.zeva.ego_boundary_cache import EgoBoundaryCache
 from fastwam.zeva.ego_cte_training import require_ego_checkpoint_ready
+from fastwam.zeva.ego_task_memory import episode_task_instructions, validate_ego_task_language_static_context
 
 
 def _require_file(value, name: str) -> Path:
@@ -144,8 +145,14 @@ def main(cfg: DictConfig) -> None:
     training_stage = str(zeva.training_stage)
     if training_stage not in {"policy_injection", "pim_adapter"}:
         raise ValueError(f"unsupported Zeva Stage-2 training_stage={training_stage!r}")
-    if str(zeva.task_context.mode) != "static":
-        raise ValueError("formal prepared Stage-2 requires task_context.mode=static")
+    task_mode = str(zeva.task_context.mode)
+    task_language = task_mode == "task_language"
+    if task_mode not in {"static", "task_language"}:
+        raise ValueError("formal prepared Stage-2 requires static or task_language task context")
+    if task_language and not predictive:
+        raise ValueError("task-language retrieval requires the predictive Zeva-Ego CTE")
+    if str(zeva.get("training_recipe")) == "ego_joint_warmup" and not task_language:
+        raise ValueError("Joint foundation training requires independent frozen task-language retrieval")
     retrieval_mode = "cross_attempt" if cross_attempt else "phase"
     if str(zeva.memory.pim_retrieval_mode) != retrieval_mode:
         raise ValueError(f"prepared Stage-2 variant requires pim_retrieval_mode={retrieval_mode}")
@@ -158,16 +165,24 @@ def main(cfg: DictConfig) -> None:
             raise ValueError("predictive Stage2 requires the Zeva-Ego prior and cross-attempt reader")
         if str(zeva.memory.get("memory_semantics")) != "predicted_effect_trace":
             raise ValueError("predictive Stage2 requires predicted_effect_trace memory")
-        if training_stage == "pim_adapter" and str(zeva.get("training_recipe")) != "ego_adapter_warmup":
-            raise ValueError("predictive Stage2B requires the explicit ego_adapter_warmup recipe")
+        if training_stage == "pim_adapter" and str(zeva.get("training_recipe")) not in {"ego_adapter_warmup", "ego_joint_warmup"}:
+            raise ValueError("predictive Stage2B requires an explicit ego_adapter_warmup or ego_joint_warmup recipe")
 
     base_ckpt = _require_file(cfg.get("ckpt"), "ckpt")
     cte_ckpt = _require_file(zeva.cte.checkpoint, "model.zeva.cte.checkpoint")
     bank_path = _require_file(zeva.task_context.bank_path, "model.zeva.task_context.bank_path")
-    readout_path = _require_file(
-        zeva.task_context.readout_cache_path,
-        "model.zeva.task_context.readout_cache_path",
-    )
+    if task_language:
+        encoder_path = _require_file(zeva.task_context.get("language_encoder_path"),
+                                      "model.zeva.task_context.language_encoder_path")
+        feature_path = _require_file(zeva.task_context.get("language_feature_cache_path"),
+                                      "model.zeva.task_context.language_feature_cache_path")
+        if float(zeva.task_context.temperature) != 1.0:
+            raise ValueError("Task-scoped language retrieval uses reference softmax temperature=1.0")
+    else:
+        readout_path = _require_file(
+            zeva.task_context.readout_cache_path,
+            "model.zeva.task_context.readout_cache_path",
+        )
     head_path = _require_file(
         zeva.task_context.retrieval_checkpoint,
         "model.zeva.task_context.retrieval_checkpoint",
@@ -261,26 +276,30 @@ def main(cfg: DictConfig) -> None:
     if predictive and pim._cross_attempt.splits != boundary.splits:
         raise ValueError("prepared PIM cache must use the exact CTE/boundary episode split")
     static_context = StaticEpisodeContextCache(static_path)
-    validate_static_artifact_hashes(
-        static_context,
-        bank_path=bank_path,
-        head_path=head_path,
-        readout_path=readout_path,
-    )
     static_expected = {
-        "base_checkpoint_sha256": base_sha,
         "cte_checkpoint_sha256": cte_sha,
         "dataset_stats_sha256": stats_sha,
         "semantic_task_map_sha256": semantic_sha,
-        "video_size": video_size,
-        "context_len": int(cfg.model.tokenizer_max_len),
     }
+    if not task_language:
+        validate_static_artifact_hashes(
+            static_context, bank_path=bank_path, head_path=head_path, readout_path=readout_path,
+        )
+        static_expected.update({"base_checkpoint_sha256": base_sha, "video_size": video_size,
+                                "context_len": int(cfg.model.tokenizer_max_len)})
     if predictive:
         static_expected.update({
             "memory_semantics": "predicted_effect_trace",
             "phase_cache_manifest_sha256": sha256_file(phase_manifest_path),
             "episode_splits_sha256": sha256_file(phase_root / "episode_splits.json"),
         })
+    language_queries = None
+    if task_language:
+        language_queries = validate_ego_task_language_static_context(
+            static_context, cache=boundary, bank_path=bank_path, feature_path=feature_path,
+            encoder_path=encoder_path, head_path=head_path, expected_metadata=static_expected,
+            top_k=int(zeva.task_context.top_k),
+        )
     for key, expected in static_expected.items():
         if static_context.metadata.get(key) != expected:
             raise ValueError(
@@ -297,6 +316,11 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("Stage-2 dataset did not load semantic_task_map_path")
     if str(base.semantic_task_identity.get("sha256")) != semantic_sha:
         raise ValueError("Stage-2 dataset semantic identity mismatch")
+    if task_language:
+        current_instructions = episode_task_instructions(base, boundary)
+        cached_instructions = dict(zip(language_queries["episode_ids"], language_queries["instructions"], strict=True))
+        if current_instructions != cached_instructions:
+            raise ValueError("Stage-2 raw instructions changed after task-language feature construction")
     history_schedule = "ego_optimizer_step" if predictive and training_stage == "pim_adapter" else "legacy"
     dataset = PreparedZevaStage2Dataset(base, pim, static_context, history_schedule=history_schedule)
     validation_dataset = None
@@ -349,12 +373,16 @@ def main(cfg: DictConfig) -> None:
         device=str(device),
     )
     model.load_checkpoint(str(base_ckpt))
-    model.zeva_task_context_identity = task_context_identity(
-        "static",
-        str(bank_path),
-        str(head_path),
-        int(zeva.task_context.top_k),
-    )
+    if task_language:
+        from fastwam.zeva.task_language import task_language_identity
+
+        model.zeva_task_context_identity = task_language_identity(
+            bank_path, head_path, encoder_path, top_k=int(zeva.task_context.top_k),
+        )
+    else:
+        model.zeva_task_context_identity = task_context_identity(
+            "static", str(bank_path), str(head_path), int(zeva.task_context.top_k),
+        )
 
     print("========== prepared Stage-2 ==========")
     print(f"training_stage: {training_stage}")
@@ -375,7 +403,7 @@ def main(cfg: DictConfig) -> None:
 
     trainer = Wan22Trainer(cfg=cfg, model=model, train_dataset=dataset, val_dataset=validation_dataset)
     trainer.train()
-    print(f"Stage-2 complete; addon checkpoints are under {Path(str(cfg.output_dir)) / 'checkpoints'}")
+    print(f"Stage-2 complete; checkpoints are under {Path(str(cfg.output_dir)) / 'checkpoints'}")
 
 
 if __name__ == "__main__":
