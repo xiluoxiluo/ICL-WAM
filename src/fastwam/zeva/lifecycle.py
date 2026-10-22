@@ -184,7 +184,7 @@ class CausalMemoryLifecycle:
         self.config = config or LifecycleConfig()
         self.pim = pim
         self._effect_dim = int(pim.config.effect_dim)
-        self.bit = BriefInteractionTraceBuffer(self._effect_dim, self.config.bit_size)
+        self.bit = BriefInteractionTraceBuffer(self._effect_dim, self.config.bit_size, storage_device=pim.config.storage_device)
         self._attempt_id = 0
         self._effect_index = 0
         self.last_retrieval_sources: list[dict[str, object]] = []
@@ -208,11 +208,11 @@ class CausalMemoryLifecycle:
     def end_attempt(self) -> None:
         if self.pim.task_cluster is None:
             raise RuntimeError("reset_episode() is required before end_attempt()")
-        self.pim.commit_attempt()
-        # BIT is scoped to the just-finished attempt.  Clear it immediately,
-        # including when there will be no retry, so stale short-term evidence
-        # cannot be observed after the lifecycle boundary.
-        self.bit.reset()
+        if self.pim.config.commit_timing == "attempt_end":
+            self.pim.commit_attempt()
+            self.bit.reset()
+        # Reference Zeva leaves the current trace pending until the next
+        # attempt reset. A terminal success/final failure is never published.
 
     def reset_attempt(self, attempt_id: int) -> None:
         attempt_id = int(attempt_id)
@@ -231,7 +231,7 @@ class CausalMemoryLifecycle:
             raise ValueError("effect_dim must be positive")
         if effect_dim != self._effect_dim:
             self._effect_dim = int(effect_dim)
-            self.bit = BriefInteractionTraceBuffer(self._effect_dim, self.config.bit_size)
+            self.bit = BriefInteractionTraceBuffer(self._effect_dim, self.config.bit_size, storage_device=self.pim.config.storage_device)
 
     def observe_completed_effect(
         self,
@@ -250,7 +250,7 @@ class CausalMemoryLifecycle:
         """Append after predicting the current action, never before its read.
 
         The raw vector is the current causal CTE prediction, not a realized
-        future outcome. Cross-attempt PIM keeps it private until end_attempt().
+        future outcome. Cross-attempt PIM keeps it private until the configured commit boundary.
         """
         if self.config.memory_semantics != "predicted_effect_trace":
             raise ValueError("predicted effects require an explicitly versioned trace")
@@ -272,7 +272,7 @@ class CausalMemoryLifecycle:
             raise ValueError("online phase/effect shape mismatch")
         effect_index = self._effect_index
         # Validate/publish to PIM before mutating BIT. Cross-attempt mode keeps
-        # this effect private until end_attempt(); legacy mode exposes it now.
+        # this effect private until its commit boundary; legacy mode exposes it now.
         self.pim.append_completed(
             task_cluster=self.pim.task_cluster,
             phase=phase_at_window_start.detach(),
@@ -296,7 +296,7 @@ class CausalMemoryLifecycle:
         if phase_query.ndim != 1:
             raise ValueError("online phase must be [D] or [1,D]")
         phases, effects, valid, _scores, sources = self.pim.query_tensors(
-            phase_query.detach().float().cpu(),
+            phase_query.detach().float(),
             top_k=self.pim.config.top_k,
             # Cross-attempt memory keeps current effects in a separate buffer;
             # filtering after a merge would lose valid older provenance.

@@ -21,7 +21,7 @@ def main() -> None:
     parser.add_argument("--task-context-top-k", type=int)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--model-seed", "--model-rng-seed", type=int, default=20260907)
-    parser.add_argument("--model-rng-protocol", choices=("torch_continuous_slot_v1", "request_seed_stream_v1"), default="torch_continuous_slot_v1")
+    parser.add_argument("--model-rng-protocol", choices=("torch_device_continuous_slot_v1", "torch_continuous_slot_v1", "request_seed_stream_v1"), default="torch_device_continuous_slot_v1")
     parser.add_argument("--instruction", help="Exact instruction retained for every attempt")
     parser.add_argument("--sim-task", default="robotwin_zeva_ego_pim_3cam_384")
     parser.add_argument(

@@ -16,7 +16,7 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from .checkpoint import checkpoint_sha256
-from .prepared_stage2 import STATIC_CONTEXT_FORMAT, StaticEpisodeContextCache
+from .prepared_stage2 import STATIC_CONTEXT_FORMAT, STATIC_QUERY_CONTEXT_FORMAT, StaticEpisodeContextCache
 from .static_task_context import (
     BEHAVIOR_KEY_SPACE, BEHAVIOR_VALUE_SPACE, READOUT_FORMAT, READOUT_KIND,
     StaticTaskContextRetriever, load_readout_cache, validate_behavior_bank,
@@ -35,11 +35,10 @@ def _train_query_exclusion_semantics(mode: str) -> str:
     raise ValueError("task_context.train_query_exclusion must be none or leave_one_episode_out")
 
 
-def episode_task_instructions(base, cache) -> dict[str, str]:
+def _episode_instruction_sequences(base, cache) -> dict[str, list[str]]:
     """Read raw task text from metadata only, without image/action access.
 
     This mirrors LeRobot's task-index lookup, not the FastWAM video prompt.
-    A static episode context requires one instruction throughout an episode.
     Semantic task labels are checked for artifact integrity but never passed
     into the language classifier as query inputs.
     """
@@ -69,15 +68,55 @@ def episode_task_instructions(base, cache) -> dict[str, str]:
                                                      raw_task_index=raw_indices[0], strict=True))
         if semantic != str(record["task_id"]):
             raise ValueError("Task-language source semantic task differs from boundary cache")
-        texts = {str(source.meta.tasks[index]) for index in set(raw_indices)}
-        if len(texts) != 1:
-            raise ValueError("Task-language static context requires a fixed instruction within each episode")
         override = getattr(base, "override_instruction", None)
-        instruction = str(override) if override is not None else next(iter(texts))
-        if not instruction.strip():
+        instructions = ([str(override)] * length if override is not None
+                        else [str(source.meta.tasks[index]) for index in raw_indices])
+        if any(not instruction.strip() for instruction in instructions):
             raise ValueError("Task-language queries cannot use empty task instructions")
-        output[identity] = instruction
+        output[identity] = instructions
     return output
+
+
+def episode_task_instructions(base, cache, *, require_fixed: bool = True) -> dict[str, str]:
+    """Read initial instructions; legacy episode-static caches require fixed text."""
+    sequences = _episode_instruction_sequences(base, cache)
+    if require_fixed and any(len(set(values)) != 1 for values in sequences.values()):
+        raise ValueError("Task-language static context requires a fixed instruction within each episode")
+    return {identity: values[0] for identity, values in sequences.items()}
+
+
+def decision_task_instructions(base, cache) -> list[dict[str, Any]]:
+    """Bind each training query to its raw instruction without decoding RGB/actions.
+
+    Zeva-Ego queries its frozen language memory for every training sample. Its
+    first-instruction cache applies only during rollout, so training contexts
+    must not silently reuse an episode's first instruction.
+    """
+    sequences = _episode_instruction_sequences(base, cache)
+    output = []
+    for row in cache.rows:
+        identity, step = str(row["episode_id"]), int(row["raw_step"])
+        if identity not in sequences or not 0 <= step < len(sequences[identity]):
+            raise ValueError("Task-language decision lies outside the source episode")
+        output.append({"episode_id": identity, "window_index": int(row["window_index"]),
+                       "raw_step": step, "instruction": sequences[identity][step]})
+    return output
+
+
+def _validate_decision_queries(queries, cache) -> list[dict[str, Any]]:
+    if not isinstance(queries, list) or len(queries) != len(cache.rows):
+        raise ValueError("Per-decision task context must cover every CTE query exactly once")
+    checked = []
+    seen = set()
+    for query, row in zip(queries, cache.rows, strict=True):
+        expected = {name: row[name] for name in ("episode_id", "window_index", "raw_step")}
+        if (not isinstance(query, dict) or any(query.get(name) != value for name, value in expected.items())
+                or not isinstance(query.get("instruction"), str) or not query["instruction"].strip()
+                or int(query["window_index"]) in seen):
+            raise ValueError("Per-decision language query identity/instruction differs from CTE cache")
+        seen.add(int(query["window_index"]))
+        checked.append({**expected, "instruction": query["instruction"]})
+    return checked
 
 
 def _language_bank_metadata(metadata: dict[str, Any], *, encoder_sha256: str) -> dict[str, Any]:
@@ -197,7 +236,9 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
                                            output_path: str | Path, expected_metadata: dict[str, Any],
                                            top_k: int = 5, device: str | torch.device = "cpu",
                                            batch_size: int = 512,
-                                           train_query_exclusion: str = "leave_one_episode_out") -> dict[str, Any]:
+                                           train_query_exclusion: str = "leave_one_episode_out",
+                                           training_query_scope: str = "episode_static",
+                                           decision_queries: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Classify language, then aggregate that task's train demos without GT scope.
 
     New predictive presets pass ``none`` to match Zeva-Ego's fixed task-scoped
@@ -207,6 +248,12 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
     from .task_language import TaskLanguageMemory, task_language_identity
 
     exclusion_semantics = _train_query_exclusion_semantics(train_query_exclusion)
+    if training_query_scope not in {"episode_static", "per_decision"}:
+        raise ValueError("training_query_scope must be episode_static or per_decision")
+    if training_query_scope == "per_decision":
+        decision_queries = _validate_decision_queries(decision_queries, cache)
+    elif decision_queries is not None:
+        raise ValueError("episode_static cannot consume per-decision language queries")
     inputs = tuple(Path(path).expanduser().resolve() for path in (bank_path, feature_path, encoder_path, head_path))
     output_path = Path(output_path).expanduser().resolve()
     if output_path in inputs or output_path.exists() or batch_size < 1:
@@ -214,6 +261,10 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
     bank_path, feature_path, encoder_path, head_path = inputs
     query = load_ego_task_language_features(feature_path, bank_path, encoder_path, cache,
                                             expected_metadata=expected_metadata)
+    if training_query_scope == "per_decision":
+        initial = {row["episode_id"]: row["instruction"] for row in decision_queries if row["raw_step"] == 0}
+        if initial != dict(zip(query["episode_ids"], query["instructions"], strict=True)):
+            raise ValueError("Per-decision initial instructions differ from the classifier feature source")
     checkpoint = torch.load(head_path, map_location="cpu", weights_only=False)
     if checkpoint.get("feature_cache_sha256") != checkpoint_sha256(feature_path):
         raise ValueError("Language classifier was trained with a different feature artifact")
@@ -224,12 +275,39 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
                                      device=device, expected=expected_metadata)
     contexts, indices, scores, sources = [], [], [], []
     ids, train_ids = query["episode_ids"], set(cache.splits["train"])
+    query_indices = None
+    if training_query_scope == "per_decision":
+        # Frozen language encoding/classification/retrieval is deterministic.
+        # Deduplicating equal instructions (and equal LOO exclusions) is exact
+        # while avoiding a dense [all video frames,256] context artifact.
+        unique = {}
+        query_indices = []
+        for row in decision_queries:
+            exclusion = (row["episode_id"] if train_query_exclusion == "leave_one_episode_out"
+                         and row["episode_id"] in train_ids else None)
+            key = (row["instruction"], exclusion)
+            if key not in unique:
+                unique[key] = len(unique)
+            query_indices.append(unique[key])
+        unique_queries = list(unique)
+        # The input embedding lookup is CPU-resident and can temporarily
+        # materialize [batch,tokens,4096]; keep this bounded independently of
+        # the smaller classifier/retrieval batch size.
+        language_batch_size = min(batch_size, 64)
     with torch.no_grad():
-        for start in range(0, len(ids), batch_size):
-            stop = min(start + batch_size, len(ids))
-            exclusions = ([identity if identity in train_ids else None for identity in ids[start:stop]]
-                          if train_query_exclusion == "leave_one_episode_out" else None)
-            result = memory.retrieve(query["features"][start:stop].to(device), exclude_episode_ids=exclusions)
+        count = len(unique_queries) if training_query_scope == "per_decision" else len(ids)
+        step = language_batch_size if training_query_scope == "per_decision" else batch_size
+        for start in range(0, count, step):
+            stop = min(start + step, count)
+            if training_query_scope == "per_decision":
+                selected = unique_queries[start:stop]
+                features = memory.encoder.encode([text for text, _ in selected], device=device)
+                exclusions = [identity for _, identity in selected]
+            else:
+                features = query["features"][start:stop].to(device)
+                exclusions = ([identity if identity in train_ids else None for identity in ids[start:stop]]
+                              if train_query_exclusion == "leave_one_episode_out" else None)
+            result = memory.retrieve(features, exclude_episode_ids=exclusions)
             contexts.append(result.values.float().cpu())
             indices.append(result.indices.cpu())
             scores.append(result.scores.float().cpu())
@@ -242,11 +320,15 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
         "language_feature_cache_sha256": checkpoint_sha256(feature_path), "top_k": top_k, "temperature": 1.0,
         "query_scope": "train_and_validation_task_language_only", "task_context_identity": identity,
         "train_query_exclusion": exclusion_semantics,
+        "training_query_scope": training_query_scope,
         "validation_query_sources": "train_only", "scope_selection": "predicted_task_only",
     }
     payload = {"format": STATIC_CONTEXT_FORMAT, "episode_ids": ids, "task_contexts": torch.cat(contexts),
                "retrieval_indices": torch.cat(indices), "retrieval_scores": torch.cat(scores),
                "retrieval_sources": sources, "episode_splits": cache.splits, "metadata": metadata}
+    if training_query_scope == "per_decision":
+        payload.update({"format": STATIC_QUERY_CONTEXT_FORMAT, "query_records": decision_queries,
+                        "query_context_indices": torch.tensor(query_indices, dtype=torch.int64)})
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f".{output_path.name}.building-{os.getpid()}")
     try:
@@ -260,6 +342,9 @@ def build_ego_task_language_context_cache(*, cache, bank_path: str | Path, featu
     return {"episodes": len(ids), "train_queries": len(train_ids),
             "validation_queries": len(cache.splits["validation"]), "top_k": top_k,
             "train_query_exclusion": train_query_exclusion,
+            "training_query_scope": training_query_scope,
+            "num_decision_queries": len(decision_queries) if decision_queries is not None else 0,
+            "num_context_values": int(payload["task_contexts"].shape[0]),
             "static_cache_sha256": checkpoint_sha256(output_path)}
 
 
@@ -267,12 +352,19 @@ def validate_ego_task_language_static_context(static_context: StaticEpisodeConte
                                                bank_path: str | Path, feature_path: str | Path,
                                                encoder_path: str | Path, head_path: str | Path,
                                                expected_metadata: dict[str, Any], top_k: int = 5,
-                                               train_query_exclusion: str = "leave_one_episode_out") -> dict[str, Any]:
+                                               train_query_exclusion: str = "leave_one_episode_out",
+                                               training_query_scope: str = "episode_static") -> dict[str, Any]:
     """Validate immutable query artifacts independently of a trainable foundation."""
     from .task_language import TASK_LANGUAGE_FEATURE_KIND, task_language_identity
 
     query = load_ego_task_language_features(feature_path, bank_path, encoder_path, cache,
                                             expected_metadata=expected_metadata)
+    if training_query_scope not in {"episode_static", "per_decision"}:
+        raise ValueError("training_query_scope must be episode_static or per_decision")
+    if static_context.training_query_scope != training_query_scope:
+        raise ValueError("Task-language static-context training_query_scope mismatch")
+    if training_query_scope == "per_decision":
+        _validate_decision_queries(static_context.query_records, cache)
     identity = task_language_identity(bank_path, head_path, encoder_path, top_k=top_k)
     expected = {
         **expected_metadata, "bank_sha256": identity["bank_sha256"],

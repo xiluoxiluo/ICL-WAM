@@ -18,6 +18,8 @@ zeva:
   cte:
     variant: zeva_ego
     checkpoint: null
+    require_reference_recipe: true
+    exploratory_epoch40: false
     input_type: rgb_multiview
     action_dim: 14
     executed_horizon: 24
@@ -39,11 +41,13 @@ zeva:
     memory_semantics: predicted_effect_trace
     bit_size: 4
     pim_retrieval_mode: cross_attempt
-    pim_top_k: 192
-    pim_max_entries: 192
+    pim_top_k: 256
+    pim_max_entries: 256
     cross_attempt_only: true
-    max_past_attempts: 3
+    max_past_attempts: 4
     max_entries_per_attempt: 64
+    commit_timing: attempt_reset
+    storage_device: policy
     compression: similarity_merge
     uniform_indexing: reference_round
     allow_compression_override: false
@@ -64,6 +68,7 @@ zeva:
     # The reference uses the same full train bank at training and inference.
     # leave_one_episode_out explicitly reproduces the previous ICL-WAM cache.
     train_query_exclusion: none
+    training_query_scope: per_decision
     top_k: 5
     key_dim: ${model.zeva.cte.retrieval_dim}
     value_dim: 256
@@ -82,18 +87,20 @@ zeva:
       eval_every: 50
   prompt:
     initialization: zeva_ego
+    numerical_contract: zeva_ego_v1
     pim_variant: cross_attempt
     global_dim: 256
     phase_dim: 256
     effect_dim: 256
     brief_length: 4
-    persistent_length: 192
+    persistent_length: 256
     hidden_dim: 256
     num_heads: 4
     pim_context_dropout: 0.0
     pim_support_dropout: 0.0
   adapter:
     initialization: zeva_ego
+    numerical_contract: zeva_ego_v1
     mode: exact_zeva
     pim_variant: cross_attempt
     prefix_layout: zeva_ego
@@ -116,8 +123,11 @@ zeva:
   cache:
     path: null  # build_zeva_ego_boundary_cache.py, never a legacy v4 cache
     strict_manifest: true
+    export_scope: all_cte_frames_v1
   prepared_stage2:
     history_pairing: reference_nearest
+    query_scope: all_cte_frames_v1
+    pairing_metric: torch_float32_first_in_source_order
     allow_reduced_curriculum: false
     pim_cache_path: null
     validation_pim_cache_path: null

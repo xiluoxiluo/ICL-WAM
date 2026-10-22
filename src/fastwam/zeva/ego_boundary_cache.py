@@ -15,7 +15,11 @@ from .cross_attempt_cache import file_sha256, validate_episode_splits
 from .ego_episode_data import EGO_CAMERA_KEYS, EGO_MEMORY_SEMANTICS, RoboTwinEgoEpisodeDataset
 
 
-EGO_BOUNDARY_CACHE_FORMAT = "zeva_ego_boundary_cache_v1"
+LEGACY_EGO_BOUNDARY_CACHE_FORMAT = "zeva_ego_boundary_cache_v1"
+EGO_BOUNDARY_CACHE_FORMAT = "zeva_ego_boundary_cache_v2"
+EGO_BOUNDARY_CACHE_FORMATS = (LEGACY_EGO_BOUNDARY_CACHE_FORMAT, EGO_BOUNDARY_CACHE_FORMAT)
+ALL_CTE_FRAMES = "all_cte_frames_v1"
+LEGACY_DECISION_FRAMES = "decision_only_v1"
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,9 @@ class EgoBoundaryManifest:
     image_size: int = 224
     camera_keys: tuple[str, ...] | list[str] = EGO_CAMERA_KEYS
     schema_version: str = EGO_BOUNDARY_CACHE_FORMAT
+    export_scope: str = ALL_CTE_FRAMES
+    data_scope: dict[str, Any] | None = None
+    export_tf32: bool | None = None
     history_semantics: str = "full_episode_prefix"
     memory_semantics: str = EGO_MEMORY_SEMANTICS
     effect_source: str = "current_prediction"
@@ -51,12 +58,19 @@ class EgoBoundaryManifest:
     shard_sha256: dict[str, str] = field(default_factory=dict)
 
     def validate(self) -> None:
-        if (self.schema_version != EGO_BOUNDARY_CACHE_FORMAT or self.history_semantics != "full_episode_prefix"
+        if (self.schema_version not in EGO_BOUNDARY_CACHE_FORMATS or self.history_semantics != "full_episode_prefix"
                 or self.memory_semantics != EGO_MEMORY_SEMANTICS or self.effect_source != "current_prediction"
                 or self.query_step_unit != "raw_action_step" or self.feature_dtype != "float32"
                 or self.cte_input_type != "rgb_multiview" or self.cte_variant != "zeva_ego"
                 or self.retrieval_space != "cte_task_head_raw_v1" or self.encoding_path != "recurrent_step_v1"):
             raise ValueError("incompatible Zeva-Ego boundary cache semantics")
+        expected_scope = ALL_CTE_FRAMES if self.schema_version == EGO_BOUNDARY_CACHE_FORMAT else LEGACY_DECISION_FRAMES
+        if self.export_scope != expected_scope:
+            raise ValueError("boundary cache export scope disagrees with its schema version")
+        if self.export_tf32 is not None and self.export_tf32 is not False:
+            raise ValueError("reference boundary extraction disables TF32")
+        if self.data_scope is not None and not isinstance(self.data_scope, dict):
+            raise ValueError("boundary cache data_scope must be a mapping")
         if (self.executed_horizon, self.action_dim, self.policy_horizon, self.image_size) != (24, 14, 32, 224):
             raise ValueError("RoboTwin Zeva-Ego cache requires H24/joint14, policy H32, RGB224")
         if tuple(self.camera_keys) != EGO_CAMERA_KEYS:
@@ -71,7 +85,12 @@ class EgoBoundaryCache:
     """Verified reader; effect is explicitly the prediction made at this row."""
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root).expanduser().resolve()
-        self.manifest = EgoBoundaryManifest(**json.loads((self.root / "manifest.json").read_text()))
+        values = json.loads((self.root / "manifest.json").read_text())
+        if values.get("schema_version") == LEGACY_EGO_BOUNDARY_CACHE_FORMAT:
+            values.setdefault("export_scope", LEGACY_DECISION_FRAMES)
+        elif "export_scope" not in values:
+            raise ValueError("boundary cache v2 must explicitly declare all-frame export")
+        self.manifest = EgoBoundaryManifest(**values)
         self.manifest.validate()
         for name, digest in (("episode_index.json", self.manifest.index_sha256),
                              ("episodes.json", self.manifest.episode_metadata_sha256),
@@ -98,18 +117,25 @@ class EgoBoundaryCache:
                     or row.get("memory_semantics") != EGO_MEMORY_SEMANTICS
                     or int(row["start_raw_step"]) != identity[1] or int(row["end_raw_step"]) != identity[1]
                     or int(row["available_at_raw_step"]) != identity[1]
-                    or not bool(row["decision_valid"])):
+                    or (self.manifest.export_scope == LEGACY_DECISION_FRAMES and not bool(row["decision_valid"]))):
                 raise ValueError("invalid/duplicate causal boundary record")
             episode = self.episodes[identity[0]]
             split = episode_split[identity[0]]
             if (row["task_id"] != episode["task_id"] or row.get("split") != split or episode.get("split") != split
-                    or identity[1] >= int(episode["episode_length"]) - 1
+                    or identity[1] >= int(episode["episode_length"])
+                    or bool(row["decision_valid"]) != (identity[1] < int(episode["episode_length"]) - 1)
                     or int(row["window_index"]) != int(episode["dataset_start"]) + identity[1]
                     or bool(row["policy_valid"]) != (identity[1] + self.manifest.policy_horizon < int(episode["episode_length"]))
                     or int(row["offset"]) < 0 or row["shard"] != episode["shard"]
                     or Path(row["shard"]).name != row["shard"]):
                 raise ValueError("boundary row differs from its episode/split/window provenance")
             seen.add(identity)
+        if self.manifest.export_scope == ALL_CTE_FRAMES:
+            expected = {(episode_id, raw) for episode_id, meta in self.episodes.items()
+                        for raw in range(0, ((int(meta["episode_length"]) - 1) // self.manifest.executed_horizon)
+                                         * self.manifest.executed_horizon + 1, self.manifest.executed_horizon)}
+            if seen != expected:
+                raise ValueError("all-frame boundary cache must include every observed CTE boundary")
 
     def get(self, index: int) -> dict[str, Any]:
         row = self.rows[int(index)]
@@ -152,6 +178,12 @@ def build_ego_boundary_cache(dataset: RoboTwinEgoEpisodeDataset, cte: torch.nn.M
     The split file is copied verbatim after validation; downstream task memory
     and PIM must select only its train episode IDs.
     """
+    identity = dict(identity)
+    schema = identity.setdefault("schema_version", EGO_BOUNDARY_CACHE_FORMAT)
+    scope = identity.setdefault("export_scope", ALL_CTE_FRAMES if schema == EGO_BOUNDARY_CACHE_FORMAT else LEGACY_DECISION_FRAMES)
+    if (schema, scope) not in {(EGO_BOUNDARY_CACHE_FORMAT, ALL_CTE_FRAMES),
+                               (LEGACY_EGO_BOUNDARY_CACHE_FORMAT, LEGACY_DECISION_FRAMES)}:
+        raise ValueError("unsupported boundary cache schema/export scope")
     output = Path(output).expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"refusing to overwrite boundary cache: {output}")
@@ -191,7 +223,8 @@ def build_ego_boundary_cache(dataset: RoboTwinEgoEpisodeDataset, cte: torch.nn.M
             if dimensions is not None and dimensions != shape:
                 raise ValueError("CTE output dimensions changed between episodes")
             dimensions = shape
-            selected = sample["decision_valid"].nonzero().flatten()
+            selected = (torch.arange(images.shape[1]) if scope == ALL_CTE_FRAMES
+                        else sample["decision_valid"].nonzero().flatten())
             shard = {name: value[selected.to(value.device)].detach().float().cpu().contiguous() for name, value in features.items()}
             shard["valid"] = torch.ones(selected.numel(), dtype=torch.bool)
             if not all(bool(torch.isfinite(value).all()) for value in shard.values()):
@@ -211,7 +244,7 @@ def build_ego_boundary_cache(dataset: RoboTwinEgoEpisodeDataset, cte: torch.nn.M
                     "raw_step": raw, "start_raw_step": raw, "end_raw_step": raw, "available_at_raw_step": raw,
                     "window_index": int(sample["window_indices"][boundary]), "transition_index": boundary,
                     "episode_step": raw, "policy_valid": bool(sample["policy_valid"][boundary]),
-                    "decision_valid": True, "split": split, "shard": name, "offset": offset})
+                    "decision_valid": bool(sample["decision_valid"][boundary]), "split": split, "shard": name, "offset": offset})
         for name, value in (("episode_index.json", rows), ("episodes.json", metadata), ("episode_splits.json", splits)):
             (temporary / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
         dp, de, dg, dr = dimensions

@@ -8,6 +8,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .precision import ReferenceFloat32Module, reference_inference_precision
+
 
 def task_tokens_from_context(
     context: Tensor, context_mask: Tensor | None, output_dim: int
@@ -42,6 +44,7 @@ class CausalPromptConfig:
     pim_support_dropout: float = 0.0
     pim_variant: str = "legacy"
     initialization: str = "legacy_xavier"
+    numerical_contract: str = "legacy_v1"
 
     def __post_init__(self) -> None:
         if min(
@@ -64,11 +67,15 @@ class CausalPromptConfig:
             raise ValueError("prompt initialization must be legacy_xavier or zeva_ego")
         if self.initialization == "zeva_ego" and self.pim_variant != "cross_attempt":
             raise ValueError("zeva_ego initialization requires the cross-attempt phase reader")
+        if self.numerical_contract not in {"legacy_v1", "zeva_ego_v1"}:
+            raise ValueError("numerical_contract must be legacy_v1 or zeva_ego_v1")
+        if self.numerical_contract == "zeva_ego_v1" and self.pim_variant != "cross_attempt":
+            raise ValueError("zeva_ego_v1 numerical_contract requires the cross-attempt phase reader")
         if self.pim_variant == "cross_attempt" and (self.pim_context_dropout or self.pim_support_dropout):
             raise ValueError("cross_attempt uses explicit sampled memory masks; disable prompt-internal dropout")
 
 
-class CausalPromptEncoder(nn.Module):
+class CausalPromptEncoder(ReferenceFloat32Module):
     def __init__(self, config: CausalPromptConfig | None = None) -> None:
         super().__init__(); self.config = config or CausalPromptConfig(); cfg = self.config
         if cfg.pim_variant == "cross_attempt":
@@ -118,6 +125,7 @@ class CausalPromptEncoder(nn.Module):
         nn.init.normal_(self.bos_brief, std=0.02)
         nn.init.normal_(self.bos_persistent, std=0.02)
 
+    @reference_inference_precision
     def forward(self, task_tokens: Tensor, current_phase: Tensor, bit_effects: Tensor, bit_mask: Tensor, pim_phases: Tensor, pim_effects: Tensor, pim_mask: Tensor) -> Tensor:
         cfg = self.config; batch = task_tokens.shape[0]
         if cfg.pim_variant == "cross_attempt":
@@ -210,8 +218,11 @@ class CausalPromptEncoder(nn.Module):
         # must not poison linear-layer gradients with NaN * 0.
         keys_input = torch.where(valid[..., None], keys_input, torch.zeros_like(keys_input))
         values_input = torch.where(valid[..., None], values_input, torch.zeros_like(values_input))
-        query = F.normalize(self.pim_query(phase).float(), dim=-1)
-        keys = F.normalize(self.pim_key(keys_input).float(), dim=-1)
+        projected_query, projected_keys = self.pim_query(phase), self.pim_key(keys_input)
+        if cfg.numerical_contract == "legacy_v1":
+            projected_query, projected_keys = projected_query.float(), projected_keys.float()
+        query = F.normalize(projected_query, dim=-1)
+        keys = F.normalize(projected_keys, dim=-1)
         scores = torch.einsum("bd,bnd->bn", query, keys).masked_fill(~valid, -torch.inf)
         scores = torch.where(valid.any(dim=-1, keepdim=True), scores, torch.zeros_like(scores))
         weights = scores.softmax(dim=-1) * valid.to(scores.dtype)

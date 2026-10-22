@@ -27,10 +27,12 @@ from safetensors.torch import load_file
 
 from fastwam.zeva.cross_attempt_cache import (
     CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT,
+    LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT, ALL_CTE_FRAMES, COMPLETE_POLICY_WINDOWS,
+    REFERENCE_PAIRING_METRIC, LEGACY_PAIRING_METRIC,
     CrossAttemptPIMCache, HISTORY_KINDS,
     build_episode_pairings, file_sha256, validate_episode_splits,
 )
-from fastwam.zeva.ego_boundary_cache import EGO_BOUNDARY_CACHE_FORMAT, EgoBoundaryCache
+from fastwam.zeva.ego_boundary_cache import EGO_BOUNDARY_CACHE_FORMAT, EGO_BOUNDARY_CACHE_FORMATS, EgoBoundaryCache
 from fastwam.zeva.memory import uniform_history_indices
 from fastwam.zeva.schemas import CacheManifest
 from fastwam.zeva.semantic_tasks import SemanticTaskMap, parse_episode_index_from_id
@@ -57,29 +59,47 @@ def _automatic_splits(tasks: dict[str, str], fraction: float, seed: int) -> dict
 def build_cache(
     *, phase_cache: Path, output: Path, semantic_map: Path, split: str = "train",
     episode_splits: Path | None = None, conditions: Path | None = None,
-    validation_fraction: float = 0.1, seed: int = 42, max_past_attempts: int = 3,
+    validation_fraction: float = 0.1, seed: int = 42, max_past_attempts: int | None = None,
     max_entries_per_attempt: int = 64, bit_size: int = 4,
     history_weights: dict[str, float] | None = None,
     uniform_indexing: str | None = None,
     history_pairing: str | None = None,
     allow_reduced_curriculum: bool | None = None,
+    query_scope: str | None = None, pairing_metric: str | None = None,
 ) -> dict[str, Any]:
     phase_cache, output, semantic_map = phase_cache.resolve(), output.resolve(), semantic_map.resolve()
     if output.exists():
         raise FileExistsError(f"refusing to overwrite cache: {output}")
-    if split not in {"train", "validation"} or min(max_past_attempts, max_entries_per_attempt, bit_size) < 1:
+    if split not in {"train", "validation"} or min(max_entries_per_attempt, bit_size) < 1:
         raise ValueError("invalid split/history dimensions")
     if not semantic_map.is_file():
         raise FileNotFoundError(semantic_map)
     semantic = SemanticTaskMap.load(semantic_map)
     source_values = json.loads((phase_cache / "manifest.json").read_text())
-    current_prediction = source_values.get("schema_version") == EGO_BOUNDARY_CACHE_FORMAT
+    current_prediction = source_values.get("schema_version") in EGO_BOUNDARY_CACHE_FORMATS
+    all_frame_source = source_values.get("schema_version") == EGO_BOUNDARY_CACHE_FORMAT
+    query_scope = query_scope or (ALL_CTE_FRAMES if all_frame_source else COMPLETE_POLICY_WINDOWS)
+    pairing_metric = pairing_metric or (REFERENCE_PAIRING_METRIC if query_scope == ALL_CTE_FRAMES else LEGACY_PAIRING_METRIC)
+    if query_scope not in {ALL_CTE_FRAMES, COMPLETE_POLICY_WINDOWS} or pairing_metric not in {REFERENCE_PAIRING_METRIC, LEGACY_PAIRING_METRIC}:
+        raise ValueError("unknown PIM query_scope or pairing_metric")
+    strict_cache = query_scope == ALL_CTE_FRAMES
+    if strict_cache and not all_frame_source:
+        raise ValueError("all-frame PIM requires a v2 boundary source; rebuild the CTE export")
+    if current_prediction and all_frame_source and not strict_cache:
+        raise ValueError("Legacy complete-window PIM requires a v1 decision-only boundary source; rebuild with explicit legacy export_scope")
+    if (pairing_metric == REFERENCE_PAIRING_METRIC) != strict_cache:
+        raise ValueError("all-frame and reference pairing semantics must be selected together")
+    max_past_attempts = (4 if strict_cache else 3) if max_past_attempts is None else max_past_attempts
+    if max_past_attempts < 1:
+        raise ValueError("max_past_attempts must be positive")
     uniform_indexing = uniform_indexing or ("reference_round" if current_prediction else "legacy_floor")
     if uniform_indexing not in {"reference_round", "legacy_floor"}:
         raise ValueError("unknown PIM uniform_indexing")
     if not current_prediction and uniform_indexing != "legacy_floor":
         raise ValueError("reference_round caches require predictive Zeva-Ego features")
     reference_cache = current_prediction and uniform_indexing == "reference_round"
+    if strict_cache and not reference_cache:
+        raise ValueError("all-frame PIM requires reference_round uniform history compression")
     history_pairing = history_pairing or ("reference_nearest" if reference_cache else "legacy_candidates")
     if history_pairing not in {"reference_nearest", "legacy_candidates"}:
         raise ValueError("unknown PIM history_pairing")
@@ -130,6 +150,10 @@ def build_cache(
         raise ValueError("condition values must be non-empty strings")
     if current_prediction and not allow_reduced_curriculum and conditions is None:
         raise ValueError("Reference PIM curriculum requires real --conditions metadata; use --allow-reduced-curriculum only for an explicit non-reference ablation")
+    if strict_cache and source_manifest.data_scope is not None and conditions is not None:
+        scope_digest = source_manifest.data_scope.get("episode_conditions_sha256")
+        if scope_digest is not None and file_sha256(conditions) != scope_digest:
+            raise ValueError("PIM conditions metadata differs from the CTE training data scope")
     weights = history_weights or {"matched": 5.0, "far": 2.0, "cross_condition": 1.0, "empty": 0.0}
     if set(weights) - set(HISTORY_KINDS):
         raise ValueError("unknown history mixture kind")
@@ -138,7 +162,7 @@ def build_cache(
         raise ValueError("invalid history mixture weights")
     if split == "train" and weights["empty"] > 0:
         raise ValueError("frozen-parent training requires nonempty histories; use empty diagnostics on validation")
-    queries = [row for row in rows if row["record_type"] == "phase_query" and str(row["episode_id"]) in query_set and (not current_prediction or row["policy_valid"])]
+    queries = [row for row in rows if row["record_type"] == "phase_query" and str(row["episode_id"]) in query_set and (not current_prediction or strict_cache or row["policy_valid"])]
     if not queries:
         raise ValueError("no query rows in selected split")
     query_episode_ids = sorted({str(row["episode_id"]) for row in queries})
@@ -229,7 +253,7 @@ def build_cache(
                     if episode in initial_phases:
                         raise ValueError("duplicate initial phase query")
                     initial_phases[episode] = phase
-                if episode in query_set and (not current_prediction or row["policy_valid"]):
+                if episode in query_set and (not current_prediction or strict_cache or row["policy_valid"]):
                     identity = (episode, raw_step)
                     window_index = int(row["window_index"])
                     if window_index < 0 or identity in seen_queries or window_index in seen_windows:
@@ -263,18 +287,23 @@ def build_cache(
         required_initials = query_set | {episode for episode in train_set if effects[episode]}
         if required_initials - set(initial_phases):
             raise ValueError("initial raw_step=0 phase is required for episode pairing")
-        history_ids = sorted(episode for episode in train_set if effects[episode])
+        history_ids = ([episode for episode in tasks if episode in train_set and effects[episode]]
+                       if strict_cache else sorted(episode for episode in train_set if effects[episode]))
         if not history_ids:
             raise ValueError("no completed training history exists")
         query_meta = {episode: {"episode_id": episode, "task_id": tasks[episode], "split": split,
                                 "condition": condition_map.get(episode), "initial_phase": initial_phases[episode]}
                       for episode in query_episode_ids}
+        if strict_cache:
+            for episode_id, query in query_meta.items():
+                query.update({key: ego_source.episodes[episode_id][key] for key in ("dataset_start", "episode_length")})
         history_meta = [{"episode_id": episode, "task_id": tasks[episode], "split": "train",
                          "condition": condition_map.get(episode), "initial_phase": initial_phases[episode]}
                         for episode in history_ids]
         pairings = build_episode_pairings(
             query_meta, history_meta, max_histories=max_past_attempts, use_conditions=conditions is not None,
             history_pairing=history_pairing, allow_reduced_curriculum=allow_reduced_curriculum,
+            pairing_metric=pairing_metric,
         )
         h = len(history_ids)
         for name, shape, dtype in (
@@ -304,10 +333,12 @@ def build_cache(
         for name, value in metadata.items():
             (temporary / name).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
         manifest = {
-            "format": ((EGO_CROSS_ATTEMPT_CACHE_FORMAT if uniform_indexing == "reference_round"
+            "format": ((EGO_CROSS_ATTEMPT_CACHE_FORMAT if strict_cache else
+                        LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT if uniform_indexing == "reference_round"
                         else LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT) if current_prediction
                        else CROSS_ATTEMPT_CACHE_FORMAT), "pim_variant": "cross_attempt",
             "history_compression": "uniform", "uniform_indexing": uniform_indexing,
+            "query_scope": query_scope, "pairing_metric": pairing_metric,
             "history_pairing": history_pairing, "allow_reduced_curriculum": allow_reduced_curriculum,
             "retrieval_mode": "cross_attempt", "source_subset": "train-only", "split": split,
             "history_semantics": "full_episode_prefix", "query_step_unit": "raw_action_step",
@@ -339,7 +370,9 @@ def build_cache(
                             memory_semantics="predicted_effect_trace", effect_source="current_prediction",
                             executed_horizon=source_manifest.executed_horizon,
                             cte_input_type=source_manifest.cte_input_type,
-                            source_episode_splits_sha256=source_manifest.episode_splits_sha256)
+                            source_episode_splits_sha256=source_manifest.episode_splits_sha256,
+                            data_scope=source_manifest.data_scope,
+                            source_export_scope=source_manifest.export_scope)
         (temporary / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         reader = CrossAttemptPIMCache(temporary)
         # Validate every query's episode/task mapping without decoding RGB.
@@ -367,13 +400,17 @@ def main() -> None:
     parser.add_argument("--conditions", type=Path)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-past-attempts", type=int, default=3)
+    parser.add_argument("--max-past-attempts", type=int, default=4)
     parser.add_argument("--max-entries-per-attempt", type=int, default=64)
     parser.add_argument("--bit-size", type=int, default=4)
     parser.add_argument("--uniform-indexing", choices=("reference_round", "legacy_floor"),
                         help="Predictive default is reference_round; legacy_floor only replays old caches")
+    parser.add_argument("--query-scope", choices=(ALL_CTE_FRAMES, COMPLETE_POLICY_WINDOWS),
+                        help="New v2 boundary sources default to every CTE frame, with native padded policy targets")
+    parser.add_argument("--pairing-metric", choices=(REFERENCE_PAIRING_METRIC, LEGACY_PAIRING_METRIC),
+                        help="New v4 caches use torch float32 and source-order ties")
     parser.add_argument("--history-pairing", choices=("reference_nearest", "legacy_candidates"),
-                        help="Predictive v3 defaults to one fixed nearest/farthest episode per mode")
+                        help="Predictive reference caches default to one fixed nearest/farthest episode per mode")
     parser.add_argument("--allow-reduced-curriculum", action="store_true", default=None,
                         help="Explicit non-reference ablation permitting missing real condition/history modes")
     parser.add_argument("--history-weights", type=json.loads,

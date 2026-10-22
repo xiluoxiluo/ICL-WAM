@@ -28,6 +28,7 @@ from fastwam.zeva.ego_cte_training import (
     FORMAL_EPOCHS, MIN_PREDICTION_GAIN, REFERENCE_REVISION,
     PairedEpochSampler, build_ego_cte_optimizer, build_episode_splits,
     canonical_sha256, episode_metadata, load_ego_cte_checkpoint,
+    select_ego_episode_scope,
     restore_ego_training_checkpoint, save_ego_cte_checkpoint,
     sha256_file, validate_ego_cte,
 )
@@ -110,17 +111,31 @@ def train(cfg: DictConfig) -> None:
     base = instantiate(data_config)
     dataset = RoboTwinEgoEpisodeDataset(base, executed_horizon=model_config.executed_horizon,
                                         image_size=model_config.image_size, action_dim=model_config.action_dim)
+    split_policy = str(cfg.get("cte_split_policy", "zeva_ego"))
+    if split_policy not in {"zeva_ego", "legacy_semantic_task"}:
+        raise ValueError("cte_split_policy must be zeva_ego or legacy_semantic_task")
+    split_seed = int(cfg.get("cte_split_seed", 1000)) if split_policy == "zeva_ego" else seed
+    data_scope, partition_rows = None, None
+    if split_policy == "zeva_ego":
+        task_subset_path, conditions_path = cfg.get("cte_task_subset_path"), cfg.get("cte_episode_conditions_path")
+        if not task_subset_path or not conditions_path:
+            raise ValueError("Reference CTE training requires cte_task_subset_path and cte_episode_conditions_path")
+        data_scope, partition_rows = select_ego_episode_scope(
+            dataset, task_subset_path=str(task_subset_path), conditions_path=str(conditions_path),
+            conditions=list(cfg.get("cte_conditions", ["Clean", "Randomized"])),
+        )
     rows = episode_metadata(dataset.episodes)
     split_path = cfg.get("cte_episode_split_path")
     split_path = None if split_path in (None, "", "None", "null") else str(split_path)
-    splits = build_episode_splits(dataset.episodes, seed=seed,
+    splits = build_episode_splits(dataset.episodes, seed=split_seed,
                                   validation_fraction=float(cfg.get("cte_validation_fraction", 0.05)),
-                                  split_path=split_path)
+                                  split_path=split_path, split_policy=split_policy, partition_rows=partition_rows)
     positions = {row["episode_id"]: index for index, row in enumerate(rows)}
     indices = {key: [positions[identity] for identity in ids] for key, ids in splits.items()}
     train_dataset, validation_dataset = Subset(dataset, indices["train"]), Subset(dataset, indices["validation"])
-    sampler = PairedEpochSampler([rows[index]["task_id"] for index in indices["train"]], seed)
-    task_ids = {task: i for i, task in enumerate(sorted({row["task_id"] for row in rows}))}
+    tasks = data_scope["task_names"] if data_scope is not None else sorted({row["task_id"] for row in rows})
+    sampler = PairedEpochSampler([rows[index]["task_id"] for index in indices["train"]], seed, task_order=tasks)
+    task_ids = {task: i for i, task in enumerate(tasks)}
     loader_generator = torch.Generator().manual_seed(seed)
     loader_options = dict(batch_size=batch_size, num_workers=workers, collate_fn=collate_ego_episodes,
                           pin_memory=device.type == "cuda", generator=loader_generator,
@@ -141,7 +156,10 @@ def train(cfg: DictConfig) -> None:
     source_paths = {"trainer": Path(__file__).resolve(),
                     **{name: source_root / "src/fastwam/zeva" / f"{name}.py"
                        for name in ("ego_cte", "ego_cte_training", "ego_episode_data")}}
-    recipe = {"name": "zeva_ego_epoch80_with_episode_holdout", "minimum_formal_epochs": FORMAL_EPOCHS,
+    recipe = {"name": "zeva_ego_epoch80_with_partition_holdout" if data_scope is not None else "legacy_ego_epoch80_with_episode_holdout",
+              "formal_endpoint_epoch": FORMAL_EPOCHS,
+              "split_policy": split_policy, "split_seed": split_seed,
+              "validation_fraction": float(cfg.get("cte_validation_fraction", 0.05)),
               "batch_size": batch_size, "seed": seed, "num_workers": workers,
               "learning_rate": float(cfg.get("learning_rate", 1e-4)),
               "vision_learning_rate": float(cfg.get("cte_vision_learning_rate", 1e-5)),
@@ -152,7 +170,7 @@ def train(cfg: DictConfig) -> None:
     resolved_data = OmegaConf.to_container(data_config, resolve=True)
     manifest = {
         "schema": model.schema, "reference_revision": REFERENCE_REVISION, "config": model_config.to_dict(),
-        "tasks": sorted(task_ids), "episode_splits": splits,
+        "tasks": tasks, "episode_splits": splits,
         "dataset_path": [str(Path(path).expanduser().resolve()) for path in data_config.dataset_dirs],
         "dataset_stats_sha256": sha256_file(stats_path), "semantic_task_map_sha256": sha256_file(semantic_path),
         "data_identity": {"episode_metadata_sha256": canonical_sha256(rows), "data_config_sha256": canonical_sha256(resolved_data)},
@@ -161,6 +179,8 @@ def train(cfg: DictConfig) -> None:
         "runtime": {"torch": torch.__version__, "cuda": torch.version.cuda, "device": str(device)},
         "promotable": bool(not smoke_steps and model_config.formal_architecture and model_config.vision_pretrained),
     }
+    if data_scope is not None:
+        manifest["data_scope"] = data_scope
     start_epoch, step = (0, 0) if previous is None else restore_ego_training_checkpoint(previous, model, optimizer, manifest, loader_generator)
     if start_epoch >= epochs:
         raise ValueError(f"Resume checkpoint already completed epoch {start_epoch}; requested num_epochs={epochs}")

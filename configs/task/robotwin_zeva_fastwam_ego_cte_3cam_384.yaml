@@ -24,6 +24,13 @@ cte_effect_weight: 0.2
 cte_smoke_steps: 0
 cte_validation_fraction: 0.05
 cte_episode_split_path: null
+cte_split_policy: zeva_ego
+cte_split_seed: 1000
+# Required source manifests; task list is ordered {"task_names": [...]};
+# conditions maps full episode IDs to actual Clean/Randomized labels.
+cte_task_subset_path: null
+cte_episode_conditions_path: null
+cte_conditions: [Clean, Randomized]
 
 data:
   train:

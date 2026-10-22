@@ -1,9 +1,8 @@
-"""Model sampling streams independent of RoboTwin scene/reset randomness.
+"""Sampling streams independent of RoboTwin scene/reset randomness.
 
-Formal evaluation consumes one private CPU Torch generator per slot, including
-across task subprocesses. This preserves Zeva-Ego's continuous-stream rule;
-FastWAM's CPU float32 noise is not Zeva's CUDA numerical sequence. The previous
-per-request seed stream remains available for replaying legacy experiments.
+New evaluations use a continuous private Torch generator on the policy device.
+The old CPU stream and per-request seeds remain explicit replay protocols. The
+public Zeva-Ego adapter is external, so no cross-model bitwise claim is made.
 """
 
 from __future__ import annotations
@@ -17,15 +16,17 @@ from pathlib import Path
 
 ATTEMPT_SEED_STRIDE = 1_000
 CONTINUOUS_NOISE_PROTOCOL = "torch_continuous_slot_v1"
+DEVICE_CONTINUOUS_NOISE_PROTOCOL = "torch_device_continuous_slot_v1"
+CONTINUOUS_NOISE_PROTOCOLS = frozenset({CONTINUOUS_NOISE_PROTOCOL, DEVICE_CONTINUOUS_NOISE_PROTOCOL})
 
 
 class ContinuousModelNoiseStream:
-    """One CPU Torch generator per evaluation slot, independent of resets.
+    """One versioned Torch generator per evaluation slot, independent of resets.
 
     State can be handed to the next task subprocess in the same fresh run.
     This is not a partial-run resume facility: the manifest runner refuses
     existing output directories and verifies each completed task handoff.
-    CPU float32 sampling is FastWAM's contract, not Zeva's CUDA bit sequence.
+    ``device`` is the policy device for the new protocol; legacy stays on CPU.
     """
 
     def __init__(
@@ -33,6 +34,7 @@ class ContinuousModelNoiseStream:
         run_id: str | None = None, state_path: str | Path | None = None,
         task_name: str | None = None,
         checkpoint_identity: dict[str, object] | None = None,
+        protocol: str = CONTINUOUS_NOISE_PROTOCOL, device: str | object = "cpu",
     ) -> None:
         import torch
 
@@ -50,7 +52,16 @@ class ContinuousModelNoiseStream:
         self.state_path = None if state_path is None else Path(state_path)
         if self.state_path is not None and (not run_id or not task_name):
             raise ValueError("slot state handoff requires run_id and task_name")
-        self.generator = torch.Generator(device="cpu").manual_seed(seed)
+        if protocol not in CONTINUOUS_NOISE_PROTOCOLS:
+            raise ValueError("unsupported continuous model RNG protocol")
+        device = torch.device(device)
+        if protocol == CONTINUOUS_NOISE_PROTOCOL and device.type != "cpu":
+            raise ValueError("legacy continuous model RNG requires CPU storage")
+        if device.type not in {"cpu", "cuda"}:
+            raise ValueError("model noise generator requires a CPU or CUDA policy device")
+        self.protocol = protocol
+        self.generator = torch.Generator(device=device).manual_seed(seed)
+        self.device = str(self.generator.device)
         self.draws = 0
         self.noise_shape: tuple[int, ...] | None = None
         self.completed_tasks: list[str] = []
@@ -89,9 +100,9 @@ class ContinuousModelNoiseStream:
 
     def _identity(self) -> dict[str, object]:
         return {
-            "protocol": CONTINUOUS_NOISE_PROTOCOL, "seed": self.seed,
+            "protocol": self.protocol, "seed": self.seed,
             "slot_index": self.slot_index, "slot_count": self.slot_count,
-            "run_id": self.run_id, "device": "cpu", "dtype": "float32",
+            "run_id": self.run_id, "device": self.device, "dtype": "float32",
             "checkpoint_identity": self.checkpoint_identity,
         }
 
@@ -109,15 +120,15 @@ class ContinuousModelNoiseStream:
         if self.noise_shape is not None and shape != self.noise_shape:
             raise ValueError("action noise shape changed within an evaluation slot")
         self.noise_shape = shape
-        noise = torch.randn(shape, generator=self.generator, device="cpu", dtype=torch.float32)
+        noise = torch.randn(shape, generator=self.generator, device=self.generator.device, dtype=torch.float32)
         self.draws += 1
         return noise
 
     def snapshot(self) -> dict[str, object]:
         return {
-            "protocol": CONTINUOUS_NOISE_PROTOCOL, "seed": self.seed,
+            "protocol": self.protocol, "seed": self.seed,
             "draws": self.draws, "state_sha256": hashlib.sha256(self._state_bytes()).hexdigest(),
-            "device": "cpu", "dtype": "float32",
+            "device": self.device, "dtype": "float32",
         }
 
     def save_state(self) -> None:

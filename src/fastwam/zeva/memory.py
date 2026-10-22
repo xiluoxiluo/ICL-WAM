@@ -40,6 +40,10 @@ class PersistentInteractionMemoryConfig:
     max_entries_per_attempt: int = 64
     compression: str = "uniform"
     uniform_indexing: str = "legacy_floor"
+    # Historical Python callers keep their original end/CPU semantics. The
+    # reference recipe opts into reset-time publication and policy-device storage.
+    commit_timing: str = "attempt_end"
+    storage_device: str = "cpu"
 
     def __post_init__(self) -> None:
         if min(self.phase_dim, self.effect_dim, self.capacity, self.top_k) < 1 or self.top_k > self.capacity:
@@ -62,6 +66,12 @@ class PersistentInteractionMemoryConfig:
             raise ValueError("PIM compression must be uniform or similarity_merge")
         if self.uniform_indexing not in {"legacy_floor", "reference_round"}:
             raise ValueError("PIM uniform_indexing must be legacy_floor or reference_round")
+        if self.commit_timing not in {"attempt_end", "attempt_reset"}:
+            raise ValueError("PIM commit_timing must be attempt_end or attempt_reset")
+        if self.storage_device not in {"cpu", "policy"}:
+            raise ValueError("PIM storage_device must be cpu or policy")
+        if self.commit_timing == "attempt_reset" and not self.cross_attempt_only:
+            raise ValueError("reset-time publication requires cross-attempt PIM")
         if self.compression == "similarity_merge" and not self.cross_attempt_only:
             raise ValueError("similarity_merge compression requires cross-attempt PIM")
         if self.cross_attempt_only:
@@ -71,7 +81,8 @@ class PersistentInteractionMemoryConfig:
                 raise ValueError("cross-attempt PIM must expose its full capacity, not fixed top-k")
 
 
-def uniform_history_indices(length: int, limit: int, *, rounding: str = "legacy_floor") -> list[int]:
+def uniform_history_indices(length: int, limit: int, *, rounding: str = "legacy_floor",
+                            device: torch.device | str | None = None) -> list[int]:
     """Deterministic endpoint-preserving compression shared by train and serve."""
     if length < 0 or limit < 1:
         raise ValueError("history length must be non-negative and limit positive")
@@ -82,7 +93,7 @@ def uniform_history_indices(length: int, limit: int, *, rounding: str = "legacy_
     if limit == 1:
         return [0]
     if rounding == "reference_round":
-        return torch.linspace(0, length - 1, limit, dtype=torch.float32).round().long().unique().tolist()
+        return torch.linspace(0, length - 1, limit, dtype=torch.float32, device=device).round().long().unique().tolist()
     return [i * (length - 1) // (limit - 1) for i in range(limit)]
 
 
@@ -112,10 +123,13 @@ class PIMMemoryEntry:
         return int(self.observation_count)
 
     def cpu(self) -> "PIMMemoryEntry":
+        return self.clone(device="cpu")
+
+    def clone(self, *, device: torch.device | str | None = None) -> "PIMMemoryEntry":
         return PIMMemoryEntry(
             self.task_cluster,
-            self.phase.detach().float().cpu(),
-            self.effect.detach().float().cpu(),
+            self.phase.detach().float().to(device=device).clone(),
+            self.effect.detach().float().to(device=device).clone(),
             self.attempt_id,
             self.transition_index,
             self.observation_count,
@@ -185,7 +199,7 @@ class PersistentInteractionMemory:
         merged: list[PIMMemoryEntry] = []
         phase_weight = self.config.phase_merge_weight / (self.config.phase_merge_weight + self.config.effect_merge_weight)
         for original in entries:
-            entry = original.cpu()
+            entry = original.clone(device="cpu" if self.config.storage_device == "cpu" else None)
             if merged:
                 phase_scores = F.cosine_similarity(torch.stack([item.phase for item in merged]), entry.phase[None])
                 effect_scores = F.cosine_similarity(torch.stack([item.effect for item in merged]), entry.effect[None])
@@ -220,6 +234,7 @@ class PersistentInteractionMemory:
             indices = uniform_history_indices(
                 len(entries), self.config.max_entries_per_attempt,
                 rounding=self.config.uniform_indexing,
+                device=entries[0].phase.device if self.config.storage_device == "policy" else None,
             )
             self._past_attempts.append([entries[i] for i in indices])
             del self._past_attempts[:-self.config.max_past_attempts]
@@ -238,8 +253,15 @@ class PersistentInteractionMemory:
             raise ValueError("PIM phase/effect shape mismatch")
         if not torch.isfinite(phase).all() or not torch.isfinite(effect).all():
             raise ValueError("PIM refuses non-finite values")
-        phase = phase.detach().float().cpu()
-        effect = effect.detach().float().cpu()
+        target = "cpu" if self.config.storage_device == "cpu" else phase.device
+        if self.config.storage_device == "policy":
+            if phase.device != effect.device:
+                raise ValueError("PIM phase/effect must share the policy device")
+            stored = self._pending_entries or self._entries
+            if stored and stored[0].phase.device != phase.device:
+                raise ValueError("PIM policy device cannot change within an episode")
+        phase = phase.detach().float().to(device=target)
+        effect = effect.detach().float().to(device=target)
         # Advance the attempt only after the feature payload has passed all
         # validation, so a malformed write cannot mutate lifecycle state.
         self.begin_attempt(attempt_id)
@@ -302,22 +324,29 @@ class PersistentInteractionMemory:
             raise ValueError("PIM query phase shape mismatch")
         if not torch.isfinite(phase).all():
             raise ValueError("PIM refuses a non-finite query phase")
+        device = torch.device("cpu") if self.config.storage_device == "cpu" else phase.device
         candidates = [(i, e) for i, e in enumerate(self._entries) if exclude_attempt_id is None or e.attempt_id != exclude_attempt_id]
         if candidates:
-            query = F.normalize(phase.detach().float().cpu(), dim=0)
-            scores_all = torch.tensor([float(F.normalize(e.phase, dim=0) @ query) for _, e in candidates], dtype=torch.float32)
+            query = F.normalize(phase.detach().float().to(device=device), dim=0)
+            if any(entry.phase.device != device for _, entry in candidates):
+                raise ValueError("PIM query must use the memory policy device")
+            scores_all = (
+                F.normalize(torch.stack([e.phase for _, e in candidates]), dim=-1) @ query
+                if self.config.storage_device == "policy" else
+                torch.tensor([float(F.normalize(e.phase, dim=0) @ query) for _, e in candidates], dtype=torch.float32)
+            )
             order = (
-                torch.arange(len(candidates))
+                torch.arange(len(candidates), device=device)
                 if self.config.cross_attempt_only
                 else torch.argsort(scores_all, descending=True, stable=True)[:k]
             )
             selected = [candidates[int(i)] for i in order]
             scores = scores_all[order]
         else:
-            selected, scores = [], torch.empty(0)
-        phases = torch.zeros((k, self.config.phase_dim), dtype=torch.float32)
-        effects = torch.zeros((k, self.config.effect_dim), dtype=torch.float32)
-        valid = torch.zeros(k, dtype=torch.bool)
+            selected, scores = [], torch.empty(0, device=device)
+        phases = torch.zeros((k, self.config.phase_dim), dtype=torch.float32, device=device)
+        effects = torch.zeros((k, self.config.effect_dim), dtype=torch.float32, device=device)
+        valid = torch.zeros(k, dtype=torch.bool, device=device)
         metadata: list[dict[str, object]] = []
         for j, ((_, entry), score) in enumerate(zip(selected, scores, strict=True)):
             phases[j], effects[j], valid[j] = entry.phase, entry.effect, True
@@ -333,13 +362,16 @@ class PersistentInteractionMemory:
                 "score": float(score),
             })
             metadata.append(source)
-        return phases, effects, valid, torch.cat((scores, torch.full((k - len(scores),), -torch.inf))), metadata
+        return phases, effects, valid, torch.cat((scores, torch.full((k - len(scores),), -torch.inf, device=device))), metadata
 
 
 class BriefInteractionTraceBuffer:
-    def __init__(self, effect_dim: int, max_length: int = 4) -> None:
+    def __init__(self, effect_dim: int, max_length: int = 4, *, storage_device: str = "cpu") -> None:
         if effect_dim < 1 or max_length < 1:
             raise ValueError("effect_dim and max_length must be positive")
+        if storage_device not in {"cpu", "policy"}:
+            raise ValueError("BIT storage_device must be cpu or policy")
+        self.storage_device = storage_device
         self.effect_dim, self.max_length = effect_dim, max_length
         self._effects: list[Tensor] = []
         self._indices: list[int] = []
@@ -350,7 +382,10 @@ class BriefInteractionTraceBuffer:
     def append(self, effect: Tensor, transition_index: int) -> None:
         if effect.shape != (self.effect_dim,):
             raise ValueError("effect shape mismatch")
-        self._effects.append(effect.detach().float().cpu()); self._indices.append(int(transition_index))
+        value = effect.detach().float()
+        if self.storage_device == "cpu":
+            value = value.cpu()
+        self._effects.append(value.clone()); self._indices.append(int(transition_index))
         del self._effects[:-self.max_length]; del self._indices[:-self.max_length]
 
     def tensors(self, device: torch.device | str | None = None) -> BriefInteractionTrace:

@@ -1,0 +1,30 @@
+# @package _global_
+defaults:
+  - robotwin_zeva_ego_pim_3cam_384
+  - _self_
+
+# Re-evaluate checkpoints from 4e95b26 with their original behavior. Exact
+# training resume requires that commit and its original config/artifacts.
+# Use --model-rng-protocol torch_continuous_slot_v1 with the evaluation launcher.
+model:
+  zeva:
+    cte:
+      require_reference_recipe: false
+    memory:
+      pim_top_k: 192
+      pim_max_entries: 192
+      max_past_attempts: 3
+      commit_timing: attempt_end
+      storage_device: cpu
+    prompt:
+      numerical_contract: legacy_v1
+      persistent_length: 192
+    adapter:
+      numerical_contract: legacy_v1
+    task_context:
+      training_query_scope: episode_static
+    cache:
+      export_scope: decision_only_v1
+    prepared_stage2:
+      query_scope: complete_policy_windows_v1
+      pairing_metric: numpy_float32_episode_id_v1

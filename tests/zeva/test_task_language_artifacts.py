@@ -10,7 +10,8 @@ from torch.nn import functional as F
 
 from fastwam.zeva.checkpoint import checkpoint_sha256
 from fastwam.zeva.ego_task_memory import (
-    build_ego_task_language_context_cache, episode_task_instructions, load_ego_task_language_features,
+    build_ego_task_language_context_cache, decision_task_instructions,
+    episode_task_instructions, load_ego_task_language_features,
     ordered_episode_ids, save_ego_task_language_artifacts, validate_ego_task_language_static_context,
 )
 from fastwam.zeva.prepared_stage2 import StaticEpisodeContextCache
@@ -30,6 +31,7 @@ class Cache:
                                         "task_id": str(i % 2), "split": "train" if i < 6 else "validation"}
                          for i in range(8)}
         self.rows = [{"episode_id": identity, "task_id": info["task_id"], "raw_step": step,
+                      "window_index": info["dataset_start"] + step,
                       "split": info["split"]} for identity, info in self.episodes.items() for step in (0, 24)]
         self.read = []
 
@@ -292,6 +294,7 @@ def test_language_bank_builder_runs_on_cpu_without_foundation_checkpoint_or_imag
     cfg = OmegaConf.create({
         "ckpt": None, "device": "cpu", "model": {"tokenizer_max_len": 128, "zeva": {
             "cte": {"variant": "zeva_ego", "input_type": "rgb_multiview", "checkpoint": str(cte),
+                    "require_reference_recipe": False,
                     "retrieval_dim": 128, "hidden_dim": 256}, "cache": {"path": str(boundary)},
             "task_context": {"mode": "task_language", "build_stage": "bank", "temperature": 1.0,
                              "bank_path": str(tmp_path / "new_bank.pt"), "language_encoder_path": str(encoder),
@@ -311,8 +314,90 @@ def test_language_bank_builder_runs_on_cpu_without_foundation_checkpoint_or_imag
 
     monkeypatch.setattr(builder, "instantiate", metadata_only)
     monkeypatch.setattr(builder, "EgoBoundaryCache", lambda _: cache)
-    monkeypatch.setattr(builder, "require_ego_checkpoint_ready", lambda _: None)
+    monkeypatch.setattr(builder, "require_ego_checkpoint_ready", lambda _, **kwargs: None)
     monkeypatch.setattr(builder, "extract_initial_readouts", lambda *a, **k: pytest.fail("image readout was used"))
     result = builder.build(cfg)
     assert calls == ["metadata_source_only"]
     assert result["train_episodes"] == 6 and result["query_episodes"] == 8
+
+
+def test_per_decision_metadata_reads_current_instruction_and_keeps_initial_query_separate():
+    base, cache, inner = metadata_source()
+    cache.rows = [{"episode_id": identity, "window_index": row["dataset_start"] + step, "raw_step": step}
+                  for identity, row in cache.episodes.items() for step in (0, 24, 48)]
+    inner.hf_dataset.rows[24]["task_index"] = 1
+    initial = episode_task_instructions(base, cache, require_fixed=False)
+    decisions = decision_task_instructions(base, cache)
+    assert initial["/dataset::episode-0"] == "pick alpha"
+    assert [row["instruction"] for row in decisions[:3]] == ["pick alpha", "place beta", "pick alpha"]
+    assert decisions[1]["window_index"] == 24
+    assert decisions[1]["episode_id"] == "/dataset::episode-0"
+
+
+def decision_queries(cache):
+    queries = []
+    for row in cache.rows:
+        number = int(row["episode_id"].split("-")[-1])
+        first_alpha = number % 2 == 0 or number == 7
+        # Change instruction midway, including the contradictory GT task-1
+        # held-out episode whose classifier feature source initially says alpha.
+        alpha = first_alpha if row["raw_step"] == 0 else not first_alpha
+        queries.append({**{key: row[key] for key in ("episode_id", "window_index", "raw_step")},
+                        "instruction": "alpha" if alpha else "beta"})
+    return queries
+
+
+def test_per_decision_context_matches_live_language_memory_and_deduplicates(artifacts, tmp_path):
+    cache, paths, metadata = artifacts
+    queries = decision_queries(cache)
+    output = tmp_path / "decisions.pt"
+    result = build_ego_task_language_context_cache(
+        cache=cache, output_path=output, expected_metadata=metadata, train_query_exclusion="none",
+        training_query_scope="per_decision", decision_queries=queries, batch_size=3, **paths)
+    static = StaticEpisodeContextCache(output)
+    validate_ego_task_language_static_context(
+        static, cache=cache, expected_metadata=metadata, train_query_exclusion="none",
+        training_query_scope="per_decision", **paths)
+    assert result["num_context_values"] == 2
+    assert result["num_decision_queries"] == len(cache.rows)
+    assert static.query_records == queries
+    memory = TaskLanguageMemory.load(paths["bank_path"], paths["head_path"], encoder_path=paths["encoder_path"])
+    expected = memory.retrieve(memory.encoder.encode([row["instruction"] for row in queries]))
+    for row, value in zip(queries, expected.values, strict=True):
+        torch.testing.assert_close(static.get(row["episode_id"], row["window_index"]), value)
+    assert not torch.allclose(static.get("episode-0", 0), static.get("episode-0", 24))
+    with pytest.raises(KeyError, match="query window"):
+        static.get("episode-0")
+    with pytest.raises(ValueError, match="different episode"):
+        static.get("episode-1", 0)
+    with pytest.raises(ValueError, match="training_query_scope"):
+        validate_ego_task_language_static_context(
+            static, cache=cache, expected_metadata=metadata, train_query_exclusion="none", **paths)
+
+
+def test_per_decision_context_rejects_omitted_or_remapped_window(artifacts, tmp_path):
+    cache, paths, metadata = artifacts
+    queries = decision_queries(cache)
+    for index, bad in enumerate((queries[:-1], [{**queries[0], "window_index": 999}, *queries[1:]])):
+        with pytest.raises(ValueError, match="Per-decision"):
+            build_ego_task_language_context_cache(
+                cache=cache, output_path=tmp_path / f"bad-{index}.pt", expected_metadata=metadata,
+                training_query_scope="per_decision", decision_queries=bad, **paths)
+        assert not (tmp_path / f"bad-{index}.pt").exists()
+
+
+def test_per_decision_loo_context_deduplicates_only_with_equal_exclusion(artifacts, tmp_path):
+    cache, paths, metadata = artifacts
+    queries = decision_queries(cache)
+    output = tmp_path / "decision_loo.pt"
+    result = build_ego_task_language_context_cache(
+        cache=cache, output_path=output, expected_metadata=metadata,
+        training_query_scope="per_decision", decision_queries=queries, **paths)
+    assert result["num_context_values"] == 2 * len(cache.splits["train"]) + 2
+    static = StaticEpisodeContextCache(output)
+    memory = TaskLanguageMemory.load(paths["bank_path"], paths["head_path"], encoder_path=paths["encoder_path"])
+    exclusions = [row["episode_id"] if row["episode_id"] in cache.splits["train"] else None for row in queries]
+    expected = memory.retrieve(memory.encoder.encode([row["instruction"] for row in queries]),
+                               exclude_episode_ids=exclusions)
+    for row, value in zip(queries, expected.values, strict=True):
+        torch.testing.assert_close(static.get(row["episode_id"], row["window_index"]), value)

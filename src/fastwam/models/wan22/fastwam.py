@@ -1077,12 +1077,17 @@ class FastWAM(torch.nn.Module):
                 )
             if int(adapter_cfg.action_dim) != int(self.action_expert.action_dim):
                 raise ValueError("exact Zeva prior action_dim must match FastWAM action_dim")
+        prompt_numerics = getattr(causal_prompt_encoder.config, "numerical_contract", "legacy_v1")
+        adapter_numerics = getattr(behavior_prefix_adapter.config, "numerical_contract", "legacy_v1")
+        if prompt_numerics != adapter_numerics:
+            raise ValueError("prompt and adapter numerical_contract must agree")
         # Make the Zeva contract safe even when the caller does not go through
         # Wan22Trainer: the pretrained FastWAM path is frozen before the addon
         # modules are attached, while the addon remains explicitly trainable.
         self.requires_grad_(False)
-        self.zeva_prompt_encoder = causal_prompt_encoder.to(device=self.device, dtype=self.torch_dtype)
-        self.zeva_behavior_prefix_adapter = behavior_prefix_adapter.to(device=self.device, dtype=self.torch_dtype)
+        addon_dtype = torch.float32 if adapter_numerics == "zeva_ego_v1" else self.torch_dtype
+        self.zeva_prompt_encoder = causal_prompt_encoder.to(device=self.device, dtype=addon_dtype)
+        self.zeva_behavior_prefix_adapter = behavior_prefix_adapter.to(device=self.device, dtype=addon_dtype)
         self.zeva_prompt_encoder.requires_grad_(True)
         self.zeva_behavior_prefix_adapter.requires_grad_(True)
         if (getattr(behavior_prefix_adapter.config, "pim_variant", "legacy") == "cross_attempt"
@@ -1101,6 +1106,15 @@ class FastWAM(torch.nn.Module):
             )
         self.zeva_training_stage = stage
         return self
+
+    @property
+    def zeva_numerical_contract(self) -> str:
+        config = getattr(self.zeva_behavior_prefix_adapter, "config", None)
+        return getattr(config, "numerical_contract", "legacy_v1")
+
+    @property
+    def zeva_condition_dtype(self) -> torch.dtype:
+        return torch.float32 if self.zeva_numerical_contract == "zeva_ego_v1" else self.torch_dtype
 
     def zeva_trainable_parameters(self):
         if not self.zeva_enabled or self.zeva_prompt_encoder is None or self.zeva_behavior_prefix_adapter is None:
@@ -1393,6 +1407,10 @@ class FastWAM(torch.nn.Module):
             )
         # Main-stream behavior conditions leave instruction/proprio inputs
         # unchanged. Their versioned layout controls independent positions.
+        reference_numerics = self.zeva_numerical_contract == "zeva_ego_v1"
+        # EAP supervises the original normalized full-horizon target. The
+        # WAM flow targets retain the model dtype and native noise formula.
+        prior_target = clean_action.to(self.device, dtype=torch.float32) if reference_numerics else None
         clean_action = clean_action.to(self.device, dtype=self.torch_dtype)
         noise = torch.randn_like(clean_action) if noise is None else noise.to(clean_action)
         timestep = self.train_action_scheduler.sample_training_t(
@@ -1503,10 +1521,13 @@ class FastWAM(torch.nn.Module):
             debug=debug_metrics,
         )
         error = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=-1)
-        if action_valid is not None:
+        if action_valid is not None and action_valid.shape != error.shape:
+            raise ValueError("action_valid must be [B,32]")
+        # Reference datasets repeat the terminal action through the full
+        # policy horizon, including terminal observation rows. Train those
+        # targets as Zeva-Ego does; masking is an explicit legacy behavior.
+        if action_valid is not None and not reference_numerics:
             valid = action_valid.to(self.device, dtype=error.dtype)
-            if valid.shape != error.shape:
-                raise ValueError("action_valid must be [B,32]")
             valid_sum = valid.sum(dim=1).clamp_min(1.0)
             loss_per_sample = (error * valid).sum(dim=1) / valid_sum
         else:
@@ -1523,14 +1544,19 @@ class FastWAM(torch.nn.Module):
         if exact_zeva and (self.zeva_training_stage == "policy_injection" or cross_attempt):
             if zeva_prior_mean is None or zeva_prior_std is None:
                 raise ValueError("exact Zeva training requires action-prior outputs")
+            prior_target = prior_target if reference_numerics else clean_action.float()
+            prior_valid = None if reference_numerics else action_valid
             prior_loss = gaussian_prior_nll(
-                clean_action.float(), zeva_prior_mean.float(), zeva_prior_std.float(), action_valid,
+                prior_target,
+                zeva_prior_mean if reference_numerics else zeva_prior_mean.float(),
+                zeva_prior_std if reference_numerics else zeva_prior_std.float(),
+                prior_valid,
                 reference_reduction=(self.zeva_behavior_prefix_adapter.config.prior_variant == "zeva_ego"),
             )
             loss = loss + prior_loss * float(self.zeva_behavior_prefix_adapter.config.prior_loss_weight)
-            prior_error = (clean_action.float() - zeva_prior_mean.float()).square().mean(dim=-1)
-            if action_valid is not None:
-                prior_valid = action_valid.to(device=prior_error.device, dtype=prior_error.dtype)
+            prior_error = (prior_target - zeva_prior_mean.float()).square().mean(dim=-1)
+            if prior_valid is not None:
+                prior_valid = prior_valid.to(device=prior_error.device, dtype=prior_error.dtype)
                 prior_mse = (prior_error * prior_valid).sum() / prior_valid.sum().clamp_min(1)
             else:
                 prior_mse = prior_error.mean()
@@ -2224,6 +2250,8 @@ class FastWAM(torch.nn.Module):
             "foundation_mode": self.zeva_foundation_mode,
             "foundation_checkpoint_required": self.zeva_requires_foundation_checkpoint,
         }
+        if getattr(self.zeva_behavior_prefix_adapter.config, "effect_source", None) == "current_prediction":
+            training_metadata["numerical_contract"] = self.zeva_numerical_contract
         if getattr(self, "zeva_foundation_parent_identity", None) is not None:
             training_metadata["foundation_parent_identity"] = self.zeva_foundation_parent_identity
         if getattr(self, "zeva_pim_memory_contract", None) is not None:
@@ -2295,7 +2323,7 @@ class FastWAM(torch.nn.Module):
         if "foundation_checkpoint_required" in addon_payload:
             expected.update({"training_stage": addon_payload["training_stage"],
                              "foundation_checkpoint_required": addon_payload["foundation_checkpoint_required"]})
-        for name in ("foundation_parent_identity", "pim_memory_contract"):
+        for name in ("foundation_parent_identity", "pim_memory_contract", "numerical_contract"):
             if name in addon_payload:
                 expected[name] = addon_payload[name]
         for name, value in expected.items():

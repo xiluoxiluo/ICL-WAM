@@ -20,6 +20,8 @@ MANIFEST_SCHEMA = "iclwam-robotwin-multiattempt-v1"
 ATTEMPT_SCHEMA = "iclwam-robotwin-attempt-v1"
 EVALUATION_PROTOCOL_SCHEMA = "iclwam-zeva-ego-evaluation-v2"
 CONTINUOUS_NOISE_PROTOCOL = "torch_continuous_slot_v1"
+DEVICE_CONTINUOUS_NOISE_PROTOCOL = "torch_device_continuous_slot_v1"
+CONTINUOUS_NOISE_PROTOCOLS = frozenset({CONTINUOUS_NOISE_PROTOCOL, DEVICE_CONTINUOUS_NOISE_PROTOCOL})
 LEGACY_SEED_PROTOCOL = "request_seed_stream_v1"
 FROZEN_MANIFEST_SHA256 = "588a85f45dc961ccf3b4ecba3a1651eeb126c4a8368d8ac7f7485c3aa4e145cf"
 REFERENCE_REVISION = "bae85ad753d3afe4f2e56762373d48ac0267e101"
@@ -73,7 +75,7 @@ def _protocol(manifest: dict[str, Any]) -> dict[str, Any] | None:
         return None  # Legacy manifests remain readable, with an explicit audit label.
     if not isinstance(protocol, dict) or protocol.get("schema") != EVALUATION_PROTOCOL_SCHEMA:
         raise ValueError("Unknown evaluation protocol schema")
-    if protocol.get("model_rng_protocol") not in {CONTINUOUS_NOISE_PROTOCOL, LEGACY_SEED_PROTOCOL}:
+    if protocol.get("model_rng_protocol") not in CONTINUOUS_NOISE_PROTOCOLS | {LEGACY_SEED_PROTOCOL}:
         raise ValueError("Unknown model RNG protocol")
     slots = _integer(protocol.get("slots"), "slots", 1)
     if _integer(protocol.get("model_seed"), "protocol model_seed") >= 2**63:
@@ -206,7 +208,7 @@ def audit_protocol_trace(manifest: dict[str, Any], rows: list[dict[str, Any]]) -
 
     Legacy JSONL remains reportable but cannot retroactively establish an audit
     it never recorded. Slot snapshots establish continuity, not a claim that
-    FastWAM CPU samples reproduce Zeva's CUDA samples bit for bit.
+    either FastWAM noise protocol reproduces the external Zeva adapter bit for bit.
     """
     protocol = _protocol(manifest)
     if protocol is None:
@@ -274,6 +276,23 @@ def audit_protocol_trace(manifest: dict[str, Any], rows: list[dict[str, Any]]) -
                 if any(recorded.get("foundation_contract_schema") != contract["foundation_contract_schema"]
                        for recorded in (row, hashes)):
                     raise ValueError("Runtime foundation contract schema differs from the verified bundle")
+            if "numerical_contract" in contract:
+                expected_numerics = contract["numerical_contract"]
+                for recorded in (row, hashes):
+                    if recorded.get("numerical_contract") != expected_numerics:
+                        raise ValueError("Runtime numerical_contract differs from the frozen policy contract")
+                if condition != "base":
+                    from fastwam.zeva_numerical_contract import validate_checkpoint_numerical_contract
+                    validate_checkpoint_numerical_contract(
+                        {"numerical_contract": hashes.get("checkpoint_numerical_contract")}, expected_numerics)
+            if condition != "base":
+                for key in ("training_query_scope", "inference_task_context_scope",
+                            "cte_exploratory_epoch40", "cte_require_reference_recipe"):
+                    if key in contract and any(recorded.get(key) != contract[key] for recorded in (row, hashes)):
+                        raise ValueError(f"Runtime {key} differs from the frozen policy contract")
+                for key in ("cte_epoch", "cte_data_scope"):
+                    if key in contract and hashes.get(key) != contract[key]:
+                        raise ValueError(f"Runtime {key} differs from the verified CTE artifact")
             if "pim_memory_contract" in contract:
                 _audit_memory_contract(contract, row, hashes)
             if "policy_text_encoder_device" in contract:
@@ -332,9 +351,14 @@ def audit_protocol_trace(manifest: dict[str, Any], rows: list[dict[str, Any]]) -
             if protocol["model_rng_protocol"] == CONTINUOUS_NOISE_PROTOCOL:
                 if snapshot.get("device") != "cpu" or snapshot.get("dtype") != "float32":
                     raise ValueError("Continuous FastWAM noise must use CPU float32")
+            elif protocol["model_rng_protocol"] == DEVICE_CONTINUOUS_NOISE_PROTOCOL:
+                device = snapshot.get("device")
+                if (not isinstance(device, str) or not re.fullmatch(r"cpu|cuda:[0-9]+", device)
+                        or snapshot.get("dtype") != "float32" or device != hashes.get("policy_device")):
+                    raise ValueError("Device-continuous noise must use float32 on the actual policy device")
         # Legacy task subprocesses restart their request-seed stream; this is
         # explicit rather than silently described as a continuous slot stream.
-        stream_key = slot if protocol["model_rng_protocol"] == CONTINUOUS_NOISE_PROTOCOL else row["task"]
+        stream_key = slot if protocol["model_rng_protocol"] in CONTINUOUS_NOISE_PROTOCOLS else row["task"]
         if stream_key in previous:
             if before != previous[stream_key]:
                 raise ValueError("Model RNG stream was reseeded, skipped or reordered between attempts/tasks")
@@ -533,7 +557,7 @@ def paired_comparison(
         "noise_pairing": (
             "same initial seed per slot; later noise offsets may diverge with trajectory lengths; "
             "local diagnostic probes reuse the exact action noise"
-            if protocol and protocol["model_rng_protocol"] == CONTINUOUS_NOISE_PROTOCOL
+            if protocol and protocol["model_rng_protocol"] in CONTINUOUS_NOISE_PROTOCOLS
             else "same recorded model seed; legacy logs do not establish exact per-step noise pairing"
         ),
     }

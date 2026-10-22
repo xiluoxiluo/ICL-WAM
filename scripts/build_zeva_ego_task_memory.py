@@ -25,7 +25,8 @@ from fastwam.zeva.ego_cte_training import require_ego_checkpoint_ready, sha256_f
 from fastwam.zeva.ego_episode_data import EGO_CAMERA_KEYS, RoboTwinEgoEpisodeDataset
 from fastwam.zeva.ego_task_memory import (
     build_ego_static_context_cache, ordered_episode_ids, save_ego_task_memory,
-    build_ego_task_language_context_cache, episode_task_instructions, save_ego_task_language_artifacts,
+    build_ego_task_language_context_cache, decision_task_instructions,
+    episode_task_instructions, save_ego_task_language_artifacts,
 )
 
 
@@ -122,9 +123,17 @@ def build(cfg: DictConfig) -> dict:
         query_path = _path(tc.query_readout_cache_path, "task_context.query_readout_cache_path", existing=stage == "static_context")
     cache = EgoBoundaryCache(cache_path)
     checkpoint = torch.load(cte_path, map_location="cpu", weights_only=False)
-    require_ego_checkpoint_ready(checkpoint)
+    require_ego_checkpoint_ready(
+        checkpoint, require_reference_recipe=bool(zeva.cte.get("require_reference_recipe", True)),
+        exploratory_epoch40=bool(zeva.cte.get("exploratory_epoch40", False)),
+    )
     if checkpoint["episode_splits"] != cache.splits:
         raise ValueError("CTE and boundary cache use different held-out episode splits")
+    if bool(zeva.cte.get("require_reference_recipe", True)):
+        if cache.manifest.data_scope != checkpoint["manifest"]["data_scope"]:
+            raise ValueError("Task-memory boundary source scope differs from reference CTE")
+        if cache.manifest.export_tf32 is not False:
+            raise ValueError("Task-memory reference CTE export must explicitly disable TF32")
     stats_sha, semantic_sha, cte_sha = sha256_file(stats_path), sha256_file(semantic_path), checkpoint_sha256(cte_path)
     for name, expected in (("dataset_stats_sha256", stats_sha), ("semantic_task_map_sha256", semantic_sha),
                            ("cte_checkpoint_sha256", cte_sha)):
@@ -164,6 +173,19 @@ def build(cfg: DictConfig) -> dict:
             FrozenTaskLanguageEncoder, export_task_language_encoder_from_fastwam_config,
         )
 
+        query_scope = str(tc.get("training_query_scope", "episode_static"))
+        if query_scope not in {"episode_static", "per_decision"}:
+            raise ValueError("task_context.training_query_scope must be episode_static or per_decision")
+        if stage == "bank" or query_scope == "per_decision":
+            if not bool(data.get("is_training_set", False)) or float(data.get("val_set_proportion", -1)) != 0:
+                raise ValueError("Read all CTE source episodes with is_training_set=true and val_set_proportion=0")
+            if int(data.global_sample_stride) != 1:
+                raise ValueError("Task-language metadata requires source stride1")
+            # Both paths read raw Arrow metadata only; no policy, RGB/action
+            # decoding, or cached foundation text embeddings are needed.
+            source_cfg = OmegaConf.create(OmegaConf.to_container(data, resolve=True))
+            source_cfg.use_text_embed_cache = False
+            base = instantiate(source_cfg)
         if stage == "static_context":
             head_path = _path(tc.retrieval_checkpoint, "task_context.retrieval_checkpoint", existing=True)
             output = _path(tc.static_episode_cache_path, "task_context.static_episode_cache_path")
@@ -172,20 +194,13 @@ def build(cfg: DictConfig) -> dict:
                 head_path=head_path, output_path=output, expected_metadata=metadata,
                 top_k=int(tc.top_k), device=device, batch_size=int(tc.get("static_context_batch_size", 512)),
                 train_query_exclusion=str(tc.get("train_query_exclusion", "leave_one_episode_out")),
+                training_query_scope=query_scope,
+                decision_queries=decision_task_instructions(base, cache) if query_scope == "per_decision" else None,
             )
         else:
             if bank_path.exists() or feature_path.exists():
                 raise ValueError("Task-language bank/features require unused output paths")
-            if not bool(data.get("is_training_set", False)) or float(data.get("val_set_proportion", -1)) != 0:
-                raise ValueError("Read all CTE source episodes with is_training_set=true and val_set_proportion=0")
-            if int(data.global_sample_stride) != 1:
-                raise ValueError("Task-language metadata requires source stride1")
-            # Only Arrow metadata is read; cached policy embeddings, RGB and
-            # FastWAM model construction are unnecessary for language queries.
-            source_cfg = OmegaConf.create(OmegaConf.to_container(data, resolve=True))
-            source_cfg.use_text_embed_cache = False
-            base = instantiate(source_cfg)
-            instructions = episode_task_instructions(base, cache)
+            instructions = episode_task_instructions(base, cache, require_fixed=query_scope == "episode_static")
             if not encoder_path.exists():
                 export_task_language_encoder_from_fastwam_config(
                     cfg.model, encoder_path, max_length=int(tc.get("language_max_length", 200)),

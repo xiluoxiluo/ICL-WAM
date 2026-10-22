@@ -125,7 +125,7 @@ class _CausalCTE(nn.Module):
         return phase, phase + 20, {"index": index}
 
 
-def make_boundary_cache(tmp_path):
+def make_boundary_cache(tmp_path, *, legacy=False):
     dataset, _ = make_dataset()
     ids = [episode.episode_id for episode in dataset.episodes]
     splits = {"train": ids[:2], "validation": ids[2:]}
@@ -135,7 +135,8 @@ def make_boundary_cache(tmp_path):
     output = tmp_path / "boundaries"
     build_ego_boundary_cache(dataset, _CausalCTE(), output,
         identity={"cte_checkpoint_sha256": "cte", "dataset_stats_sha256": "stats",
-                  "semantic_task_map_sha256": file_sha256(semantic), "dataset_path": "/source"},
+                  "semantic_task_map_sha256": file_sha256(semantic), "dataset_path": "/source",
+                  **({"schema_version": "zeva_ego_boundary_cache_v1", "export_scope": "decision_only_v1"} if legacy else {})},
         episode_splits=splits)
     return output, semantic
 
@@ -194,7 +195,7 @@ def test_prediction_cache_preserves_current_effect_and_train_only_history(tmp_pa
     for name in ("pim_history_phases", "pim_history_effects", "pim_history_masks"):
         torch.testing.assert_close(bundle[name], resumed[name])
     assert bundle["pim_history_available"].tolist() == [True, True, False]
-    assert bundle["pim_history_phases"].shape == (3, 12, 2)
+    assert bundle["pim_history_phases"].shape == (3, 16, 2)
     assert bundle["pim_history_masks"].sum(-1).tolist() == [4, 4, 0]
     assert not bundle["pim_mask"].any()
     wrong = tmp_path / "split.json"

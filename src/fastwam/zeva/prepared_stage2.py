@@ -12,8 +12,8 @@ This module defines an immutable, sharded mmap artifact containing exactly the
 * four causal BIT effect slots [B,D_effect] + mask
 * top-K offline PIM phase/effect slots [K,D] + mask/scores
 
-Static task context is stored separately because it is episode-level rather
- than query-window-level.  Both artifacts keep strong SHA256 identities so the
+Frozen task context is stored separately, indexed by query for the reference
+ language path or by episode for historical configurations. Both artifacts keep SHA256 identities so the
  prepared path cannot silently drift from the frozen CTE/base policy/bank/head.
 """
 
@@ -37,6 +37,7 @@ from fastwam.zeva.cross_attempt_cache import CROSS_ATTEMPT_CACHE_FORMATS, CrossA
 
 PIM_CACHE_FORMAT = "zeva_stage2_prepared_pim_v1"
 STATIC_CONTEXT_FORMAT = "zeva_static_episode_context_v1"
+STATIC_QUERY_CONTEXT_FORMAT = "zeva_static_query_context_v2"
 
 
 @dataclass(frozen=True)
@@ -226,12 +227,13 @@ class PreparedPIMCache:
 
 
 class StaticEpisodeContextCache:
-    """Episode-level static task-context values used only during Stage-2 training."""
+    """Immutable task contexts, with explicit episode or per-query indexing."""
 
     def __init__(self, path: str | Path, *, expected: dict[str, Any] | None = None) -> None:
         self.path = Path(path).expanduser().resolve()
         payload = torch.load(self.path, map_location="cpu", weights_only=False)
-        if payload.get("format") != STATIC_CONTEXT_FORMAT:
+        self.format = payload.get("format")
+        if self.format not in {STATIC_CONTEXT_FORMAT, STATIC_QUERY_CONTEXT_FORMAT}:
             raise ValueError(f"unsupported static episode-context format: {payload.get('format')!r}")
         for key, value in dict(expected or {}).items():
             if payload.get(key) != value:
@@ -241,9 +243,12 @@ class StaticEpisodeContextCache:
                 )
         episode_ids = payload.get("episode_ids")
         values = payload.get("task_contexts")
-        if not isinstance(episode_ids, list) or len(set(episode_ids)) != len(episode_ids):
+        if (not isinstance(episode_ids, list) or not episode_ids
+                or any(not isinstance(identity, str) or not identity for identity in episode_ids)
+                or len(set(episode_ids)) != len(episode_ids)):
             raise ValueError("static episode-context cache requires unique episode_ids")
-        if not torch.is_tensor(values) or values.ndim != 2 or values.shape[0] != len(episode_ids):
+        if (not torch.is_tensor(values) or values.ndim != 2 or min(values.shape) < 1
+                or (self.format == STATIC_CONTEXT_FORMAT and values.shape[0] != len(episode_ids))):
             raise ValueError("static episode-context cache requires task_contexts [N,D]")
         if values.dtype != torch.float32 or not bool(torch.isfinite(values).all()):
             raise ValueError("static episode-context values must be finite float32")
@@ -252,11 +257,47 @@ class StaticEpisodeContextCache:
         self.value_dim = int(values.shape[1])
         self.metadata = dict(payload.get("metadata", {}))
         self._index = {episode_id: i for i, episode_id in enumerate(self.episode_ids)}
+        self.query_records = None
+        self._query_index = {}
+        self.training_query_scope = self.metadata.get("training_query_scope", "episode_static")
+        if self.format == STATIC_QUERY_CONTEXT_FORMAT:
+            if self.training_query_scope != "per_decision":
+                raise ValueError("query-context v2 requires training_query_scope=per_decision")
+            records = payload.get("query_records")
+            context_indices = payload.get("query_context_indices")
+            if (not isinstance(records, list) or not records
+                    or not isinstance(context_indices, Tensor) or context_indices.dtype != torch.int64
+                    or context_indices.shape != (len(records),)
+                    or bool((context_indices < 0).any()) or bool((context_indices >= len(values)).any())):
+                raise ValueError("invalid per-query context mapping")
+            covered = set()
+            for row, index in zip(records, context_indices.tolist(), strict=True):
+                if (not isinstance(row, dict) or set(row) != {"episode_id", "window_index", "raw_step", "instruction"}
+                        or row["episode_id"] not in self._index
+                        or type(row["window_index"]) is not int or row["window_index"] < 0
+                        or type(row["raw_step"]) is not int or row["raw_step"] < 0
+                        or not isinstance(row["instruction"], str) or not row["instruction"].strip()
+                        or row["window_index"] in self._query_index):
+                    raise ValueError("invalid or duplicate per-query context identity")
+                self._query_index[row["window_index"]] = (row["episode_id"], index)
+                covered.add(row["episode_id"])
+            if covered != set(self.episode_ids):
+                raise ValueError("query-context cache must cover every declared episode")
+            self.query_records = records
+        elif self.training_query_scope != "episode_static":
+            raise ValueError("episode-context v1 requires training_query_scope=episode_static")
 
     def __len__(self) -> int:
         return len(self.episode_ids)
 
-    def get(self, episode_id: str) -> Tensor:
+    def get(self, episode_id: str, window_index: int | None = None) -> Tensor:
+        if self.format == STATIC_QUERY_CONTEXT_FORMAT:
+            if window_index is None or int(window_index) not in self._query_index:
+                raise KeyError(f"static context missing query window {window_index}")
+            source_episode, index = self._query_index[int(window_index)]
+            if str(episode_id) != source_episode:
+                raise ValueError("static context query belongs to a different episode")
+            return self.values[index].clone()
         try:
             index = self._index[str(episode_id)]
         except KeyError as exc:
@@ -337,7 +378,7 @@ class PreparedZevaStage2Dataset(Dataset):
                 "pim_mask": prepared["pim_mask"],
                 "pim_scores": prepared["pim_scores"],
                 "raw_step": int(prepared["raw_step"]),
-                "task_context": self.static_context.get(prepared["episode_id"]),
+                "task_context": self.static_context.get(prepared["episode_id"], requested_index),
             }
         )
         for name in ("pim_history_kind", "pim_history_count", "pim_nonempty_history_weight", "current_effect", "current_effect_mask",

@@ -19,9 +19,13 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 
 from fastwam.zeva.checkpoint import checkpoint_sha256
-from fastwam.zeva.ego_boundary_cache import build_ego_boundary_cache
+from fastwam.zeva.ego_boundary_cache import (
+    ALL_CTE_FRAMES, EGO_BOUNDARY_CACHE_FORMAT, LEGACY_EGO_BOUNDARY_CACHE_FORMAT,
+    build_ego_boundary_cache,
+)
 from fastwam.zeva.ego_cte_training import (
     canonical_sha256, episode_metadata, load_ego_cte_checkpoint,
+    verify_ego_episode_scope,
 )
 from fastwam.zeva.ego_episode_data import RoboTwinEgoEpisodeDataset
 
@@ -33,7 +37,16 @@ def main(cfg: DictConfig) -> None:
     if cte_path in ("", "None", "null") or output in ("", "None", "null"):
         raise ValueError("set model.zeva.cte.checkpoint and model.zeva.cache.path")
     device = str(cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
-    cte, payload = load_ego_cte_checkpoint(cte_path, device=device, require_ready=True)
+    reference_recipe = bool(zeva.cte.get("require_reference_recipe", True))
+    cte, payload = load_ego_cte_checkpoint(
+        cte_path, device=device, require_ready=True, require_reference_recipe=reference_recipe,
+        exploratory_epoch40=bool(zeva.cte.get("exploratory_epoch40", False)),
+    )
+    if reference_recipe:
+        # Zeva-Ego's feature exporter explicitly disables TF32. This concerns
+        # CTE export only, not a global policy-training precision override.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     data_cfg = OmegaConf.create(OmegaConf.to_container(cfg.data.train, resolve=True))
     with open_dict(data_cfg):
         data_cfg.val_set_proportion = 0.0
@@ -64,7 +77,19 @@ def main(cfg: DictConfig) -> None:
     expected_episodes = metadata.get("data_identity", {}).get("episode_metadata_sha256")
     if not expected_episodes or canonical_sha256(episode_metadata(dataset.episodes)) != expected_episodes:
         raise ValueError("boundary cache episode metadata differs from CTE training")
-    manifest = build_ego_boundary_cache(dataset, cte, output, identity=identity, episode_splits=splits)
+    if reference_recipe:
+        verify_ego_episode_scope(dataset, payload["manifest"])
+        identity.update({"data_scope": payload["manifest"]["data_scope"],
+                         "export_tf32": False})
+    export_scope = str(zeva.cache.get("export_scope", ALL_CTE_FRAMES if reference_recipe else "decision_only_v1"))
+    if reference_recipe and export_scope != ALL_CTE_FRAMES:
+        raise ValueError("Reference CTE export requires every CTE frame")
+    identity.update({"export_scope": export_scope,
+                     "schema_version": (EGO_BOUNDARY_CACHE_FORMAT if export_scope == ALL_CTE_FRAMES
+                                        else LEGACY_EGO_BOUNDARY_CACHE_FORMAT)})
+    manifest = build_ego_boundary_cache(
+        dataset, cte, output, identity=identity, episode_splits=splits,
+    )
     print(json.dumps(manifest, indent=2, sort_keys=True))
 
 

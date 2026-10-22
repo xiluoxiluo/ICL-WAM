@@ -83,11 +83,16 @@ def test_two_level_merge_keeps_raw_weighted_centroids_and_evicts_whole_attempts(
 
 def test_predictive_cache_versions_bind_actual_rounding_and_keep_legacy_readable(tmp_path):
     boundary, semantic = make_boundary_cache(tmp_path)
-    expected = {"reference_round": ([21., 23., 24.], "zeva_stage2_cross_attempt_pim_v3"),
+    expected = {"reference_round": ([21., 23., 24.], "zeva_stage2_cross_attempt_pim_v4"),
                 "legacy_floor": ([21., 22., 24.], LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT)}
     for indexing, (effects, format_name) in expected.items():
+        if indexing == "legacy_floor":
+            legacy_source = tmp_path / "legacy_source"
+            legacy_source.mkdir()
+            boundary, semantic = make_boundary_cache(legacy_source, legacy=True)
         output = tmp_path / indexing
-        options = {} if indexing == "reference_round" else {"uniform_indexing": indexing}
+        options = {} if indexing == "reference_round" else {"uniform_indexing": indexing,
+            "query_scope": "complete_policy_windows_v1", "pairing_metric": "numpy_float32_episode_id_v1"}
         manifest = BUILDER.build_cache(phase_cache=boundary, output=output, semantic_map=semantic,
                                        max_entries_per_attempt=3, allow_reduced_curriculum=True, **options)
         assert manifest["format"] == format_name
@@ -179,7 +184,9 @@ def test_manifest_records_explicit_uniform_ablation_without_weakening_legacy_gua
     assert plan["policy_contracts"]["new_on"] == plan["policy_contracts"]["new_off"]
     contract = plan["policy_contracts"]["new_on"]
     assert contract["pim_compression_override"] is True
-    assert contract["pim_memory_contract"] == _reference_contract(compression="uniform")
+    assert contract["pim_memory_contract"] == _reference_contract(
+        compression="uniform", max_past_attempts=4, pim_max_entries=256,
+        commit_timing="attempt_reset", storage_device="policy")
     for item in plan["commands"]:
         fields = {key: json.loads(value) for arg in item["command"] if "=" in arg
                   for key, value in [arg.split("=", 1)]}

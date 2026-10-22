@@ -2,11 +2,31 @@
 
 ## 结论与范围
 
-**不能将此前的实现概括为“只有 token 注入不同，其余完全一致”。** 本次以 ICL-WAM `b8b6e84` 为基线，逐项核对 Zeva `feature/zeva_ego` 的固定提交 [`bae85ad753d3afe4f2e56762373d48ac0267e101`](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101)。不仅检查README，也检查实际训练、artifact构建、发布版加载和评测调用链。
+**本轮执行“除了必要的 FastWAM 适配，其余按 Zeva-Ego 设计对齐”。** 基线为 ICL-WAM `4e95b26`，参考固定到 Zeva `feature/zeva_ego` 的 [`bae85ad753d3afe4f2e56762373d48ac0267e101`](https://github.com/air-embodied-brain/Zeva/tree/bae85ad753d3afe4f2e56762373d48ac0267e101)。上一轮列出的额外差异并非都由WAM架构要求；本轮继续修正，没有将它们仅以“适配”为由保留。
 
-本次修正不必要的配方与算法偏差；保留FastWAM的原生foundation、动作与数值执行合同。新默认更接近参考设计，但不等于重新实现一个与pi0.5逐位等价的模型。全部可执行命令、产物迁移和评测说明见[训练与评测指南](zeva_ego_training_evaluation.md)。
+只保留FastWAM foundation、video/action注意力接口、输入特征空间、joint14/H32/执行24和原生flow目标形式；训练样本范围、padding权重、EAP/PIM数值语义不再当作必须保留的差异。完整操作见[训练与评测指南](zeva_ego_training_evaluation.md)。对齐公开源码的设计和配方，不代表与不同底座、不同数据源的pi0.5逐位等价，也不代表已经测得任务收益。
 
-## 1. 本次查出并修正的差异
+## 1. 相对4e95b26继续修正的差异
+
+| 项目 | 4e95b26行为 | 新默认 |
+| --- | --- | --- |
+| CTE数据范围 | 全部可用任务，没有外部task subset约束 | 必填有序`task_names`文件和真实episode conditions；按指定conditions与task subset筛选，记录文件/源数据指纹。 |
+| CTE holdout | 按semantic task，seeded permutation，ceil | 按condition×task分区，SHA256排序、round计数；先划分完整正长度源population，再过滤CTE任务和短episode。独立`cte_split_seed=1000`。 |
+| Paired sampler | 按任务排序遍历 | 遵循外部task_names顺序（含空任务槽）；有样本组按此顺序分配shuffle随机流。 |
+| CTE选择 | 允许≥80epoch | 默认精确epoch80；显式探索仅epoch40/step26160。均须正式可发布架构、记录的validation.stage1_gate=true，并重新核验当前epoch三项gain。旧split checkpoint不能改标签升级。 |
+| CTE导出 | 未显式关闭TF32；只写decision_valid行 | 参考导出关闭matmul/cuDNN TF32；boundary v2保存全部CTE frames，包括末边界。完整source scope传到下游。 |
+| Stage2 query与padding | 仅完整H32监督窗口；EAP/flow丢弃action_valid=False目标 | PIM v4使用全部CTE frames；沿原生LeRobot末动作重复填充H32，EAP NLL和action-flow按完整horizon计算。CTE Stage1仍只监督完整H24段。 |
+| 训练语言查询 | 整episode固定首指令 | `training_query_scope=per_decision`，按当前样本原始指令检索；相同输入可离线去重，不跨不同指令误复用。推理仍缓存attempt首条指令。 |
+| EAP dropout/attention | `rand>=0.4`；MHA不返回weights | 参考`rand<0.6`；MHA使用参考的`need_weights=True`调用。 |
+| EAP NLL | 目标先转WAM dtype；mask尾部 | 保留原FP32 normalized action，坐标求和、完整horizon平均、系数0.01。 |
+| PIM/部署精度 | Q/K强制FP32后归一化；整个addon跟随WAM BF16 | 训练按AMP计算dtype归一化；EAP/PIM保持FP32权重和推理运算，在注入WAM时才转换到其dtype。 |
+| PIM容量/提交/设备 | 3 attempts、192条，end_attempt提交、CPU存储 | 4 attempts、每attempt64/总256；下次attempt reset提交；历史保持policy device。最后成功attempt尚未reset时留pending，避免统计假称已提交。 |
+| 历史配对数值与tie | NumPy余弦，episode ID打破平局 | Torch float32 normalize/matmul；first argmax/argmin遵循train source原序。 |
+| 评测模型噪声 | 私有CPU连续Torch流 | 默认policy device连续slot流，设备、protocol及state参与handoff和审计；CPU旧协议只用于显式复现。 |
+
+新合同为`numerical_contract=zeva_ego_v1`、boundary v2、PIM cache v4、per-query context v2、PIM memory contract v2。旧产物在对应legacy配置下仍可重评，不允许缺失元数据后静默进入新默认。
+
+### 已完成并保留的上一轮修正
 
 | 项目 | 此前 ICL-WAM | Zeva-Ego参考与本轮处理 |
 | --- | --- | --- |
@@ -61,13 +81,13 @@ CTE五项损失及默认权重为`0.1 action + 0.2 vision + 2 global + 1 phase +
 
 ### EAP、PIM与Stage2B
 
-EAP使用global→8个waypoints，当前raw phase作为attention query，预测完整policy horizon的Gaussian；辅助NLL系数0.01。PIM使用phase查询历史phase、加权读取预测effect；当前attempt只积累pending trace，在结束后才提交历史，retry重置CTE但保留已结束历史，新episode清空PIM。第一次重规划已有当前预测effect，不等待completed-effect窗口。
+EAP使用global→8个waypoints，当前raw phase作为attention query，预测完整policy horizon的Gaussian；辅助NLL系数0.01。PIM使用phase查询历史phase、加权读取预测effect；当前attempt只积累pending trace，在下次attempt reset才提交已结束trace，retry重置CTE并读取该历史，新episode清空PIM。当前query不读取自身pending。第一次重规划已有当前预测effect，不等待completed-effect窗口。
 
 Stage2B默认2000个optimizer updates，前500步只更新PIM；后1500步joint的foundation/EAP/PIM学习率分别为1e-6/1e-5/5e-5。课程按全局optimizer step固定循环，warmup为matched×5/far×2/cross×1，之后加empty×2。新完整配方会检查数据确实能够提供这些模式。frozen对照保留相同输入、EAP/PIM和课程，仅不更新foundation。
 
 ### RoboTwin评测协议
 
-冻结10任务×20场景manifest；最多4次attempt，成功即停；retry保持同scene seed与instruction，分母固定200；采用8个连续逻辑RNG slot，并审计reset、artifact身份、RNG延续与视频。`new_off/new_on`始终复用同一Stage2B bundle，off只关闭PIM路径，仍保留CTE/EAP与该bundle的foundation。
+冻结10任务×20场景manifest；最多4次attempt，成功即停；retry保持同scene seed与instruction，分母固定200；采用8个连续逻辑RNG slot，初始动作噪声在policy device生成，并审计reset、artifact身份、数值合同、RNG设备/延续与视频。`new_off/new_on`始终复用同一Stage2B bundle，off只关闭PIM路径，仍保留CTE/EAP与该bundle的foundation。
 
 完整run的连续slot协议相同，但不同条件成功时间不同，会改变后续噪声offset。严格复用同一初始动作噪声的是**单一重规划点的paired诊断**；不能把整轮on/off描述为每个动作都用了相同噪声。参考[评测指南](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/README_EVALUATION.md)，本项目入口为[manifest runner](../scripts/eval_zeva_robotwin_manifest.py)。
 
@@ -80,34 +100,29 @@ Stage2B默认2000个optimizer updates，前500步只更新PIM；后1500步joint�
 | Policy视觉输入 | reference pi0.5输入；本项目三相机融合384×320再经Wan VAE。两边CTE仍使用三张独立RGB224，CTE与policy视觉通道须分清。 |
 | 检索语言特征 | 相同的冻结语言分类器→task-scoped检索机制；reference Gemma2048与本地Wan4096输入embedding空间不同，classifier权重不可互换。 |
 | 分类器训练 | reference公开consumer/MLP并从handoff读取既有分类器，没有完整独立训练配方；本项目2000步CE与内部episode划分是本地重建方案，不能称为复刻原训练。 |
-| CTE训练任务范围 | reference使用外部必填task-subset JSON和adapter conditions；本项目使用配置dataset中全部可用episodes。没有双方实际manifests，不能断言均为10或50任务，亦不能把50任务classifier注释当CTE训练范围。 |
-| Validation成员 | reference按condition×task分组、SHA排序并round；本项目按semantic task、seeded permutation并ceil，保证至少2 train+1 val。可导入明确episode split，但默认成员不保证相同。 |
-| Policy监督窗口 | reference遍历CTE cache中仍位于episode内的query frames；本地prepared训练要求完整H32动作监督，尾部不足32步不作为policy训练query。历史可保留真实决策的预测trace，但无后续动作的纯末观测不作为decision；reference cache可保留导出的末frame。训练样本集合不能宣称逐条相同。 |
-| Readiness | reference发布选择epoch80，另有显式探索例外；本项目允许≥80，要求该epoch验证、重新核验gain和来源，是更严格的工程合同。 |
-| 数值细节 | AMP、native flow/action target dtype、kernel、TF32配置、噪声维度与设备算法不同。本项目EAP NLL target沿用native action dtype路径；不声称逐位GPU复现。 |
-| 数据指令 | 当前static context要求同episode原始instruction固定；reference动态consumer更一般。切换instruction的数据必须先明确其训练合同。 |
-| 历史容量与提交时点 | 本项目最多3个已结束attempt，在4次尝试评测中可读取的历史数与参考等价；不能外推到任意5次以上协议。本地在end_attempt提交，reference通常在下次reset提交，下一次action可见历史一致，最终快照/计数未必相同。 |
+| 实际数据成员 | CTE task-subset、conditions和SHA/round划分算法已对齐；实际任务名、episode顺序与源数据必须由真实外部manifest决定。没有原训练的完整数据清单，不能声称训练成员逐条相同或猜测为10/50任务。空source episode无法可靠重建分区位置时，严格路径明确拒绝。 |
+| 硬件与随机流 | policy-device连续slot机制已对齐；FastWAM噪声为[1,32,14]，底座、张量形状、硬件/kernel及模型server adapter不同，不能宣称与pi0.5的CUDA逐元素相同。 |
 | 运行与硬件 | ZeRO-1、FP32训练参数、CPU完整文本编码器/LRU缓存、严格checkpoint及评测审计是本地工程扩展；不代表已有16GPU/5090实测。 |
 
 reference数据范围与split依据：[train_cte.py](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/train_cte.py)、[robotwin_dataset.py](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/src/openpi/zeva/robotwin_dataset.py)与[数据文档](https://github.com/air-embodied-brain/Zeva/blob/bae85ad753d3afe4f2e56762373d48ac0267e101/scripts/robotwin/README_DATASET.md)。源码省略conditions时默认Clean，公开recipe明确写Clean+Randomized；本项目要求提供真实conditions，不推断或伪造。
 
-“初始化/随机正则对齐”指分布和尺度：模块构造顺序不同，权重样本不相同；参考`rand<0.6`与本地`rand>=0.4`具有相同保留分布，但同seed不产生同一mask。prior attention是否返回weights可能选择不同kernel；本地BF16部署还会量化EAP/PIM，而参考模块默认FP32。本地NLL使用`action_valid`排除padding，reference对完整H50平均；完整有效目标上的公式对应，尾部padding下的权重不相同。
+EAP/PIM的上述数值差异本轮已经修正，不能再作为未处理的“WAM适配”列出。新数值合同显式区分training AMP与inference FP32，包括训练中暂时冻结/处于eval模式的EAP，不因子模块模式误判而关闭训练AMP。不同模型的模块构造数量、顺序和张量尺寸仍会消耗不同随机数；这不意味着初始权重或整次训练轨迹可逐位对应。
 
 ## 5. 迁移与实验次序
 
 | 已有产物 | 本轮如何处理 |
 | --- | --- |
 | FastWAM原base、原数据、joint统计 | 继续使用并核验身份。 |
-| 来源与readiness匹配的预测CTE、boundary | 可复用；本轮不改变CTE架构/损失或Stage1源码合同。新的boundary导出会额外核验episode metadata。 |
-| 同一CTE/数据来源的language encoder、features、train bank、classifier | 可复用；无需仅因改LOO就重训classifier。 |
-| 旧static contexts | 按`train_query_exclusion=none`重新构建；不要只修改旧metadata。 |
-| 旧PIM v2/cache | 用真实conditions重新构建v3，reference-nearest配对、reference-round索引及完整课程身份。 |
+| 4e95及更早CTE | 新默认改变数据范围、split/sampler与readiness来源合同；按新配方重训。旧CTE保留legacy复现，不补标签冒充新来源。 |
+| 旧boundary、bank、features、classifier | 因新CTE权重/split身份改变，重新导出/训练；独立冻结语言encoder若资产与tokenizer完全相同可以复用。 |
+| 旧static contexts | 重建per-decision v2；不只是把LOO改none或修改metadata。 |
+| 旧PIM v2/v3 cache | 重建v4，全部CTE帧、Torch配对/source-order tie、完整真实conditions课程。 |
 | 旧Stage2A/B | 保留用于旧版对照；新Stage2A/B使用新目录重新训练，不能将旧权重改名为新recipe。 |
 | 完整optimizer/resume state | 仅用于相同配方精确续训；foundation模式、schedule、缓存合同变化属于新实验。 |
 
 建议先完成一个新joint Stage2A，再让joint与frozen Stage2B从**同一个完整父bundle**出发；分别报告同一B checkpoint的PIM off/on，而不是将不同foundation的差异全部归于PIM。在线压缩可另用同一checkpoint的显式`--new-pim-compression uniform`做单因素消融。
 
-重评`b8b6e84`语言版使用`robotwin_zeva_ego_pim_language_legacy_3cam_384`；更早的image+text版仍使用独立static任务。旧产物必须保持其base/CTE/bank/classifier/encoder身份。两条路径不能相互冒充。
+重评`4e95b26`使用`robotwin_zeva_ego_pim_4e95_3cam_384`；`b8b6e84`语言版使用`robotwin_zeva_ego_pim_language_legacy_3cam_384`；更早的image+text版仍使用独立static任务。旧版评测显式选择`--model-rng-protocol torch_continuous_slot_v1`，保留CPU噪声协议。旧产物必须保持其base/CTE/bank/classifier/encoder身份。旧alias用于重评；精确训练续跑应使用原commit。
 
 ## 6. 验证与效果边界
 

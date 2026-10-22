@@ -39,9 +39,11 @@ from fastwam.zeva import (
     TaskContextBank,
     retrieve_task_context,
 )
-from fastwam.zeva.attempt_protocol import ModelSeedStream, ContinuousModelNoiseStream, CONTINUOUS_NOISE_PROTOCOL
+from fastwam.zeva.attempt_protocol import (ModelSeedStream, ContinuousModelNoiseStream,
+    CONTINUOUS_NOISE_PROTOCOL, DEVICE_CONTINUOUS_NOISE_PROTOCOL, CONTINUOUS_NOISE_PROTOCOLS)
 from fastwam.zeva.ego_episode_data import prepare_ego_rgb_views
 from fastwam.zeva_memory_contract import pim_memory_contract, validate_checkpoint_pim_memory_contract
+from fastwam.zeva_numerical_contract import config_numerical_contract, validate_checkpoint_numerical_contract
 from fastwam.zeva.checkpoint import checkpoint_sha256, load_cte_checkpoint
 from fastwam.zeva.static_task_context import (
     StaticTaskContextRetriever, StaticTaskContextSession, task_context_identity,
@@ -384,7 +386,17 @@ class WorldActionRobotWinPolicy:
             raise ValueError("pim_diagnostic_interval must be non-negative")
         self._last_pim_diagnostics = {}
         self._terminal_observation_step = None
+        numerical_contract = config_numerical_contract(model_cfg_copy.get("zeva", {}))
+        policy_device = torch.device(self.model.device)
+        if policy_device.type == "cuda" and policy_device.index is None:
+            policy_device = torch.device("cuda", torch.cuda.current_device())
         self.checkpoint_identity = {
+            "policy_device": str(policy_device),
+            "numerical_contract": numerical_contract if requested_zeva_mode != "base" else None,
+            "cte_exploratory_epoch40": bool(model_cfg_copy.get("zeva", {}).get("cte", {}).get("exploratory_epoch40", False)),
+            "cte_require_reference_recipe": bool(model_cfg_copy.get("zeva", {}).get("cte", {}).get("require_reference_recipe", numerical_contract == "zeva_ego_v1")),
+            "training_query_scope": str(model_cfg_copy.get("zeva", {}).get("task_context", {}).get("training_query_scope", "episode_static")),
+            "inference_task_context_scope": "reference_first_instruction" if numerical_contract == "zeva_ego_v1" else "legacy_constant_instruction",
             "base_sha256": checkpoint_sha256(checkpoint_path),
             "stats_sha256": checkpoint_sha256(dataset_stats_path),
             "cte_sha256": checkpoint_sha256(cte_checkpoint) if cte_checkpoint else None,
@@ -442,7 +454,15 @@ class WorldActionRobotWinPolicy:
             self._ego_cte = self.cte_schema == "iclwam_zeva_ego_cte_v1"
             if self._ego_cte:
                 from fastwam.zeva.ego_cte_training import load_ego_cte_checkpoint
-                self.cte, cte_payload = load_ego_cte_checkpoint(str(cte_checkpoint), device=device, require_ready=True)
+                cte_options = model_cfg_copy.get("zeva", {}).get("cte", {})
+                exploratory = bool(cte_options.get("exploratory_epoch40", False))
+                strict_recipe = bool(cte_options.get("require_reference_recipe", numerical_contract == "zeva_ego_v1"))
+                self.cte, cte_payload = load_ego_cte_checkpoint(
+                    str(cte_checkpoint), device=device, require_ready=True,
+                    exploratory_epoch40=exploratory, require_reference_recipe=strict_recipe)
+                self.checkpoint_identity.update(
+                    cte_exploratory_epoch40=exploratory, cte_require_reference_recipe=strict_recipe,
+                    cte_epoch=int(cte_payload["epoch"]), cte_data_scope=cte_payload.get("manifest", {}).get("data_scope"))
                 cte_cfg = self.cte.cfg
                 if (cte_cfg.executed_horizon, cte_cfg.action_dim, cte_cfg.image_size) != (24, 14, 224):
                     raise ValueError("RoboTwin Zeva-Ego requires H24/joint14/RGB224")
@@ -568,6 +588,8 @@ class WorldActionRobotWinPolicy:
                     base_checkpoint_sha256=checkpoint_sha256(checkpoint_path),
                     cte_checkpoint_sha256=checkpoint_sha256(cte_checkpoint),
                 )
+                self.checkpoint_identity["checkpoint_numerical_contract"] = validate_checkpoint_numerical_contract(
+                    addon_payload, numerical_contract)
                 self.checkpoint_identity["training_recipe"] = addon_payload.get("training_recipe", "frozen_parent")
                 from fastwam.zeva.checkpoint import checkpoint_requires_foundation
                 self.checkpoint_identity["foundation_checkpoint_required"] = checkpoint_requires_foundation(addon_payload)
@@ -592,6 +614,8 @@ class WorldActionRobotWinPolicy:
                     max_entries_per_attempt=int(zeva_memory_cfg.get("max_entries_per_attempt", 64)),
                     compression=str(zeva_memory_cfg.get("compression", "uniform")),
                     uniform_indexing=str(zeva_memory_cfg.get("uniform_indexing", "legacy_floor")),
+                    commit_timing=str(zeva_memory_cfg.get("commit_timing", "attempt_end")),
+                    storage_device=str(zeva_memory_cfg.get("storage_device", "cpu")),
                 )
             )
             self.lifecycle = CausalMemoryLifecycle(
@@ -632,13 +656,14 @@ class WorldActionRobotWinPolicy:
         self.evaluation_slot_index, self.evaluation_slot_count = int(evaluation_slot_index), int(evaluation_slot_count)
         if not 0 <= self.evaluation_slot_index < self.evaluation_slot_count:
             raise ValueError("evaluation slot index must be within slot count")
-        if model_rng_protocol == CONTINUOUS_NOISE_PROTOCOL:
+        if model_rng_protocol in CONTINUOUS_NOISE_PROTOCOLS:
             if seed is None:
                 raise ValueError("continuous model RNG requires an explicit model seed")
             self._model_noise_stream = ContinuousModelNoiseStream(seed, slot_index=self.evaluation_slot_index,
                 slot_count=self.evaluation_slot_count, run_id=model_rng_run_id,
                 state_path=model_rng_state_path, task_name=model_rng_task_name,
-                checkpoint_identity=self.checkpoint_identity)
+                checkpoint_identity=self.checkpoint_identity, protocol=model_rng_protocol,
+                device=policy_device if model_rng_protocol == DEVICE_CONTINUOUS_NOISE_PROTOCOL else "cpu")
         elif model_rng_protocol != "request_seed_stream_v1":
             raise ValueError("unsupported model RNG protocol")
         self._attempt_id = 0
@@ -792,7 +817,8 @@ class WorldActionRobotWinPolicy:
             features = self._task_language_memory.encoder.encode(instruction, device=self.model.device)
             self._task_language_result = self._task_language_memory.retrieve(features)
             self._task_language_instruction = instruction
-        elif instruction != self._task_language_instruction:
+        elif (instruction != self._task_language_instruction
+              and getattr(self.model, "zeva_numerical_contract", "legacy_v1") != "zeva_ego_v1"):
             raise ValueError("task-language instruction changed within an attempt; reset before changing tasks")
         return self._task_language_result
 
@@ -822,7 +848,7 @@ class WorldActionRobotWinPolicy:
                 task_dim = int(self.model.zeva_prompt_encoder.config.global_dim)
                 if self.zeva_mode == "pim_shadow":
                     task_tokens = torch.zeros(
-                        (1, task_dim), device=self.model.device, dtype=self.model.torch_dtype
+                        (1, task_dim), device=self.model.device, dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype)
                     )
                 elif getattr(self, "_task_language_memory", None) is not None:
                     task_context_result = self._resolve_task_language(instruction)
@@ -857,22 +883,22 @@ class WorldActionRobotWinPolicy:
                         "scores": task_context_result.scores.detach().cpu(),
                         "sources": task_context_result.sources,
                     }
-                task_tokens = task_tokens.to(device=self.model.device, dtype=self.model.torch_dtype)
+                task_tokens = task_tokens.to(device=self.model.device, dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype))
                 if getattr(self, "_ego_cte", False):
                     phase, current_effect = self._step_ego_cte(observation)
                     trace_phase, trace_effect = phase, current_effect
-                    current_effect = current_effect.to(device=self.model.device, dtype=self.model.torch_dtype)
+                    current_effect = current_effect.to(device=self.model.device, dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype))
                     current_effect_mask = torch.ones(phase.shape[0], dtype=torch.bool, device=self.model.device)
                 else:
                     encoded = self._cte_history.forward()
                     phase = encoded["phase"][:, -1]
                     current_effect, current_effect_mask = None, None
                 memory = self.lifecycle.memory_inputs(phase, task_tokens)
-                phase = phase.to(device=self.model.device, dtype=self.model.torch_dtype)
+                phase = phase.to(device=self.model.device, dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype))
                 memory = {
                     key: value.to(
                         device=self.model.device,
-                        dtype=self.model.torch_dtype if value.is_floating_point() else value.dtype,
+                        dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype) if value.is_floating_point() else value.dtype,
                     )
                     for key, value in memory.items()
                 }
@@ -880,14 +906,14 @@ class WorldActionRobotWinPolicy:
                     causal_prompt = torch.zeros(
                         (1, int(self.model.zeva_prompt_encoder.config.hidden_dim)),
                         device=self.model.device,
-                        dtype=self.model.torch_dtype,
+                        dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype),
                     )
                     pim_mask = memory["pim_mask"]
                 elif self.zeva_mode == "zeva_stage2" or not self.cross_memory_enabled:
                     causal_prompt = torch.zeros(
                         (1, int(self.model.zeva_prompt_encoder.config.hidden_dim)),
                         device=self.model.device,
-                        dtype=self.model.torch_dtype,
+                        dtype=getattr(self.model, "zeva_condition_dtype", self.model.torch_dtype),
                     )
                     pim_mask = torch.zeros_like(memory["pim_mask"], dtype=torch.bool)
                 else:
@@ -1107,6 +1133,11 @@ class WorldActionRobotWinPolicy:
             "foundation_checkpoint_required": self.checkpoint_identity.get("foundation_checkpoint_required", False),
             "foundation_contract_schema": self.checkpoint_identity.get("foundation_contract_schema"),
             "pim_memory_contract": self.checkpoint_identity.get("pim_memory_contract"),
+            "numerical_contract": self.checkpoint_identity.get("numerical_contract"),
+            "training_query_scope": self.checkpoint_identity.get("training_query_scope"),
+            "inference_task_context_scope": self.checkpoint_identity.get("inference_task_context_scope"),
+            "cte_exploratory_epoch40": self.checkpoint_identity.get("cte_exploratory_epoch40"),
+            "cte_require_reference_recipe": self.checkpoint_identity.get("cte_require_reference_recipe"),
             "pim_compression_override": self.checkpoint_identity.get("pim_compression_override", False),
             "policy_text_encoder_device": getattr(self, "policy_text_encoder_device", None),
             "policy_text_cache_size": getattr(self, "policy_text_cache_size", None),
@@ -1268,6 +1299,17 @@ class WorldActionRobotWinPolicy:
 
         if self.zeva_mode == "base" or self.cte is None or self.lifecycle is None:
             self._transition_actions.clear()
+            self._attempt_finalized = True
+            return
+
+        if (getattr(self, "_ego_cte", False)
+                and self.lifecycle.pim.config.commit_timing == "attempt_reset"):
+            # The reference trace contains predictions at actual decision
+            # boundaries only. No terminal observation or extra prediction is
+            # needed; the next attempt reset publishes this private trace.
+            self._transition_actions.clear()
+            if self.lifecycle.pim.task_cluster is not None:
+                self.lifecycle.end_attempt()
             self._attempt_finalized = True
             return
 

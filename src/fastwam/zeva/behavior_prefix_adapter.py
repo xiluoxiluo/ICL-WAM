@@ -8,6 +8,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .precision import ReferenceFloat32Module, reference_inference_precision
+
 
 @dataclass(frozen=True)
 class BehaviorPrefixAdapterConfig:
@@ -97,6 +99,7 @@ class ExactZevaPolicyInjectionConfig:
     # explicit rather than silently changing their BIT-conditioned prior.
     prior_variant: str = "legacy_bit"
     initialization: str = "legacy_xavier"
+    numerical_contract: str = "legacy_v1"
 
     def __post_init__(self) -> None:
         values = (
@@ -129,6 +132,10 @@ class ExactZevaPolicyInjectionConfig:
             raise ValueError("adapter initialization must be legacy_xavier or zeva_ego")
         if self.initialization == "zeva_ego" and self.prior_variant != "zeva_ego":
             raise ValueError("zeva_ego initialization requires the predictive Zeva-Ego prior")
+        if self.numerical_contract not in {"legacy_v1", "zeva_ego_v1"}:
+            raise ValueError("numerical_contract must be legacy_v1 or zeva_ego_v1")
+        if self.numerical_contract == "zeva_ego_v1" and self.prior_variant != "zeva_ego":
+            raise ValueError("zeva_ego_v1 numerical_contract requires the predictive Zeva-Ego prior")
         if self.effect_source == "current_prediction":
             if self.prefix_layout != "zeva_ego" or self.prior_variant != "zeva_ego":
                 raise ValueError("current_prediction requires zeva_ego prefix_layout and prior_variant")
@@ -237,7 +244,7 @@ class FastWAMPolicyInjectionPrior(nn.Module):
         return mean, std
 
 
-class ZevaEgoActionPrior(nn.Module):
+class ZevaEgoActionPrior(ReferenceFloat32Module):
     """Reference EAP: global waypoints attended by the current raw CTE phase.
 
     Effects condition the independent visual prefix. They are deliberately
@@ -263,6 +270,7 @@ class ZevaEgoActionPrior(nn.Module):
         nn.init.normal_(self.dist_head[-1].weight, std=0.01)
         nn.init.zeros_(self.dist_head[-1].bias)
 
+    @reference_inference_precision
     def forward(self, task_tokens: Tensor, phase: Tensor,
                 bit_effects: Tensor | None = None, bit_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         cfg = self.config
@@ -272,7 +280,10 @@ class ZevaEgoActionPrior(nn.Module):
             raise ValueError("phase must be [B,phase_dim]")
         anchors = self.temporal_waypoint(task_tokens).reshape(-1, 8, cfg.prior_hidden_dim) + self.pos_emb
         keys = self.norm_global(anchors)
-        local, _ = self.progress_attention(self.norm_local(phase)[:, None], keys, keys, need_weights=False)
+        local, _ = self.progress_attention(
+            self.norm_local(phase)[:, None], keys, keys,
+            need_weights=(cfg.numerical_contract == "zeva_ego_v1"),
+        )
         params = self.dist_head(local[:, 0]).reshape(-1, cfg.action_horizon, cfg.action_dim, 2)
         return params[..., 0], params[..., 1].clamp(-5.0, 2.0).exp()
 
@@ -325,7 +336,7 @@ def select_latest_completed_effect(
     return selected, has_effect
 
 
-class ExactZevaPolicyInjectionAdapter(nn.Module):
+class ExactZevaPolicyInjectionAdapter(ReferenceFloat32Module):
     """Separate behavior-prefix and action-prior injection branches.
 
     ``legacy_merged`` preserves ICL-WAM's original combined global/PIM slot.
@@ -398,6 +409,7 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         nn.init.zeros_(self.prefix_project.bias)
         self.pim_gate.fill_(float(self.config.prompt_gate_init))
 
+    @reference_inference_precision
     def condition_task_tokens(
         self,
         task_tokens: Tensor,
@@ -429,6 +441,7 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         delta = self.pim_to_global(prompt)
         return original + torch.where(valid, delta, torch.zeros_like(delta))
 
+    @reference_inference_precision
     def prior_for_prompt(
         self,
         task_tokens: Tensor,
@@ -530,6 +543,7 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
             dtype=base_prefix.dtype,
         )
 
+    @reference_inference_precision
     def behavior_prefix_tokens(
         self,
         task_tokens: Tensor,
@@ -616,10 +630,16 @@ class ExactZevaPolicyInjectionAdapter(nn.Module):
         )
         return tokens, valid.to(device=tokens.device)
 
+    @reference_inference_precision
     def action_prior_residual(self, prior_mean: Tensor, *, training: bool) -> Tensor:
+        if self.config.numerical_contract == "zeva_ego_v1":
+            prior_mean = prior_mean.to(self.action_prior_adapter.weight)
         residual = self.action_prior_adapter(prior_mean)
         if training and self.config.prior_dropout_rate:
-            keep = torch.rand((residual.shape[0], 1, 1), device=residual.device) >= self.config.prior_dropout_rate
+            draw = torch.rand((residual.shape[0], 1, 1), device=residual.device)
+            keep = (draw < 1.0 - self.config.prior_dropout_rate
+                    if self.config.numerical_contract == "zeva_ego_v1"
+                    else draw >= self.config.prior_dropout_rate)
             residual = residual * keep.to(residual.dtype)
         elif not training:
             residual = residual * self.config.prior_inference_guidance_scale

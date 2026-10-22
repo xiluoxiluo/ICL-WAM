@@ -57,17 +57,22 @@ def test_manifest_uses_per_condition_layout_and_configured_reader_capacity(
     assert contracts["new_off"] == contracts["new_on"]
     assert contracts["new_on"] == {
         "prefix_layout": "zeva_ego", "effect_source": "current_prediction",
-        "pim_variant": "cross_attempt", "pim_top_k": 192,
+        "pim_variant": "cross_attempt", "pim_top_k": 256,
         "memory_semantics": "predicted_effect_trace", "prior_variant": "zeva_ego",
         "training_recipe": "ego_joint_warmup", "task_context_mode": "task_language",
         "foundation_mode": "joint", "policy_text_encoder_device": "cpu", "policy_text_cache_size": 16,
         "pim_memory_contract": {
-            "schema": "iclwam_cross_attempt_pim_memory_v1", "compression": "similarity_merge",
-            "uniform_indexing": "reference_round", "max_past_attempts": 3,
-            "max_entries_per_attempt": 64, "capacity": 192,
+            "schema": "iclwam_cross_attempt_pim_memory_v2", "compression": "similarity_merge",
+            "uniform_indexing": "reference_round", "max_past_attempts": 4,
+            "max_entries_per_attempt": 64, "capacity": 256,
+            "commit_timing": "attempt_reset", "storage_device": "policy",
             "merge_threshold": 0.95, "phase_weight": 0.5,
         },
         "pim_compression_override": False,
+        "numerical_contract": "zeva_ego_v1",
+        "training_query_scope": "per_decision",
+        "inference_task_context_scope": "reference_first_instruction",
+        "cte_exploratory_epoch40": False, "cte_require_reference_recipe": True,
         "skip_get_obs_within_replan": True,
     }
     for item in plan["commands"]:

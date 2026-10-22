@@ -48,6 +48,8 @@ def _validate_zeva_foundation_config(zeva: dict) -> None:
     from the same Hydra switch; an explicit contradictory override is an
     error rather than a silently different experiment.
     """
+    from .zeva_numerical_contract import config_numerical_contract
+    config_numerical_contract(zeva)
     recipe = str(zeva.get("training_recipe", "frozen_parent"))
     if recipe not in {"frozen_parent", "ego_joint_parent", "ego_adapter_warmup", "ego_joint_warmup"}:
         raise ValueError("unsupported Zeva training_recipe")

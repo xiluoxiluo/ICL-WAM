@@ -112,6 +112,8 @@ class RoboTwinEgoEpisodeDataset(Dataset):
         self.semantic_task_identity = base_dataset.semantic_task_identity
         allowed = None if episode_ids is None else set(map(str, episode_ids))
         episodes: list[EgoEpisode] = []
+        source_episodes: list[EgoEpisode] = []
+        empty_source_episode_ids: list[str] = []
         global_offset = 0
         for inner in self.source.multi_dataset._datasets:
             starts, ends = inner.episode_data_index["from"], inner.episode_data_index["to"]
@@ -120,19 +122,35 @@ class RoboTwinEgoEpisodeDataset(Dataset):
                 raise ValueError("LeRobot episode index metadata is inconsistent")
             start_indices = [int(value) for value in starts]
             table = inner.hf_dataset.with_format(None)
-            tasks = table[start_indices]["task_index"] if start_indices and "task_index" in table.column_names else [0] * len(ids)
+            positive_positions = [position for position, start in enumerate(start_indices)
+                                  if int(ends[position]) > start]
+            if positive_positions and "task_index" in table.column_names:
+                positive_tasks = table[[start_indices[position] for position in positive_positions]]["task_index"]
+                tasks = dict(zip(positive_positions, positive_tasks))
+            else:
+                tasks = dict.fromkeys(positive_positions, 0)
             for position, episode_index in enumerate(ids):
                 length = int(ends[position]) - int(starts[position])
-                if length <= self.executed_horizon:
-                    continue
                 identity = f"{inner.root}::episode-{int(episode_index)}"
-                if allowed is not None and identity not in allowed:
+                if length <= 0:
+                    empty_source_episode_ids.append(identity)
                     continue
                 task = base_dataset.resolve_semantic_task_id(episode_index=int(episode_index),
                                                              raw_task_index=tasks[position], strict=True)
-                episodes.append(EgoEpisode(identity, str(task), int(episode_index),
-                                           global_offset + int(starts[position]), length))
+                episode = EgoEpisode(identity, str(task), int(episode_index),
+                                     global_offset + int(starts[position]), length)
+                # The reference adapter creates its holdout before the CTE
+                # removes short trajectories or applies its task subset.
+                source_episodes.append(episode)
+                if length <= self.executed_horizon or (allowed is not None and identity not in allowed):
+                    continue
+                episodes.append(episode)
             global_offset += int(inner.num_frames)
+        self.source_episodes = tuple(source_episodes)
+        # Empty source slots have no first frame from which to resolve a
+        # semantic task. Reference SHA splitting must reject them instead of
+        # silently collapsing their original per-partition positions.
+        self.empty_source_episode_ids = tuple(empty_source_episode_ids)
         self.episodes = tuple(episodes)
         if not self.episodes:
             raise ValueError("no episodes contain a complete CTE execution chunk")

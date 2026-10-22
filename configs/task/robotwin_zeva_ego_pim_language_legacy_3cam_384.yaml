@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - robotwin_zeva_ego_pim_3cam_384
+  - robotwin_zeva_ego_pim_4e95_3cam_384
   - _self_
 
 # Evaluation compatibility for the b8b6e84 task-language checkpoint family.

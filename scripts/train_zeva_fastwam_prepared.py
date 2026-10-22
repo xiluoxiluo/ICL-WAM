@@ -36,10 +36,13 @@ from fastwam.zeva.prepared_stage2 import (
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.static_task_context import task_context_identity
 from fastwam.zeva.cross_attempt_cache import (CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT,
-                                            LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT, HISTORY_KINDS)
+                                            LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT,
+                                            ALL_CTE_FRAMES, COMPLETE_POLICY_WINDOWS, LEGACY_PAIRING_METRIC, HISTORY_KINDS)
 from fastwam.zeva.ego_boundary_cache import EgoBoundaryCache
 from fastwam.zeva.ego_cte_training import require_ego_checkpoint_ready
-from fastwam.zeva.ego_task_memory import episode_task_instructions, validate_ego_task_language_static_context
+from fastwam.zeva.ego_task_memory import (
+    decision_task_instructions, episode_task_instructions, validate_ego_task_language_static_context,
+)
 
 
 def _require_file(value, name: str) -> Path:
@@ -220,7 +223,10 @@ def main(cfg: DictConfig) -> None:
     video_size = [int(v) for v in cfg.data.train.video_size]
     boundary = None
     if predictive:
-        require_ego_checkpoint_ready(cte_payload)
+        require_ego_checkpoint_ready(
+            cte_payload, require_reference_recipe=bool(zeva.cte.get("require_reference_recipe", True)),
+            exploratory_epoch40=bool(zeva.cte.get("exploratory_epoch40", False)),
+        )
         if cte_payload["semantic_task_map_sha256"] != semantic_sha or cte_payload["dataset_stats_sha256"] != stats_sha:
             raise ValueError("predictive CTE semantic-task map or joint normalization mismatch")
         boundary = EgoBoundaryCache(phase_root)
@@ -232,6 +238,11 @@ def main(cfg: DictConfig) -> None:
                 raise ValueError(f"predictive boundary cache identity mismatch: {key}")
         if boundary.splits != cte_payload["episode_splits"]:
             raise ValueError("boundary cache must reuse the CTE episode train/validation split")
+        if bool(zeva.cte.get("require_reference_recipe", True)):
+            if boundary.manifest.data_scope != cte_payload["manifest"]["data_scope"]:
+                raise ValueError("boundary cache must preserve the reference CTE source scope")
+            if boundary.manifest.export_tf32 is not False:
+                raise ValueError("reference CTE boundary export must explicitly disable TF32")
         if float(cfg.data.train.get("val_set_proportion", -1)) != 0:
             raise ValueError("explicit predictive episode splits require data.train.val_set_proportion=0")
     else:
@@ -263,7 +274,10 @@ def main(cfg: DictConfig) -> None:
         if not bool(zeva.memory.get("cross_attempt_only", False)) or int(zeva.memory.pim_max_entries) != top_k:
             raise ValueError("cross-attempt training/serving memory capacity must agree")
         uniform_indexing = str(zeva.memory.get("uniform_indexing", "legacy_floor"))
-        predictive_cache_format = (EGO_CROSS_ATTEMPT_CACHE_FORMAT if uniform_indexing == "reference_round"
+        query_scope = str(zeva.prepared_stage2.get("query_scope", COMPLETE_POLICY_WINDOWS))
+        pairing_metric = str(zeva.prepared_stage2.get("pairing_metric", LEGACY_PAIRING_METRIC))
+        predictive_cache_format = (EGO_CROSS_ATTEMPT_CACHE_FORMAT if query_scope == ALL_CTE_FRAMES else
+                                   LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT if uniform_indexing == "reference_round"
                                    else LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT)
         pim_expected.update({
             "format": predictive_cache_format if predictive else CROSS_ATTEMPT_CACHE_FORMAT, "pim_variant": "cross_attempt",
@@ -276,6 +290,10 @@ def main(cfg: DictConfig) -> None:
         if predictive:
             pim_expected.update({"memory_semantics": "predicted_effect_trace", "effect_source": "current_prediction",
                                  "executed_horizon": 24})
+            if query_scope == ALL_CTE_FRAMES:
+                pim_expected.update({"query_scope": query_scope, "pairing_metric": pairing_metric,
+                                     "data_scope": boundary.manifest.data_scope,
+                                     "source_export_scope": boundary.manifest.export_scope})
             if uniform_indexing == "reference_round":
                 pim_expected.update({"uniform_indexing": "reference_round", "history_compression": "uniform"})
     pim = PreparedPIMCache(pim_root, expected=pim_expected)
@@ -285,6 +303,7 @@ def main(cfg: DictConfig) -> None:
         pim._cross_attempt.validate_training_curriculum(
             history_pairing=str(zeva.prepared_stage2.get("history_pairing", "legacy_candidates")),
             allow_reduced_curriculum=zeva.prepared_stage2.get("allow_reduced_curriculum", False),
+            query_scope=query_scope, pairing_metric=pairing_metric,
         )
     static_context = StaticEpisodeContextCache(static_path)
     static_expected = {
@@ -311,6 +330,7 @@ def main(cfg: DictConfig) -> None:
             encoder_path=encoder_path, head_path=head_path, expected_metadata=static_expected,
             top_k=int(zeva.task_context.top_k),
             train_query_exclusion=str(zeva.task_context.get("train_query_exclusion", "leave_one_episode_out")),
+            training_query_scope=str(zeva.task_context.get("training_query_scope", "episode_static")),
         )
     for key, expected in static_expected.items():
         if static_context.metadata.get(key) != expected:
@@ -329,10 +349,13 @@ def main(cfg: DictConfig) -> None:
     if str(base.semantic_task_identity.get("sha256")) != semantic_sha:
         raise ValueError("Stage-2 dataset semantic identity mismatch")
     if task_language:
-        current_instructions = episode_task_instructions(base, boundary)
+        language_query_scope = str(zeva.task_context.get("training_query_scope", "episode_static"))
+        current_instructions = episode_task_instructions(base, boundary, require_fixed=language_query_scope == "episode_static")
         cached_instructions = dict(zip(language_queries["episode_ids"], language_queries["instructions"], strict=True))
         if current_instructions != cached_instructions:
             raise ValueError("Stage-2 raw instructions changed after task-language feature construction")
+        if language_query_scope == "per_decision" and decision_task_instructions(base, boundary) != static_context.query_records:
+            raise ValueError("Stage-2 raw per-decision instructions changed after task-context construction")
     history_schedule = "ego_optimizer_step" if predictive and training_stage == "pim_adapter" else "legacy"
     dataset = PreparedZevaStage2Dataset(base, pim, static_context, history_schedule=history_schedule)
     validation_dataset = None
@@ -345,6 +368,7 @@ def main(cfg: DictConfig) -> None:
             validation_pim._cross_attempt.validate_training_curriculum(
                 history_pairing=str(zeva.prepared_stage2.get("history_pairing", "legacy_candidates")),
                 allow_reduced_curriculum=zeva.prepared_stage2.get("allow_reduced_curriculum", False),
+                query_scope=query_scope, pairing_metric=pairing_metric,
             )
         split_hash = pim.manifest["metadata_sha256"]["episode_splits.json"]
         if validation_pim.manifest["metadata_sha256"]["episode_splits.json"] != split_hash:

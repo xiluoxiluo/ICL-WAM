@@ -230,7 +230,8 @@ def addon_layout_metadata(behavior_prefix_adapter) -> dict[str, str | None]:
         "pim_variant": variant,
         "prefix_layout": layout,
         "effect_source": effect_source,
-        **({"prior_variant": prior_variant, "memory_semantics": "predicted_effect_trace"} if predictive else {}),
+        **({"prior_variant": prior_variant, "memory_semantics": "predicted_effect_trace",
+            "numerical_contract": getattr(config, "numerical_contract", "legacy_v1")} if predictive else {}),
         "addon_schema": (
             "zeva_ego_prediction_v1" if predictive
             else "zeva_ego_prefix_v1" if layout == "zeva_ego"
@@ -335,6 +336,11 @@ def load_addon_checkpoint(
         if expected is not None and payload.get(name) != expected:
             raise ValueError(f"addon checkpoint {name} mismatch")
     expected_layout = addon_layout_metadata(behavior_prefix_adapter)
+    from fastwam.zeva_numerical_contract import validate_checkpoint_numerical_contract
+    expected_numerics = expected_layout.get("numerical_contract", "legacy_v1")
+    if getattr(getattr(causal_prompt_encoder, "config", None), "numerical_contract", "legacy_v1") != expected_numerics:
+        raise ValueError("prompt and adapter numerical_contract must agree")
+    validate_checkpoint_numerical_contract(payload, expected_numerics)
     checkpoint_layout = _checkpoint_prefix_layout(payload)
     if payload.get("prior_variant", "legacy_bit") != expected_layout.get("prior_variant", "legacy_bit"):
         raise ValueError("addon checkpoint prior_variant mismatch; train a new predictive Stage2A")

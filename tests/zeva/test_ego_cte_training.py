@@ -13,7 +13,8 @@ import torch
 
 from fastwam.zeva.ego_cte import EGO_CTE_SCHEMA, ZevaEgoCTE, ZevaEgoCTEConfig
 from fastwam.zeva.ego_cte_training import (
-    PairedEpochSampler, build_ego_cte_optimizer, build_episode_splits,
+    CTE_DATA_SCOPE_SCHEMA, PairedEpochSampler, build_ego_cte_optimizer, build_episode_splits,
+    canonical_sha256,
     capture_rng_state, load_ego_cte_checkpoint, prediction_gain_metrics,
     require_ego_checkpoint_ready, restore_ego_training_checkpoint,
     restore_rng_state, save_ego_cte_checkpoint, validate_ego_cte,
@@ -56,6 +57,22 @@ def manifest(cfg, promotable=False):
 def formal_payload():
     cfg = ZevaEgoCTEConfig()
     identity = manifest(cfg, True)
+    rows = [{"episode_id": f"episode-{index}", "task_id": "task", "episode_index": index,
+             "dataset_start": index * 49, "episode_length": 49} for index in range(3)]
+    population = [{**row, "condition": "Clean", "partition_id": 0, "episode_position": index}
+                  for index, row in enumerate(rows)]
+    identity["data_scope"] = {
+        "schema": CTE_DATA_SCOPE_SCHEMA, "split_policy": "zeva_ego", "task_names": ["task"],
+        "conditions": ["Clean"], "task_subset_sha256": "a" * 64, "episode_conditions_sha256": "b" * 64,
+        "episode_conditions": {row["episode_id"]: "Clean" for row in rows},
+        "source_episode_metadata_sha256": canonical_sha256(rows),
+        "partition_population_sha256": canonical_sha256(population), "partition_population": population,
+        "eligible_episode_ids": [row["episode_id"] for row in rows], "partition_keys": [["Clean", "task"]],
+        "partition_position_semantics": "source_table_order_within_condition_task",
+    }
+    identity["data_identity"] = {"episode_metadata_sha256": canonical_sha256(rows)}
+    identity["recipe"].update(split_policy="zeva_ego", split_seed=1000, validation_fraction=.05)
+    identity["episode_splits"] = build_episode_splits(rows, partition_rows=population)
     value = metrics()
     value["epoch"] = 80
     return {"schema": EGO_CTE_SCHEMA, "config": cfg.to_dict(), "model_config": cfg.to_dict(),
@@ -67,21 +84,21 @@ def formal_payload():
 
 def test_episode_split_is_disjoint_stable_complete_and_semantically_balanced(tmp_path):
     source = episodes()
-    split = build_episode_splits(source)
-    assert split == build_episode_splits(reversed(source))
+    split = build_episode_splits(source, split_policy="legacy_semantic_task")
+    assert split == build_episode_splits(reversed(source), split_policy="legacy_semantic_task")
     assert not set(split["train"]) & set(split["validation"])
     assert set(split["train"] + split["validation"]) == {row.episode_id for row in source}
     assert len(split["train"]) == 8 and len(split["validation"]) == 2
     path = tmp_path / "split.json"
     path.write_text(json.dumps(split))
-    assert build_episode_splits(source, split_path=path) == split
+    assert build_episode_splits(source, split_path=path, split_policy="legacy_semantic_task") == split
     bad = deepcopy(split)
     bad["train"].append(bad["validation"][0])
     path.write_text(json.dumps(bad))
     with pytest.raises(ValueError, match="overlap"):
-        build_episode_splits(source, split_path=path)
+        build_episode_splits(source, split_path=path, split_policy="legacy_semantic_task")
     with pytest.raises(ValueError, match=">=3 episodes"):
-        build_episode_splits(source[:2])
+        build_episode_splits(source[:2], split_policy="legacy_semantic_task")
 
 
 def test_paired_sampler_covers_each_episode_once_even_with_odd_task_counts():
@@ -161,6 +178,45 @@ def test_ready_gate_recomputes_metrics_and_requires_same_epoch_validation():
     payload["camera_keys"].reverse()
     with pytest.raises(ValueError, match="camera order"):
         require_ego_checkpoint_ready(payload)
+    payload = formal_payload()
+    payload["validation"]["stage1_gate"] = False
+    with pytest.raises(ValueError, match="record a passed"):
+        require_ego_checkpoint_ready(payload)
+
+
+def test_reference_readiness_uses_exact_epoch80_and_explicit_validated_epoch40(tmp_path):
+    payload = formal_payload()
+    for epoch in (79, 80.5, 81, 100):
+        payload["epoch"] = payload["validation"]["epoch"] = epoch
+        with pytest.raises(ValueError, match="exactly 80"):
+            require_ego_checkpoint_ready(payload)
+    payload["epoch"] = payload["validation"]["epoch"] = 40
+    payload["step"] = 26160
+    require_ego_checkpoint_ready(payload, exploratory_epoch40=True)
+    with pytest.raises(ValueError, match="exactly 80"):
+        require_ego_checkpoint_ready(payload)
+    payload["step"] += 1
+    with pytest.raises(ValueError, match="epoch40/step26160"):
+        require_ego_checkpoint_ready(payload, exploratory_epoch40=True)
+    payload["step"] = 26160
+    payload["validation"]["action"] = 1.
+    with pytest.raises(ValueError, match="prediction gate failed"):
+        require_ego_checkpoint_ready(payload, exploratory_epoch40=True)
+    path = tmp_path / "exploratory.pt"
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="cannot bypass validation"):
+        load_ego_cte_checkpoint(path, exploratory_epoch40=True, require_ready=False)
+
+
+def test_old_cte_is_explicit_legacy_and_is_not_silently_reference_relabelled():
+    payload = formal_payload()
+    del payload["manifest"]["data_scope"]
+    del payload["manifest"]["recipe"]["split_policy"]
+    with pytest.raises(ValueError, match="explicit legacy route"):
+        require_ego_checkpoint_ready(payload)
+    require_ego_checkpoint_ready(payload, require_reference_recipe=False)
+    payload["epoch"] = payload["validation"]["epoch"] = 100
+    require_ego_checkpoint_ready(payload, require_reference_recipe=False)
 
 
 def test_test_backend_checkpoint_cannot_be_promoted_even_with_forged_flag(tmp_path):
@@ -214,6 +270,7 @@ def test_real_epoch_entrypoint_smoke_is_nonpromotable_and_writes_no_checkpoint(t
 
     class Dataset(torch.utils.data.Dataset):
         episodes = tuple(EgoEpisode(f"dataset::episode-{i}", "task", i, i * 49, 49) for i in range(6))
+        source_episodes = episodes
 
         def __len__(self):
             return len(self.episodes)
@@ -233,9 +290,14 @@ def test_real_epoch_entrypoint_smoke_is_nonpromotable_and_writes_no_checkpoint(t
     stats, semantic = tmp_path / "stats.json", tmp_path / "semantic.json"
     stats.write_text("{}")
     semantic.write_text("{}")
+    subset, conditions = tmp_path / "subset.json", tmp_path / "conditions.json"
+    subset.write_text(json.dumps({"task_names": ["task"]}))
+    conditions.write_text(json.dumps({f"dataset::episode-{index}": "Clean" if index < 3 else "Randomized"
+                                      for index in range(6)}))
     output = tmp_path / "run"
     cfg = OmegaConf.create({"num_epochs": 1, "batch_size": 2, "num_workers": 0,
                            "device": "cpu", "output_dir": str(output), "cte_smoke_steps": 1,
+                           "cte_task_subset_path": str(subset), "cte_episode_conditions_path": str(conditions),
                            "model": {"zeva": {"cte": tiny_config().to_dict()}},
                            "data": {"train": {"val_set_proportion": 0., "require_semantic_task_id": True,
                                                "use_text_embed_cache": False, "dataset_dirs": [str(tmp_path)],

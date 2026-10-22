@@ -6,7 +6,8 @@ from collections.abc import Mapping
 import math
 
 
-PIM_MEMORY_CONTRACT_SCHEMA = "iclwam_cross_attempt_pim_memory_v1"
+LEGACY_PIM_MEMORY_CONTRACT_SCHEMA = "iclwam_cross_attempt_pim_memory_v1"
+PIM_MEMORY_CONTRACT_SCHEMA = "iclwam_cross_attempt_pim_memory_v2"
 
 
 def pim_memory_contract(config: Mapping) -> dict | None:
@@ -35,8 +36,14 @@ def pim_memory_contract(config: Mapping) -> dict | None:
     if (not all(math.isfinite(value) for value in (threshold, phase, effect))
             or not -1 <= threshold <= 1 or min(phase, effect) < 0 or phase + effect <= 0):
         raise ValueError("Invalid PIM similarity-merge threshold or weights")
-    return {
-        "schema": PIM_MEMORY_CONTRACT_SCHEMA, "compression": compression,
+    timing = str(config.get("commit_timing", "attempt_end"))
+    storage = str(config.get("storage_device", "cpu"))
+    if timing not in {"attempt_end", "attempt_reset"} or storage not in {"cpu", "policy"}:
+        raise ValueError("Invalid PIM commit_timing or storage_device")
+    reference_lifecycle = (timing, storage) != ("attempt_end", "cpu")
+    contract = {
+        "schema": PIM_MEMORY_CONTRACT_SCHEMA if reference_lifecycle else LEGACY_PIM_MEMORY_CONTRACT_SCHEMA,
+        "compression": compression,
         "uniform_indexing": indexing, **counts,
         # These values do not affect uniform compression; canonicalize them
         # so changing an unused legacy threshold does not invent a new policy.
@@ -44,10 +51,16 @@ def pim_memory_contract(config: Mapping) -> dict | None:
         "phase_weight": phase / (phase + effect) if compression == "similarity_merge" else None,
     }
 
+    if reference_lifecycle:
+        contract.update(commit_timing=timing, storage_device=storage)
+    return contract
+
 
 def validate_pim_memory_contract(contract: dict) -> dict:
-    if not isinstance(contract, dict) or contract.get("schema") != PIM_MEMORY_CONTRACT_SCHEMA:
+    if not isinstance(contract, dict) or contract.get("schema") not in {PIM_MEMORY_CONTRACT_SCHEMA, LEGACY_PIM_MEMORY_CONTRACT_SCHEMA}:
         raise ValueError("Missing or unsupported PIM memory contract")
+    if contract["schema"] == PIM_MEMORY_CONTRACT_SCHEMA and not {"commit_timing", "storage_device"} <= contract.keys():
+        raise ValueError("PIM memory v2 must declare commit timing and storage device")
     phase_weight = contract.get("phase_weight")
     if phase_weight is not None and (type(phase_weight) not in {int, float}
                                      or not math.isfinite(phase_weight)
@@ -78,7 +91,8 @@ def checkpoint_pim_memory_contract(payload: dict) -> dict | None:
     # Old full training configs establish the historical uniform/floor policy.
     # Do not accept unmarked new compression semantics as an old checkpoint.
     if from_config is not None:
-        if (from_config["compression"], from_config["uniform_indexing"]) != ("uniform", "legacy_floor"):
+        if (from_config["schema"] != LEGACY_PIM_MEMORY_CONTRACT_SCHEMA
+                or (from_config["compression"], from_config["uniform_indexing"]) != ("uniform", "legacy_floor")):
             raise ValueError("Checkpoint must explicitly record its non-legacy PIM memory contract")
         return from_config
     return None
@@ -92,13 +106,14 @@ def validate_checkpoint_pim_memory_contract(payload: dict, expected: dict | None
         return saved
     expected = validate_pim_memory_contract(expected)
     if saved is None:
-        if (expected["compression"], expected["uniform_indexing"]) == ("uniform", "legacy_floor"):
+        if (expected["schema"] == LEGACY_PIM_MEMORY_CONTRACT_SCHEMA
+                and (expected["compression"], expected["uniform_indexing"]) == ("uniform", "legacy_floor")):
             # Early addons omitted config metadata. Only an explicitly legacy
             # target can supply the otherwise implicit old serving behavior.
             return expected
         raise ValueError("Legacy addon has no PIM memory contract; select explicit uniform/legacy_floor configuration")
     if saved != expected:
-        changed = {key for key in saved if saved[key] != expected[key]}
+        changed = {key for key in saved.keys() | expected.keys() if saved.get(key) != expected.get(key)}
         if not allow_compression_override or not changed <= {"compression", "merge_threshold", "phase_weight"}:
             raise ValueError("Checkpoint PIM memory contract mismatch; use matching compression/indexing or an explicit compression ablation")
     return saved

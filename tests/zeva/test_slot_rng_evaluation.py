@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from experiments.robotwin.multiattempt import (
-    ATTEMPT_SCHEMA, CONTINUOUS_NOISE_PROTOCOL, EVALUATION_PROTOCOL_SCHEMA,
+    ATTEMPT_SCHEMA, CONTINUOUS_NOISE_PROTOCOL, DEVICE_CONTINUOUS_NOISE_PROTOCOL, EVALUATION_PROTOCOL_SCHEMA,
     MANIFEST_SCHEMA, append_attempt, load_manifest, summarize_attempts,
     validate_attempts,
 )
@@ -209,7 +209,7 @@ def test_manifest_plan_freezes_slot_order_hash_and_development_scope(tmp_path, m
     assert protocol["manifest_scope"] == "frozen_full"
     assert protocol["model_seed"] == 20260907 and protocol["slots"] == 8
     assert full["episodes"] == 200
-    assert full["model_rng_protocol"] == CONTINUOUS_NOISE_PROTOCOL
+    assert full["model_rng_protocol"] == DEVICE_CONTINUOUS_NOISE_PROTOCOL
     assert [row["task"] for row in full["commands"]] == protocol["task_order"]
     for item in full["commands"]:
         fields = dict(part.split("=", 1) for part in item["command"] if "=" in part)
@@ -255,6 +255,7 @@ def test_manifest_runner_exports_complete_only_after_all_task_handoffs_and_audit
     ])
     visited = []
     identity = {"base_sha256": "a" * 64, "stats_sha256": "b" * 64,
+                "policy_device": "cpu", "numerical_contract": None,
                 "foundation_checkpoint_required": False,
                 "pim_memory_contract": None, "pim_compression_override": False,
                 "policy_text": {"schema": "iclwam_policy_text_v1",
@@ -273,7 +274,7 @@ def test_manifest_runner_exports_complete_only_after_all_task_handoffs_and_audit
         stream = ContinuousModelNoiseStream(
             get("model_seed"), slot_index=get("evaluation_slot_index"), slot_count=get("evaluation_slot_count"),
             state_path=get("model_rng_state_path"), run_id=get("model_rng_run_id"),
-            task_name=task, checkpoint_identity=identity,
+            task_name=task, checkpoint_identity=identity, protocol=get("model_rng_protocol"), device="cpu",
         )
         for episode in manifest["episodes"]:
             if episode["task"] != task:

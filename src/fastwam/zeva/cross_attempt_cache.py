@@ -19,9 +19,14 @@ import torch
 
 CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v1"
 LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v2"
-EGO_CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v3"
+LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v3"
+EGO_CROSS_ATTEMPT_CACHE_FORMAT = "zeva_stage2_cross_attempt_pim_v4"
 CROSS_ATTEMPT_CACHE_FORMATS = (CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT,
-                             EGO_CROSS_ATTEMPT_CACHE_FORMAT)
+                             LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT, EGO_CROSS_ATTEMPT_CACHE_FORMAT)
+ALL_CTE_FRAMES = "all_cte_frames_v1"
+COMPLETE_POLICY_WINDOWS = "complete_policy_windows_v1"
+REFERENCE_PAIRING_METRIC = "torch_float32_first_in_source_order"
+LEGACY_PAIRING_METRIC = "numpy_float32_episode_id_v1"
 HISTORY_KINDS = ("matched", "far", "cross_condition", "empty")
 
 
@@ -61,8 +66,11 @@ def build_episode_pairings(
     use_conditions: bool,
     history_pairing: str = "legacy_candidates",
     allow_reduced_curriculum: bool = True,
+    pairing_metric: str = LEGACY_PAIRING_METRIC,
 ) -> dict[str, dict[str, list[int]]]:
     """Pair initial phases only; later query outcomes/actions cannot affect it."""
+    if pairing_metric not in {REFERENCE_PAIRING_METRIC, LEGACY_PAIRING_METRIC}:
+        raise ValueError("unknown PIM pairing_metric")
     if max_histories < 1:
         raise ValueError("max_histories must be positive")
     if history_pairing not in {"reference_nearest", "legacy_candidates"}:
@@ -78,20 +86,35 @@ def build_episode_pairings(
         key = np.asarray(history["initial_phase"], dtype=np.float32)
         if not np.isfinite(key).all():
             raise ValueError("initial phase must be finite")
-        key = key / max(float(np.linalg.norm(key)), 1e-12)
+        if pairing_metric == LEGACY_PAIRING_METRIC:
+            key = key / max(float(np.linalg.norm(key)), 1e-12)
         by_task[history["task_id"]].append((index, history, key))
     result: dict[str, dict[str, list[int]]] = {}
     for episode_id, query in queries.items():
         q = np.asarray(query["initial_phase"], dtype=np.float32)
         if not np.isfinite(q).all():
             raise ValueError("initial phase must be finite")
-        q = q / max(float(np.linalg.norm(q)), 1e-12)
+        if pairing_metric == LEGACY_PAIRING_METRIC:
+            q = q / max(float(np.linalg.norm(q)), 1e-12)
+        else:
+            # Use the same float32 normalize + matrix-vector product as the
+            # reference builder. Source order, not episode names, breaks ties.
+            candidates = [(i, h, k) for i, h, k in by_task[query["task_id"]] if h["episode_id"] != episode_id]
+            scores = {}
+            for is_cross in (False, True):
+                group = [(i, k) for i, h, k in candidates
+                         if bool(use_conditions and h["condition"] != query["condition"]) == is_cross]
+                if group:
+                    keys = torch.from_numpy(np.stack([key for _, key in group])).float()
+                    values = torch.nn.functional.normalize(keys, dim=-1) @ torch.nn.functional.normalize(torch.from_numpy(q).float(), dim=-1)
+                    scores.update({i: float(value) for (i, _), value in zip(group, values, strict=True)})
         same: list[tuple[float, str, int]] = []
         cross: list[tuple[float, str, int]] = []
         for index, history, key in by_task[query["task_id"]]:
             if history["episode_id"] == episode_id:
                 continue
-            item = (float(q @ key), str(history["episode_id"]), index)
+            item = ((float(q @ key) if pairing_metric == LEGACY_PAIRING_METRIC else scores[index]),
+                    str(history["episode_id"]) if pairing_metric == LEGACY_PAIRING_METRIC else index, index)
             if use_conditions and history["condition"] != query["condition"]:
                 cross.append(item)
             else:
@@ -126,7 +149,17 @@ class CrossAttemptPIMCache:
         if self.manifest.get("pim_variant") != "cross_attempt" or self.manifest.get("source_subset") != "train-only":
             raise ValueError("cross-attempt cache requires explicit train-only provenance")
         self.current_prediction = self.manifest["format"] in {
-            EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT}
+            EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_EGO_CROSS_ATTEMPT_CACHE_FORMAT}
+        self.query_scope = self.manifest.get("query_scope", COMPLETE_POLICY_WINDOWS)
+        self.pairing_metric = self.manifest.get("pairing_metric", LEGACY_PAIRING_METRIC)
+        if self.manifest["format"] == EGO_CROSS_ATTEMPT_CACHE_FORMAT:
+            if (self.query_scope != ALL_CTE_FRAMES or self.pairing_metric != REFERENCE_PAIRING_METRIC
+                    or self.manifest.get("source_export_scope") != ALL_CTE_FRAMES):
+                raise ValueError("PIM cache v4 requires all CTE frames and reference float32/source-order pairing")
+            if not {"query_scope", "pairing_metric"} <= self.manifest.keys():
+                raise ValueError("PIM cache v4 requires explicit query/pairing contracts")
+        elif self.query_scope != COMPLETE_POLICY_WINDOWS or self.pairing_metric != LEGACY_PAIRING_METRIC:
+            raise ValueError("Legacy PIM cache query/pairing semantics cannot be relabeled")
         self.uniform_indexing = self.manifest.get("uniform_indexing", "legacy_floor")
         self.history_pairing = self.manifest.get("history_pairing", "legacy_candidates")
         self.allow_reduced_curriculum = self.manifest.get("allow_reduced_curriculum", True)
@@ -134,12 +167,12 @@ class CrossAttemptPIMCache:
             raise ValueError("unknown PIM history_pairing")
         if type(self.allow_reduced_curriculum) is not bool:
             raise ValueError("allow_reduced_curriculum must be boolean")
-        if self.manifest["format"] == EGO_CROSS_ATTEMPT_CACHE_FORMAT:
+        if self.manifest["format"] in {EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT}:
             if (self.uniform_indexing != "reference_round"
                     or self.manifest.get("history_compression") != "uniform"):
-                raise ValueError("PIM cache v3 requires explicit uniform/reference_round history compression")
+                raise ValueError("PIM reference cache requires explicit uniform/reference_round history compression")
             if "history_pairing" not in self.manifest or "allow_reduced_curriculum" not in self.manifest:
-                raise ValueError("PIM cache v3 must declare its pairing and curriculum policy")
+                raise ValueError("PIM reference cache must declare its pairing and curriculum policy")
         elif self.uniform_indexing != "legacy_floor":
             raise ValueError("Legacy PIM cache formats require legacy_floor indexing")
         elif self.history_pairing != "legacy_candidates":
@@ -232,7 +265,7 @@ class CrossAttemptPIMCache:
             if not global_kinds or self.manifest.get("globally_available_history_kinds") != global_kinds:
                 raise ValueError("globally available history kinds do not match pairing provenance")
             reduced = global_kinds != list(HISTORY_KINDS[:3])
-            if self.manifest["format"] == EGO_CROSS_ATTEMPT_CACHE_FORMAT and self.manifest.get("reduced_curriculum") is not reduced:
+            if self.manifest["format"] in {EGO_CROSS_ATTEMPT_CACHE_FORMAT, LEGACY_REFERENCE_EGO_CROSS_ATTEMPT_CACHE_FORMAT} and self.manifest.get("reduced_curriculum") is not reduced:
                 raise ValueError("PIM cache reduced_curriculum does not match its available history modes")
             if reduced and not self.allow_reduced_curriculum:
                 raise ValueError("Reference PIM curriculum requires all three history modes for every query")
@@ -270,6 +303,24 @@ class CrossAttemptPIMCache:
             if array.dtype != dtype or array.shape != shape:
                 raise ValueError(f"cross-attempt array shape/dtype mismatch: {name}")
             self._arrays[name] = array
+        if self.query_scope == ALL_CTE_FRAMES:
+            seen_queries = set()
+            for index in range(n):
+                ep = int(self._arrays["episode_index"][index])
+                if not 0 <= ep < len(self.episode_ids):
+                    raise ValueError("all-frame PIM query episode index is invalid")
+                episode_id = self.episode_ids[ep]
+                meta = self.query_episodes[episode_id]
+                raw = int(self._arrays["raw_step"][index])
+                if (raw < 0 or raw >= int(meta.get("episode_length", 0)) or raw % 24
+                        or int(self._arrays["window_index"][index]) != int(meta.get("dataset_start", -1)) + raw
+                        or (episode_id, raw) in seen_queries):
+                    raise ValueError("all-frame PIM query differs from its source boundary/window provenance")
+                seen_queries.add((episode_id, raw))
+            expected_queries = {(episode_id, raw) for episode_id, meta in self.query_episodes.items()
+                                for raw in range(0, ((int(meta["episode_length"]) - 1) // 24) * 24 + 1, 24)}
+            if seen_queries != expected_queries:
+                raise ValueError("all-frame PIM cache must retain every observed CTE frame, including padded tails")
         if not np.all(np.asarray(self._arrays["history_mask"]).sum(axis=1) > 0):
             raise ValueError("history catalog contains an empty source episode")
         for name in (("history_mask", "bit_mask", "current_effect_mask") if self.current_prediction else ("history_mask", "bit_mask")):
@@ -279,10 +330,15 @@ class CrossAttemptPIMCache:
     def __len__(self) -> int:
         return self.num_queries
 
-    def validate_training_curriculum(self, *, history_pairing: str, allow_reduced_curriculum: bool) -> None:
+    def validate_training_curriculum(self, *, history_pairing: str, allow_reduced_curriculum: bool,
+                                     query_scope: str | None = None, pairing_metric: str | None = None) -> None:
         """Require the training config to opt into any non-reference reduction."""
         if not self.current_prediction:
             raise ValueError("predictive curriculum requires a predicted-effect PIM cache")
+        if query_scope is not None and query_scope != self.query_scope:
+            raise ValueError("prepared PIM query_scope differs from the selected training recipe")
+        if pairing_metric is not None and pairing_metric != self.pairing_metric:
+            raise ValueError("prepared PIM pairing_metric differs from the selected training recipe")
         if history_pairing != self.history_pairing:
             raise ValueError("prepared PIM history_pairing differs from the selected training recipe")
         if type(allow_reduced_curriculum) is not bool:

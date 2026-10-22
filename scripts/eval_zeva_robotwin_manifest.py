@@ -1,6 +1,6 @@
 """Run frozen-scene, four-attempt RoboTwin conditions with strict reporting.
 
-Models load once per task and condition. A private CPU Torch generator is handed
+Models load once per task and condition. A private policy-device Torch generator is handed
 between tasks assigned to the same slot; scene/attempt resets never reseed it.
 --dry-run validates the manifest and writes the exact command plan without
 importing torch/SAPIEN or loading assets. Every invocation needs a fresh directory.
@@ -21,9 +21,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from fastwam.zeva_memory_contract import pim_memory_contract, validate_checkpoint_pim_memory_contract
+from fastwam.zeva_numerical_contract import config_numerical_contract, validate_checkpoint_numerical_contract
 
 from experiments.robotwin.multiattempt import (
-    CONTINUOUS_NOISE_PROTOCOL, EVALUATION_PROTOCOL_SCHEMA, FROZEN_MANIFEST_SHA256,
+    CONTINUOUS_NOISE_PROTOCOL, DEVICE_CONTINUOUS_NOISE_PROTOCOL, CONTINUOUS_NOISE_PROTOCOLS, EVALUATION_PROTOCOL_SCHEMA, FROZEN_MANIFEST_SHA256,
     LEGACY_SEED_PROTOCOL, REFERENCE_MANIFEST_SHA256, REFERENCE_REVISION,
     audit_attempt_videos, load_manifest, paired_comparison, read_attempts, summarize_attempts,
 )
@@ -34,7 +35,8 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
                      foundation_mode: str | None = None,
                      policy_text_encoder_device: str = "cpu",
                      policy_text_cache_size: int = 16,
-                     pim_compression: str | None = None) -> dict:
+                     pim_compression: str | None = None,
+                     cte_exploratory_epoch40: bool | None = None) -> dict:
     """Resolve reader capacity without importing or instantiating the policy."""
     from hydra import compose, initialize_config_dir
 
@@ -45,6 +47,7 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
             f"model.zeva.adapter.effect_source={effect_source}",
             *([] if task_context_mode is None else [f"model.zeva.task_context.mode={task_context_mode}"]),
             *([] if foundation_mode is None else [f"++foundation_mode={foundation_mode}"]),
+            *([] if cte_exploratory_epoch40 is None else [f"++model.zeva.cte.exploratory_epoch40={str(cte_exploratory_epoch40).lower()}"]),
             *([] if pim_compression is None else [f"++model.zeva.memory.compression={pim_compression}",
                                                  "++model.zeva.memory.allow_compression_override=true"]),
         ])
@@ -71,6 +74,8 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
             raise ValueError("joint foundation evaluation requires freeze_fastwam=false and task_language retrieval")
     if task_context_mode == "task_language" and float(zeva.task_context.get("temperature", 1.0)) != 1.0:
         raise ValueError("task-language retrieval uses the reference temperature=1.0")
+    if cte_exploratory_epoch40 and effect_source != "current_prediction":
+        raise ValueError("Exploratory epoch40 selection requires a Zeva-Ego predictive CTE")
     if effect_source == "current_prediction":
         if (prefix_layout != "zeva_ego" or prior != "zeva_ego" or semantics != "predicted_effect_trace"
                 or str(zeva.cte.get("variant", "legacy")) != "zeva_ego"
@@ -83,6 +88,7 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
         effect_source == "current_prediction" and not processor.get("action_state_transforms")
         and not bool(processor.get("use_stepwise_action_norm", False))
     )
+    numerical_contract = config_numerical_contract(zeva)
     memory_contract = pim_memory_contract(zeva.memory)
     if pim_compression is not None and memory_contract is None:
         raise ValueError("PIM compression ablations require cross-attempt memory")
@@ -99,13 +105,19 @@ def _policy_contract(task: str, overrides: list[str], prefix_layout: str, effect
         "policy_text_encoder_device": policy_text_encoder_device,
         "policy_text_cache_size": policy_text_cache_size,
         "pim_memory_contract": memory_contract,
+        "numerical_contract": numerical_contract,
+        "training_query_scope": str(zeva.task_context.get("training_query_scope", "episode_static")),
+        "inference_task_context_scope": "reference_first_instruction" if numerical_contract == "zeva_ego_v1" else "legacy_constant_instruction",
+        "cte_exploratory_epoch40": bool(zeva.cte.get("exploratory_epoch40", False)),
+        "cte_require_reference_recipe": bool(zeva.cte.get("require_reference_recipe", numerical_contract == "zeva_ego_v1")),
         "pim_compression_override": bool(zeva.memory.get("allow_compression_override", False)),
         "skip_get_obs_within_replan": boundary_observations,
     }
 
 
 def _foundation_artifact(addon_path: str, training_recipe: str, *,
-                         memory_contract: dict | None = None, allow_compression_override: bool = False) -> dict:
+                         memory_contract: dict | None = None, allow_compression_override: bool = False,
+                         numerical_contract: str | None = None) -> dict:
     """Validate a real checkpoint bundle before launching the simulator."""
     import torch
     sys.path.insert(0, str(ROOT / "src"))
@@ -114,6 +126,8 @@ def _foundation_artifact(addon_path: str, training_recipe: str, *,
 
     payload = torch.load(addon_path, map_location="cpu", weights_only=False)
     checkpoint_foundation_mode(payload)  # Reject inconsistent explicit mode metadata.
+    saved_numerical = (validate_checkpoint_numerical_contract(payload, numerical_contract)
+                       if numerical_contract is not None else None)
     saved_memory = validate_checkpoint_pim_memory_contract(payload, memory_contract,
                                                           allow_compression_override=allow_compression_override)
     if payload.get("training_recipe", "frozen_parent") != training_recipe:
@@ -121,6 +135,8 @@ def _foundation_artifact(addon_path: str, training_recipe: str, *,
     foundation = resolve_joint_foundation_checkpoint(addon_path, payload=payload, verify_hash=True)
     result = {"foundation_checkpoint_required": checkpoint_requires_foundation(payload),
               "checkpoint_pim_memory_contract": saved_memory}
+    if saved_numerical is not None:
+        result["checkpoint_numerical_contract"] = saved_numerical
     if payload.get("foundation_contract_schema") is not None:
         result["foundation_contract_schema"] = payload["foundation_contract_schema"]
     if foundation is None:
@@ -132,6 +148,7 @@ def _foundation_artifact(addon_path: str, training_recipe: str, *,
 def _verify_rng_handoff(
     path: str | Path, *, seed: int, slot: int, slots: int, run_id: str,
     completed_tasks: list[str], log_path: str | Path,
+    protocol: str = CONTINUOUS_NOISE_PROTOCOL,
 ) -> None:
     """Check that a successful subprocess committed the exact slot/log tail."""
     path = Path(path)
@@ -139,11 +156,15 @@ def _verify_rng_handoff(
         raise ValueError("Task finished without committing its continuous model RNG state")
     payload = json.loads(path.read_text())
     expected = {
-        "protocol": CONTINUOUS_NOISE_PROTOCOL, "seed": seed,
+        "protocol": protocol, "seed": seed,
         "slot_index": slot, "slot_count": slots, "run_id": run_id,
-        "device": "cpu", "dtype": "float32", "noise_shape": [1, 32, 14],
+        "dtype": "float32", "noise_shape": [1, 32, 14],
         "completed_tasks": completed_tasks,
     }
+    if protocol == CONTINUOUS_NOISE_PROTOCOL:
+        expected["device"] = "cpu"
+    elif protocol != DEVICE_CONTINUOUS_NOISE_PROTOCOL:
+        raise ValueError("unsupported continuous RNG handoff protocol")
     if any(payload.get(key) != value for key, value in expected.items()):
         raise ValueError("Continuous model RNG task handoff identity/order differs from the plan")
     try:
@@ -158,6 +179,8 @@ def _verify_rng_handoff(
     identity = rows[-1].get("checkpoint_identity")
     if not isinstance(identity, dict) or payload.get("checkpoint_identity") != identity:
         raise ValueError("Continuous model RNG handoff checkpoint bundle differs from the task log")
+    if protocol == DEVICE_CONTINUOUS_NOISE_PROTOCOL and payload.get("device") != identity.get("policy_device"):
+        raise ValueError("Continuous model RNG handoff device differs from the actual policy device")
     snapshot = rows[-1].get("seed_stream")
     if not isinstance(snapshot, dict) or any(payload.get(key) != snapshot.get(key) for key in (
         "protocol", "seed", "draws", "state_sha256", "device", "dtype",
@@ -174,6 +197,10 @@ def main() -> None:
     parser.add_argument("--cte-checkpoint")
     parser.add_argument("--old-cte-checkpoint", help="Override shared --cte-checkpoint for the legacy condition")
     parser.add_argument("--new-cte-checkpoint", help="Override shared --cte-checkpoint for new_on/new_off")
+    parser.add_argument("--old-cte-exploratory-epoch40", action="store_true",
+                        help="Explicit epoch40/step26160 CTE experiment for the old family only")
+    parser.add_argument("--new-cte-exploratory-epoch40", action="store_true",
+                        help="Explicit epoch40/step26160 CTE experiment for new_on/new_off only")
     parser.add_argument("--old-addon-checkpoint")
     parser.add_argument("--new-addon-checkpoint")
     parser.add_argument("--task-context-bank")
@@ -194,7 +221,7 @@ def main() -> None:
     parser.add_argument("--tasks", nargs="+", help="Create a separately hashed development subset")
     parser.add_argument("--model-seed", "--model-rng-seed", type=int, default=20260907)
     parser.add_argument("--slots", type=int, default=8)
-    parser.add_argument("--model-rng-protocol", choices=(CONTINUOUS_NOISE_PROTOCOL, LEGACY_SEED_PROTOCOL), default=CONTINUOUS_NOISE_PROTOCOL)
+    parser.add_argument("--model-rng-protocol", choices=(DEVICE_CONTINUOUS_NOISE_PROTOCOL, CONTINUOUS_NOISE_PROTOCOL, LEGACY_SEED_PROTOCOL), default=DEVICE_CONTINUOUS_NOISE_PROTOCOL)
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--pim-diagnostic-interval", type=int, default=0)
@@ -266,6 +293,7 @@ def main() -> None:
                 policy_text_encoder_device=args.policy_text_encoder_device,
                 policy_text_cache_size=args.policy_text_cache_size,
                 pim_compression=(None if condition == "base" else getattr(args, f"{family}_pim_compression")),
+                cte_exploratory_epoch40=(True if condition != "base" and getattr(args, f"{family}_cte_exploratory_epoch40") else None),
             )
             if condition == "base":
                 contracts[condition]["skip_get_obs_within_replan"] = True
@@ -275,6 +303,7 @@ def main() -> None:
                 contracts[condition]["foundation_mode"] = "frozen"
                 contracts[condition]["foundation_checkpoint_required"] = False
                 contracts[condition]["pim_memory_contract"] = None
+                contracts[condition]["numerical_contract"] = None
                 contracts[condition]["pim_compression_override"] = False
         except ValueError as exc:
             parser.error(f"Invalid {condition} policy configuration: {exc}")
@@ -304,7 +333,16 @@ def main() -> None:
             try:
                 bundle = _foundation_artifact(getattr(args, f"{family}_addon_checkpoint"), contracts[condition]["training_recipe"],
                     memory_contract=contracts[condition]["pim_memory_contract"],
-                    allow_compression_override=contracts[condition]["pim_compression_override"])
+                    allow_compression_override=contracts[condition]["pim_compression_override"],
+                    numerical_contract=contracts[condition]["numerical_contract"])
+                if contracts[condition]["effect_source"] == "current_prediction":
+                    import torch
+                    from fastwam.zeva.ego_cte_training import require_ego_checkpoint_ready
+                    cte_payload = torch.load(assets["cte_checkpoint"], map_location="cpu", weights_only=False)
+                    require_ego_checkpoint_ready(
+                        cte_payload, exploratory_epoch40=contracts[condition]["cte_exploratory_epoch40"],
+                        require_reference_recipe=contracts[condition]["cte_require_reference_recipe"])
+                    bundle.update(cte_epoch=int(cte_payload["epoch"]), cte_data_scope=cte_payload.get("manifest", {}).get("data_scope"))
             except (ValueError, FileNotFoundError) as exc:
                 parser.error(f"Invalid {condition} checkpoint bundle: {exc}")
             assets.update(bundle)
@@ -346,7 +384,11 @@ def main() -> None:
         "slot_assignment_basis": "sorted source-manifest task index modulo slots",
         "num_inference_steps": args.num_inference_steps,
         "policy_contracts": contracts,
-        "noise_implementation": "CPU float32; FastWAM joint14/horizon32, not Zeva CUDA samples",
+        "noise_implementation": ("policy-device float32 continuous stream; FastWAM joint14/horizon32; public Zeva adapter is external"
+                                 if args.model_rng_protocol == DEVICE_CONTINUOUS_NOISE_PROTOCOL else
+                                 "legacy CPU float32 continuous stream" if args.model_rng_protocol == CONTINUOUS_NOISE_PROTOCOL else
+                                 "legacy per-request seed stream"),
+        "model_noise_device": "policy" if args.model_rng_protocol == DEVICE_CONTINUOUS_NOISE_PROTOCOL else "cpu",
     }
     manifest["evaluation_protocol"] = protocol
     output.mkdir(parents=True, exist_ok=False)
@@ -400,7 +442,7 @@ def main() -> None:
                 setting("EVALUATION.policy_text_cache_size", args.policy_text_cache_size),
                 setting("EVALUATION.skip_get_obs_within_replan", contract["skip_get_obs_within_replan"]),
             ]
-            if args.model_rng_protocol == CONTINUOUS_NOISE_PROTOCOL:
+            if args.model_rng_protocol in CONTINUOUS_NOISE_PROTOCOLS:
                 command.extend([
                     setting("EVALUATION.model_rng_state_path", str(state_path)),
                     setting("EVALUATION.model_rng_task_name", task),
@@ -408,6 +450,8 @@ def main() -> None:
                 ])
             if condition != "base":
                 assets = condition_assets[condition]
+                if getattr(args, "new_cte_exploratory_epoch40" if new else "old_cte_exploratory_epoch40"):
+                    command.append(setting("++model.zeva.cte.exploratory_epoch40", True))
                 selected_mode = getattr(args, "new_foundation_mode" if new else "old_foundation_mode")
                 if selected_mode is not None:
                     command.append(setting("++foundation_mode", selected_mode))
@@ -434,7 +478,7 @@ def main() -> None:
             ])
             commands.append({
                 "condition": condition, "task": task, "slot": slot,
-                "rng_state_path": str(state_path) if args.model_rng_protocol == CONTINUOUS_NOISE_PROTOCOL else None,
+                "rng_state_path": str(state_path) if args.model_rng_protocol in CONTINUOUS_NOISE_PROTOCOLS else None,
                 "rng_run_id": rng_run_id, "command": command,
             })
     plan = {
@@ -462,13 +506,13 @@ def main() -> None:
             failure = {"condition": item["condition"], "task": item["task"], "returncode": result.returncode}
             (output / "run_failure.json").write_text(json.dumps(failure, indent=2) + "\n")
             raise SystemExit(f"Evaluation failed: {failure}; partial logs are not a completed benchmark")
-        if args.model_rng_protocol == CONTINUOUS_NOISE_PROTOCOL:
+        if args.model_rng_protocol in CONTINUOUS_NOISE_PROTOCOLS:
             completed_tasks = completed.setdefault((item["condition"], item["slot"]), [])
             completed_tasks.append(item["task"])
             _verify_rng_handoff(
                 item["rng_state_path"], seed=args.model_seed, slot=item["slot"], slots=args.slots,
                 run_id=item["rng_run_id"], completed_tasks=completed_tasks,
-                log_path=output / f"{item['condition']}.jsonl",
+                log_path=output / f"{item['condition']}.jsonl", protocol=args.model_rng_protocol,
             )
     all_rows = {condition: read_attempts(output / f"{condition}.jsonl") for condition in args.conditions}
     # Audit across conditions too: an on/off pair must not reuse a recording.
