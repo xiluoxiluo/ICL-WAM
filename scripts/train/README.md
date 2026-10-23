@@ -104,6 +104,26 @@ STAGE2A_FOUNDATION_MODE=joint STAGE2B_FOUNDATION_MODE=frozen \
 
 已有输出默认拒绝覆盖。准备完成后从后续编号继续；latent cache 中断可显式 `LATENT_RESUME=1`，底层仍验证来源与存储。`CTE_RESUME` 指向兼容 CTE checkpoint；当前 CTE trainer 结束时才写 `cte.pt`，`save_every` 不是已经实现的周期性 CTE checkpoint。A/B 的 `STAGE2A_RESUME` / `STAGE2B_RESUME` 必须是完整 trainer state 目录，不能给 deployment addon `.pt`。单独改 `RUN_ROOT` 会得到独立实验，避免缓存/权重混配。
 
+## 03 的双卡吞吐优化与测量
+
+主线 VAE latent 的来源、PyAV 帧选择、数值转换、缓存数组和进度协议不改变。此优化**没有**重新引入磁盘预分配，也不能解决用户/项目 quota 限制。
+
+原来的 `identity_collate` 将包含图像的 Python 对象列表交回主进程，再执行 `torch.stack`；虽然 DataLoader 开启 `pin_memory`，自定义对象并不会自动组成 pinned tensor batch。设置 `LATENT_FAST_COLLATE=1` 后，在 worker 中按原顺序拼接纯 Tensor 字典，使 DataLoader 能直接 pin 这些张量，再用 `non_blocking=True` 送到设备。这不改变输入值、顺序或 BF16 缓存表示。该选项默认关闭，需在实际机器上对比后开启。
+
+建议先维持 batch=8，仅在已有完整旧缓存且确认作业停下后，使用相同 `world_size=2` 续算：
+
+```bash
+LATENT_RESUME=1 PREP_GPU_IDS=0,1 PREP_NPROC_PER_NODE=2 \
+LATENT_FAST_COLLATE=1 LATENT_BATCH_SIZE=8 NUM_WORKERS=8 \
+LATENT_PREFETCH_FACTOR=2 LATENT_PROFILE_EVERY_BATCHES=50 \
+  bash scripts/train/03_precompute_cte_latents.sh
+```
+
+会每 50 个 batch 输出 `wait_data`（CPU 解码/等待）、`h2d_vae_d2h`（传输与 VAE）、`memmap_flush`（数组写入与周期 flush）和 `throughput`（该 rank 的 windows/s）。两个 rank 速度相近时，汇总吞吐约为它们之和。与旧配置比较时，**优先比较 windows/s，不能只比较不同 batch size 的秒/batch**。
+
+如果 `wait_data` 占主导，再测试 workers 4/6/8；如果 `h2d_vae_d2h` 占主导且显存充裕，再在相同 2 rank 下测试 `LATENT_BATCH_SIZE=16`。更高 workers/prefetch 可能增大 CPU/RAM、`/dev/shm` 和网络存储压力，导致反而变慢或 DataLoader bus error；先检查 `df -h /dev/shm`。批大小和 workers 可以改变，**生成 world size 不能从 2 改到其他值**，并且绝不能让两次作业同时写同一个缓存目录。
+
+数据仍按成功 episode 来源及既有 `progress.json.next_offset` 恢复。增设分项计时不改变任何源数据、checkpoint 或 loss；若运行数小时后再遇 `Errno 122`，需优先处理 quota 而不是调大 worker。
 ## RoboTwin：分别报告单次、恢复和稳定性
 
 入口 [`../eval_zeva_main_robotwin.py`](../eval_zeva_main_robotwin.py) 使用 `sim_robotwin_zeva_main`，默认按顺序在一个 GPU 上运行同权重 memory off/on。参数见 `python scripts/eval_zeva_main_robotwin.py --help`；需要 base、CTE、A/B addon、stats、success manifest、bank 和 retrieval checkpoint。

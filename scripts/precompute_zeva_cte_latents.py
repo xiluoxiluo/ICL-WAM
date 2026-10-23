@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,7 @@ from fastwam.zeva.cte_windows import (
     MAIN_CTE_WINDOW_SEMANTICS, observed_prefix_transitions, validate_main_cte_window_semantics,
 )
 from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, load_frozen_wan_vae
+from fastwam.zeva.latent_batch import collate_latent_windows
 
 
 def _cfg_dict(value) -> dict:
@@ -142,6 +144,18 @@ def _atomic_json(path: Path, payload: Any) -> None:
 
 def _identity_collate(batch):
     return batch
+
+
+def _timed_loader(loader):
+    """Measure decoded-batch wait time without synchronizing CUDA."""
+    iterator = iter(loader)
+    while True:
+        started = time.perf_counter()
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            return
+        yield batch, time.perf_counter() - started
 
 
 def _semantic_remap_rows(rows: list[CTETrainIndex], base_dataset) -> list[CTETrainIndex]:
@@ -346,6 +360,10 @@ def main(cfg: DictConfig) -> None:
         flush_every = max(int(cache_cfg.get("flush_every_batches", 8)), 1)
         overwrite = bool(cache_cfg.get("overwrite", False))
         presample_images = bool(cache_cfg.get("presample_images", True))
+        fast_collate = bool(cache_cfg.get("fast_collate", False))
+        profile_every = int(cache_cfg.get("profile_every_batches", 0))
+        if profile_every < 0:
+            raise ValueError("cte_latent_cache.profile_every_batches must be >= 0")
 
         stats_path = Path(str(cfg.data.train.get("pretrained_norm_stats", "")))
         if not stats_path.is_file():
@@ -484,7 +502,9 @@ def main(cfg: DictConfig) -> None:
                 "batch_size": batch_size,
                 "shuffle": False,
                 "num_workers": num_workers,
-                "collate_fn": _identity_collate,
+                # Stack tensors inside the worker so pin_memory=True can pin
+                # the tensor dict for nonblocking device transfers.
+                "collate_fn": collate_latent_windows if fast_collate else _identity_collate,
                 "pin_memory": True,
             }
             if num_workers > 0:
@@ -493,7 +513,7 @@ def main(cfg: DictConfig) -> None:
             loader = DataLoader(**loader_kwargs)
 
             progress = tqdm(
-                loader,
+                _timed_loader(loader) if profile_every else ((batch, 0.0) for batch in loader),
                 total=(len(remaining_rows) + batch_size - 1) // batch_size,
                 desc=f"VAE latent cache GPU{local_rank} rank {rank}/{world_size}",
                 unit="batch",
@@ -504,10 +524,16 @@ def main(cfg: DictConfig) -> None:
 
             write_offset = progress_offset
             batches_since_flush = 0
+            profile_count = 0
+            profile_totals = {"wait": 0.0, "encode": 0.0, "write": 0.0, "windows": 0}
             with torch.inference_mode():
-                for items in progress:
-                    frames = torch.stack([item.frames for item in items], dim=0)
-                    frames = frames.to(device, non_blocking=True)
+                for items, data_wait_seconds in progress:
+                    encode_start = time.perf_counter() if profile_every else 0.0
+                    if fast_collate:
+                        frames = items["frames"].to(device, non_blocking=True)
+                    else:
+                        frames = torch.stack([item.frames for item in items], dim=0)
+                        frames = frames.to(device, non_blocking=True)
                     latent = frame_encoder(frames)
                     if latent.ndim != 5 or latent.shape[1] != 9:
                         raise ValueError(
@@ -515,16 +541,23 @@ def main(cfg: DictConfig) -> None:
                             f"got {tuple(latent.shape)}"
                         )
                     latent_bits = bf16_tensor_to_u16_numpy(latent)
-
-                    actions = torch.stack(
-                        [item.transition_actions for item in items], dim=0
-                    ).numpy()
-                    frame_valid = torch.stack(
-                        [item.frame_valid for item in items], dim=0
-                    ).to(torch.uint8).numpy()
-                    transition_valid = torch.stack(
-                        [item.transition_valid for item in items], dim=0
-                    ).to(torch.uint8).numpy()
+                    # This device-to-CPU copy synchronizes the encoded batch.
+                    encode_seconds = time.perf_counter() - encode_start if profile_every else 0.0
+                    write_start = time.perf_counter() if profile_every else 0.0
+                    if fast_collate:
+                        actions = items["actions"].numpy()
+                        frame_valid = items["frame_valid"].to(torch.uint8).numpy()
+                        transition_valid = items["transition_valid"].to(torch.uint8).numpy()
+                    else:
+                        actions = torch.stack(
+                            [item.transition_actions for item in items], dim=0
+                        ).numpy()
+                        frame_valid = torch.stack(
+                            [item.frame_valid for item in items], dim=0
+                        ).to(torch.uint8).numpy()
+                        transition_valid = torch.stack(
+                            [item.transition_valid for item in items], dim=0
+                        ).to(torch.uint8).numpy()
 
                     if arrays is None:
                         latent_shape = tuple(int(v) for v in latent_bits.shape[1:])
@@ -551,7 +584,7 @@ def main(cfg: DictConfig) -> None:
                         _atomic_json(existing_meta_path, rank_meta)
 
                     assert arrays is not None
-                    count = len(items)
+                    count = int(latent_bits.shape[0])
                     end = write_offset + count
                     if end > local_count:
                         raise RuntimeError("rank cache write exceeded allocated window count")
@@ -574,6 +607,23 @@ def main(cfg: DictConfig) -> None:
                         windows=f"{write_offset:,}/{local_count:,}",
                         refresh=False,
                     )
+                    if profile_every:
+                        profile_count += 1
+                        profile_totals["wait"] += data_wait_seconds
+                        profile_totals["encode"] += encode_seconds
+                        profile_totals["write"] += time.perf_counter() - write_start
+                        profile_totals["windows"] += count
+                        if profile_count % profile_every == 0:
+                            total = sum(profile_totals[key] for key in ("wait", "encode", "write"))
+                            print(
+                                f"[CTE latent profile rank {rank}] last {profile_every} batches "
+                                f"wait_data={profile_totals['wait']/profile_every:.3f}s/batch "
+                                f"h2d_vae_d2h={profile_totals['encode']/profile_every:.3f}s/batch "
+                                f"memmap_flush={profile_totals['write']/profile_every:.3f}s/batch "
+                                f"throughput={profile_totals['windows']/max(total, 1e-9):.2f} windows/s",
+                                flush=True,
+                            )
+                            profile_totals = {"wait": 0.0, "encode": 0.0, "write": 0.0, "windows": 0}
 
             if local_count > 0 and arrays is None:
                 raise RuntimeError("rank produced no latent batch despite non-empty row assignment")
