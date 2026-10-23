@@ -104,6 +104,80 @@ STAGE2A_FOUNDATION_MODE=joint STAGE2B_FOUNDATION_MODE=frozen \
 
 已有输出默认拒绝覆盖。准备完成后从后续编号继续；latent cache 中断可显式 `LATENT_RESUME=1`，底层仍验证来源与存储。`CTE_RESUME` 指向兼容 CTE checkpoint；当前 CTE trainer 结束时才写 `cte.pt`，`save_every` 不是已经实现的周期性 CTE checkpoint。A/B 的 `STAGE2A_RESUME` / `STAGE2B_RESUME` 必须是完整 trainer state 目录，不能给 deployment addon `.pt`。单独改 `RUN_ROOT` 会得到独立实验，避免缓存/权重混配。
 
+## 03 的存储预算与配额中断恢复
+
+`OSError: [Errno 122] Disk quota exceeded` 表示写入受到配额限制。用户、项目、容器或存储平台的配额可以先于整个文件系统耗尽；`df -h` 显示大量空闲并不能排除此错误。日志中的 torchvision 视频接口弃用警告与此错误无关。
+
+03 保存每个窗口的 BF16 latent（以 uint16 原始位存储）、FP32 action 和 uint8 validity mask。以默认 `[9, 48, 24, 20]` latent 形状为例，每窗口数组 payload 为：
+
+```text
+9 × 48 × 24 × 20 × 2 + 8 × 4 × 14 × 4 + 9 + 8 × 4 = 416,553 bytes
+199,534 windows × 416,553 bytes = 83,116,486,302 bytes ≈ 77.41 GiB
+```
+
+这不包括 NPY header、完整索引、来源 metadata 和文件系统开销。实际预算以缓存 `rank_meta.json` 的形状与窗口数为准。为这个规模的新缓存安排约 **90–100 GiB 可用容量和相应配额**比较稳妥；后续其他 cache、checkpoint 和日志需要另外规划。已有部分缓存续算时，应根据已分配块数估计还需增加的空间，不必把完整容量再次全部算为新增空间。减少 `LATENT_BATCH_SIZE`、`NUM_WORKERS` 或调整 GPU 数不会减少相同数据集的完整缓存容量。
+
+### 先只读检查，不删除已有缓存
+
+确认原任务已退出，更新代码后运行：
+
+```bash
+source scripts/train/_common.sh
+"$PYTHON_BIN" scripts/inspect_zeva_cte_latent_cache.py --cache-root "$LATENT_CACHE"
+df -h "$LATENT_CACHE"
+df -i "$LATENT_CACHE"
+du -sh "$LATENT_CACHE"
+du -sh --apparent-size "$LATENT_CACHE"
+# 系统支持时检查；也可能需要在平台控制台查看项目/容器配额。
+if command -v quota >/dev/null 2>&1; then quota -s; fi
+```
+
+检查工具只读 JSON、NPY header 和文件分配信息，不导入 NumPy/Torch/CUDA，不读完整 latent，也不修改文件；可加 `--json` 输出结构化报告。它显示每 rank 的 `committed_windows`、完整数组 payload、逻辑长度、已分配块、剩余分配估计，以及是否缺失 shard。它不替代来源兼容性验证，也不证明 payload 内容完整或配额充足。
+
+文件通过 mmap 预先建立完整逻辑长度，因此 `du --apparent-size` 接近完整大小不等于计算完成。新版预分配也可能在计算开始前把整个数组范围分配好；**已提交进度只取 `progress.json` 的 `next_offset`**。默认每 8 个 batch 先 flush 数组再原子提交进度。旧版若在写 `progress.json.tmp` 时触发配额错误，最后成功提交的 `progress.json` 通常仍在；不要用进度条的 batch 数、文件大小或 `.tmp` 中的内容手改 offset。
+
+### 路线 A：扩容或释放足够配额后，原地续算
+
+保持原数据、来源文件、VAE 与数值配置一致，保留完整缓存目录。**未完成的缓存必须用原生成 world size 续算**；本次日志为 `rank 0/2`、`rank 1/2`，因此使用两个进程：
+
+```bash
+LATENT_RESUME=1 PREP_GPU_IDS=0,1 PREP_NPROC_PER_NODE=2 \
+  bash scripts/train/03_precompute_cte_latents.sh
+```
+
+物理 GPU ID 可以换成实际可用的两个设备，rank 数仍需为 2。先等 03 输出 `VAE LATENT CACHE: PASSED`，再运行 `bash scripts/train/04_train_cte.sh`。完整缓存的读取不要求训练 GPU 数与生成 rank 数一致，04 可以按配置使用 16 GPU。
+
+部分 rank 已完成、其余 rank 还需数小时时，完成者仍要等待统一收尾。03 的 `LATENT_PROCESS_GROUP_TIMEOUT_SECONDS` 默认 `86400`（24 小时），避免正常的长时间等待被通信超时中断；预计单次等待超过一天时可显式增加。它不改变数据分片，也不替代异常处理。
+
+### 路线 B：迁移完整部分缓存后续算
+
+目标必须有足够的实际容量和用户/项目配额；在同一配额域内改目录名通常无效。下面的 `NEW_CACHE` 是示例，需要换成实际已确认可用、可持久保存的挂载路径，使用与 `OLD_CACHE` 不同的新建空目录，不与其他缓存合并。停止旧任务后复制整个目录，保留数组、所有 `rank_meta.json`、`progress.json` 和已有完成标记：
+
+```bash
+source scripts/train/_common.sh
+OLD_CACHE="$LATENT_CACHE"
+NEW_CACHE=/your_verified_storage/iclwam/cte_latents
+mkdir -p "$NEW_CACHE"
+rsync -aS --info=progress2 "$OLD_CACHE/" "$NEW_CACHE/"
+# 必须确认 rsync 成功退出后再继续；保留旧目录，暂不删除。
+"$PYTHON_BIN" scripts/inspect_zeva_cte_latent_cache.py --cache-root "$NEW_CACHE"
+
+export LATENT_CACHE="$NEW_CACHE"
+LATENT_RESUME=1 PREP_GPU_IDS=0,1 PREP_NPROC_PER_NODE=2 \
+  bash scripts/train/03_precompute_cte_latents.sh \
+    "hydra.run.dir=\"$NEW_CACHE/precompute_logs\""
+```
+
+`rsync -S` 保留未写入区域的稀疏特性；复制耗时、实际占用仍取决于文件系统。不要在复制未完成或检查报错时开始续算。上述 Hydra 参数也把本次运行日志放到新存储，避免原配额已满时日志先写失败。把新 `LATENT_CACHE` 写入实际使用的 `ICLWAM_TRAIN_ENV`，让 04 及后续阶段读同一缓存；若该配置文件已有硬编码旧路径，需要同步修改。后续训练产物也要使用配额足够的 `RUN_ROOT`；仅迁移 latent 不会自动改变其他输出路径。
+
+### 新版预检与可选预分配
+
+03 根据各 rank 的实际数组形状计算**全体 rank**还需分配的空间，并检查文件系统可用量及元数据余量（至少 256 MiB，或完整 payload 的 1%，取较大值）。默认 `LATENT_RESERVE_SPACE=1` 会在批量编码前用 `posix_fallocate` 预留数组范围，尽早暴露 `EDQUOT` / `ENOSPC`；它不会截断已有数组或改写已提交窗口。失败时旧进度仍保留，但操作可能已分配部分块，检查实际占用后再重试。
+
+文件系统明确不支持预分配时会警告并继续保留容量检查；意外错误不会悄悄忽略。特殊存储上可显式 `LATENT_RESERVE_SPACE=0` 关闭预分配，文件系统容量检查仍执行。**关闭预分配不会解决配额不足**，只会把可能的失败推迟到写入阶段。即使预分配成功，也不能保证后续 metadata 写入或其他进程占用后的剩余配额。
+
+此次存储修复不改变模型、窗口内容、BF16 位表示或 `zeva_main_v2` 产物合同；符合来源与存储校验的现有 main-v2 部分缓存可以续用。前述 main-v1 → main-v2 的重建要求仍然适用，但不因这次存储修复新增重建要求。
+
 ## RoboTwin：分别报告单次、恢复和稳定性
 
 入口 [`../eval_zeva_main_robotwin.py`](../eval_zeva_main_robotwin.py) 使用 `sim_robotwin_zeva_main`，默认按顺序在一个 GPU 上运行同权重 memory off/on。参数见 `python scripts/eval_zeva_main_robotwin.py --help`；需要 base、CTE、A/B addon、stats、success manifest、bank 和 retrieval checkpoint。

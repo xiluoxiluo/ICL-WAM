@@ -133,6 +133,9 @@ def test_every_generated_hydra_stage_composes_the_main_lineage(tmp_path):
         assert cfg.model.zeva.offline.validation_fraction == .1 and cfg.model.zeva.offline.split_seed == 42
         assert cfg.data.train.val_set_proportion == 0 and cfg.data.val is None
         assert cfg.model.zeva.task_context.mode == "static"
+        if entry == "precompute_zeva_cte_latents.py":
+            assert cfg.cte_latent_cache.reserve_space is True
+            assert cfg.cte_latent_cache.process_group_timeout_seconds == 86400
         if entry == "train_zeva_cte.py":
             assert cfg.max_steps == 5000 and cfg.learning_rate == 2e-4
             assert cfg.model.zeva.cte.latent_cache_path.endswith("/artifacts/cte_latents")
@@ -228,6 +231,35 @@ def test_main_resume_requires_full_state_and_does_not_reload_old_a(captured_laun
     env["STAGE2B_RESUME"] = env["CTE_CKPT"]
     result = _launch("11_train_stage2b.sh", env, tmp_path)
     assert result.returncode != 0 and "Required directory missing" in result.stderr
+    assert not Path(env["ARGV_LOG"]).exists()
+
+
+@pytest.mark.parametrize("reserve,expected", [("1", True), ("0", False)])
+def test_latent_resume_preserves_path_and_uses_boolean_reservation(captured_launch, tmp_path, reserve, expected):
+    env = {**captured_launch, "LATENT_RESUME": "1", "LATENT_RESERVE_SPACE": reserve,
+           "PREP_GPU_IDS": "2,3", "PREP_NPROC_PER_NODE": "2",
+           "LATENT_PROCESS_GROUP_TIMEOUT_SECONDS": "172800"}
+    result = _launch("03_precompute_cte_latents.sh", env, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    row, cfg = _captured_cfg(env)
+    assert row["gpus"] == "2,3" and "--nproc-per-node=2" in row["argv"]
+    assert cfg.cte_latent_cache.reserve_space is expected
+    assert cfg.cte_latent_cache.process_group_timeout_seconds == 172800
+    assert cfg.cte_latent_cache.overwrite is False
+    assert cfg.model.zeva.cte.latent_cache_path == env["LATENT_CACHE"]
+
+
+def test_invalid_latent_reservation_switch_does_not_launch_python(captured_launch, tmp_path):
+    env = {**captured_launch, "LATENT_RESUME": "1", "LATENT_RESERVE_SPACE": "2"}
+    result = _launch("03_precompute_cte_latents.sh", env, tmp_path)
+    assert result.returncode != 0 and "LATENT_RESERVE_SPACE must be 0 or 1" in result.stderr
+    assert not Path(env["ARGV_LOG"]).exists()
+
+
+def test_invalid_latent_process_group_timeout_does_not_launch_python(captured_launch, tmp_path):
+    env = {**captured_launch, "LATENT_RESUME": "1", "LATENT_PROCESS_GROUP_TIMEOUT_SECONDS": "0"}
+    result = _launch("03_precompute_cte_latents.sh", env, tmp_path)
+    assert result.returncode != 0 and "LATENT_PROCESS_GROUP_TIMEOUT_SECONDS" in result.stderr
     assert not Path(env["ARGV_LOG"]).exists()
 
 
