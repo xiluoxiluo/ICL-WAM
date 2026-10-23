@@ -124,6 +124,22 @@ LATENT_PREFETCH_FACTOR=2 LATENT_PROFILE_EVERY_BATCHES=50 \
 如果 `wait_data` 占主导，再测试 workers 4/6/8；如果 `h2d_vae_d2h` 占主导且显存充裕，再在相同 2 rank 下测试 `LATENT_BATCH_SIZE=16`。更高 workers/prefetch 可能增大 CPU/RAM、`/dev/shm` 和网络存储压力，导致反而变慢或 DataLoader bus error；先检查 `df -h /dev/shm`。批大小和 workers 可以改变，**生成 world size 不能从 2 改到其他值**，并且绝不能让两次作业同时写同一个缓存目录。
 
 数据仍按成功 episode 来源及既有 `progress.json.next_offset` 恢复。增设分项计时不改变任何源数据、checkpoint 或 loss；若运行数小时后再遇 `Errno 122`，需优先处理 quota 而不是调大 worker。
+### 可选的相邻窗口 PyAV 顺序解码（实验性）
+
+如果两卡的性能日志显示 `wait_data` 主导，可以额外试验 `LATENT_STREAMING_PYAV=1`。原数据加载器在每个 H32 窗口都对三路相机重新打开视频、seek 到关键帧并解码；同一个 DataLoader worker 收到同一 episode 的连续窗口时，新路径会复用各路 PyAV VideoReader，并携带少量上一个窗口的边界帧。不同文件与超出缓冲范围的乱序请求会重新打开或 seek。此项**默认关闭**，不修改 CTE、VAE、动作、输入帧尺寸、validity mask 或缓存 schema。
+
+为了避免解码优化悄悄改变像素，配置 `LATENT_STREAMING_VERIFY_EVERY=N` 会每 N 次读取再次调用原始 PyAV 解码器并执行逐像素 `torch.equal` 对照，发现不一致立刻报错；代价是额外的解码开销。抽检并不能证明每一帧都一致，因此首次调试应使用 `1` 检查较短的一段，然后在完成验证、停止作业后改成 `128` 做正式吞吐对比。当前并没有在目标 PPU 和真实 mp4 上完成逐帧验证或速度实测，不能直接声称加速倍数。
+
+```bash
+# 与原生成相同的两个 rank，保留已提交的部分缓存
+LATENT_RESUME=1 PREP_GPU_IDS=0,1 PREP_NPROC_PER_NODE=2 \
+LATENT_FAST_COLLATE=1 LATENT_BATCH_SIZE=8 NUM_WORKERS=4 \
+LATENT_STREAMING_PYAV=1 LATENT_STREAMING_VERIFY_EVERY=128 \
+LATENT_STREAMING_MAX_OPEN=6 LATENT_PROFILE_EVERY_BATCHES=50 \
+  bash scripts/train/03_precompute_cte_latents.sh
+```
+
+`LATENT_STREAMING_PYAV=0` 可以随时退回原始逐窗口 PyAV；两种模式使用相同的进度、2-rank 分片与输出格式，不可同时运行两个写任务。该路径优化的是视频读取，不会解决 `Errno 122`（磁盘配额不足）。读完后请对比两张卡的 `throughput` 汇总及 `wait_data`；若出现数值检查失败，应改回原始模式并检查产生分歧的视频时间戳。
 ## RoboTwin：分别报告单次、恢复和稳定性
 
 入口 [`../eval_zeva_main_robotwin.py`](../eval_zeva_main_robotwin.py) 使用 `sim_robotwin_zeva_main`，默认按顺序在一个 GPU 上运行同权重 memory off/on。参数见 `python scripts/eval_zeva_main_robotwin.py --help`；需要 base、CTE、A/B addon、stats、success manifest、bank 和 retrieval checkpoint。

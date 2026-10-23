@@ -214,14 +214,40 @@ class _BuildItem:
 class _WindowSourceDataset(Dataset):
     """Materialize exact Stage-1 windows from the normal RGB dataset."""
 
-    def __init__(self, dataset: ZevaRobotWinDataset, rows: list[CTETrainIndex]) -> None:
+    def __init__(
+        self, dataset: ZevaRobotWinDataset, rows: list[CTETrainIndex], *,
+        streaming_pyav: bool = False, streaming_verify_every: int = 0,
+        streaming_max_open: int = 6,
+    ) -> None:
         self.dataset = dataset
         self.rows = rows
+        self.streaming_pyav = bool(streaming_pyav)
+        self.streaming_verify_every = int(streaming_verify_every)
+        self.streaming_max_open = int(streaming_max_open)
+        if self.streaming_verify_every < 0 or self.streaming_max_open < 1:
+            raise ValueError("invalid streaming PyAV cache limits")
+
+    def _enable_worker_decoder(self) -> None:
+        if not self.streaming_pyav:
+            return
+        # Instantiate readers lazily in the worker, never in the main process
+        # before DataLoader forks. Each worker owns its own independent LRU.
+        from fastwam.zeva.streaming_pyav import StreamingPyAVDecoder
+
+        base = self.dataset.base_dataset
+        underlying = base.lerobot_dataset.multi_dataset._datasets
+        for inner in underlying:
+            if getattr(inner, "_cte_streaming_pyav_decoder", None) is None:
+                inner._cte_streaming_pyav_decoder = StreamingPyAVDecoder(
+                    max_open=self.streaming_max_open,
+                    verify_every=self.streaming_verify_every,
+                )
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> _BuildItem:
+        self._enable_worker_decoder()
         row = self.rows[int(index)]
         sample = self.dataset[int(row.dataset_index)]
         source_index = int(sample.get("dataset_index", -1))
@@ -361,6 +387,11 @@ def main(cfg: DictConfig) -> None:
         overwrite = bool(cache_cfg.get("overwrite", False))
         presample_images = bool(cache_cfg.get("presample_images", True))
         fast_collate = bool(cache_cfg.get("fast_collate", False))
+        streaming_pyav = bool(cache_cfg.get("streaming_pyav", False))
+        streaming_verify_every = int(cache_cfg.get("streaming_verify_every", 0))
+        streaming_max_open = int(cache_cfg.get("streaming_max_open", 6))
+        if streaming_verify_every < 0 or streaming_max_open < 1:
+            raise ValueError("invalid cte_latent_cache.streaming_* options")
         profile_every = int(cache_cfg.get("profile_every_batches", 0))
         if profile_every < 0:
             raise ValueError("cte_latent_cache.profile_every_batches must be >= 0")
@@ -496,7 +527,12 @@ def main(cfg: DictConfig) -> None:
             ).encode_history
 
             remaining_rows = local_rows[progress_offset:]
-            source_dataset = _WindowSourceDataset(dataset, remaining_rows)
+            source_dataset = _WindowSourceDataset(
+                dataset, remaining_rows,
+                streaming_pyav=streaming_pyav,
+                streaming_verify_every=streaming_verify_every,
+                streaming_max_open=streaming_max_open,
+            )
             loader_kwargs: dict[str, Any] = {
                 "dataset": source_dataset,
                 "batch_size": batch_size,
@@ -511,6 +547,13 @@ def main(cfg: DictConfig) -> None:
                 loader_kwargs["prefetch_factor"] = prefetch_factor
                 loader_kwargs["persistent_workers"] = True
             loader = DataLoader(**loader_kwargs)
+            if is_main and streaming_pyav:
+                print(
+                    f"[CTE cache rank {rank}] streaming PyAV enabled; "
+                    f"verify_every={streaming_verify_every}, max_open={streaming_max_open}; "
+                    "frames must pass reference comparison when sampled",
+                    flush=True,
+                )
 
             progress = tqdm(
                 _timed_loader(loader) if profile_every else ((batch, 0.0) for batch in loader),

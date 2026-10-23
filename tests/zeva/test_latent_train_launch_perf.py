@@ -12,7 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _launch(fast_collate: str, profile: str = "50"):
+def _launch(fast_collate: str, profile: str = "50", streaming: str = "0", verify: str = "0"):
     env = {
         **os.environ,
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -25,6 +25,9 @@ def _launch(fast_collate: str, profile: str = "50"):
         "WORLD_SIZE": "1",
         "LATENT_RESUME": "1",
         "LATENT_FAST_COLLATE": fast_collate,
+        "LATENT_STREAMING_PYAV": streaming,
+        "LATENT_STREAMING_VERIFY_EVERY": verify,
+        "LATENT_STREAMING_MAX_OPEN": "6",
         "LATENT_PROFILE_EVERY_BATCHES": profile,
         "LATENT_BATCH_SIZE": "8",
         "NUM_WORKERS": "8",
@@ -62,5 +65,20 @@ def test_original_fallback_remains_available():
 @pytest.mark.parametrize("fast,profile", [("maybe", "50"), ("1", "-1"), ("1", "nan")])
 def test_bad_switches_fail_without_starting_gpu_processes(fast, profile):
     result = _launch(fast, profile)
+    assert result.returncode != 0
+    assert "VAE latent cache GPU" not in result.stdout
+
+
+def test_streaming_decoder_switches_reach_hydra_only_when_requested():
+    result = _launch("1", streaming="1", verify="128")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "++cte_latent_cache.streaming_pyav=true" in result.stdout
+    assert "++cte_latent_cache.streaming_verify_every=128" in result.stdout
+    assert "++cte_latent_cache.streaming_max_open=6" in result.stdout
+
+
+@pytest.mark.parametrize("streaming,verify", [("unknown", "0"), ("1", "-1"), ("1", "none")])
+def test_bad_streaming_options_are_rejected_before_training(streaming, verify):
+    result = _launch("1", streaming=streaming, verify=verify)
     assert result.returncode != 0
     assert "VAE latent cache GPU" not in result.stdout
