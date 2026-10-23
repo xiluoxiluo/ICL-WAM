@@ -5,11 +5,7 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 iclwam_init "$@"; iclwam_preparation_launcher; iclwam_require_data
 iclwam_require_directory "$DIFFSYNTH_MODEL_BASE_PATH"
 iclwam_positive_integer LATENT_BATCH_SIZE "$LATENT_BATCH_SIZE"
-iclwam_positive_integer LATENT_PROCESS_GROUP_TIMEOUT_SECONDS "$LATENT_PROCESS_GROUP_TIMEOUT_SECONDS"
 [[ "$LATENT_RESUME" == 0 || "$LATENT_RESUME" == 1 ]] || iclwam_die 'LATENT_RESUME must be 0 or 1.'
-[[ "$LATENT_RESERVE_SPACE" == 0 || "$LATENT_RESERVE_SPACE" == 1 ]] || iclwam_die 'LATENT_RESERVE_SPACE must be 0 or 1.'
-reserve_space=false
-if [[ "$LATENT_RESERVE_SPACE" == 1 ]]; then reserve_space=true; fi
 if [[ "$LATENT_RESUME" == 1 ]]; then iclwam_require_directory "$LATENT_CACHE"
 else iclwam_expect_new "$LATENT_CACHE"; fi
 iclwam_data_args
@@ -17,6 +13,4 @@ iclwam_run "${TORCH_LAUNCH[@]}" scripts/precompute_zeva_cte_latents.py \
     task=robotwin_zeva_main_cte_3cam_384 "${DATA_ARGS[@]}" \
     "model.zeva.cte.latent_cache_path=$(iclwam_q "$LATENT_CACHE")" \
     "++cte_latent_cache.batch_size=$LATENT_BATCH_SIZE" "++cte_latent_cache.num_workers=$NUM_WORKERS" \
-    "++cte_latent_cache.reserve_space=$reserve_space" \
-    "++cte_latent_cache.process_group_timeout_seconds=$LATENT_PROCESS_GROUP_TIMEOUT_SECONDS" \
     ++cte_latent_cache.presample_images=true ++cte_latent_cache.overwrite=false "${EXTRA_ARGS[@]}"
