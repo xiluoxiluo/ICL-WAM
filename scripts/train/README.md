@@ -104,6 +104,28 @@ STAGE2A_FOUNDATION_MODE=joint STAGE2B_FOUNDATION_MODE=frozen \
 
 已有输出默认拒绝覆盖。准备完成后从后续编号继续；latent cache 中断可显式 `LATENT_RESUME=1`，底层仍验证来源与存储。`CTE_RESUME` 指向兼容 CTE checkpoint；当前 CTE trainer 结束时才写 `cte.pt`，`save_every` 不是已经实现的周期性 CTE checkpoint。A/B 的 `STAGE2A_RESUME` / `STAGE2B_RESUME` 必须是完整 trainer state 目录，不能给 deployment addon `.pt`。单独改 `RUN_ROOT` 会得到独立实验，避免缓存/权重混配。
 
+## 06：两卡 FastWAM readout 首帧优化（可选）
+
+阶段 06 的 CTE prototypes 使用已有 CTE latent 缓存，主要瓶颈通常是 FastWAM 初始 readout。每个 episode 的 readout 只需要第一张三相机观测（`video[:,0]`），但旧数据管线仍通过原始 33 帧图像查询和 9 帧重采样执行完整视频解码及预处理。**新优化在仅用于 06 的路径里把三个视频查询缩减为第 0 帧**，剩余 Action/State、FastWAMProcessor、三相机拼接、resize/crop/normalize、文本 cache、预训练模型前向和输出格式均保持不变。
+
+默认关闭，不影响 CTE、Stage2 或普通 RoboTwin 读取。建议先检查 `df -h /dev/shm`，然后在当前 06 任务停止之后、**确认接受 06 从头计算（本阶段还没有真正的中途断点恢复）**，用下述两卡/32 核配置测试：
+
+```bash
+PREP_GPU_IDS=0,1 PREP_NPROC_PER_NODE=2 \
+ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY=1 \
+ZEVA_BEHAVIOR_READOUT_VERIFY_SAMPLES=4 \
+ZEVA_BEHAVIOR_READOUT_FAST_COLLATE=1 \
+ZEVA_BEHAVIOR_READOUT_BATCH_SIZE=4 \
+ZEVA_BEHAVIOR_READOUT_WORKERS=8 \
+ZEVA_BEHAVIOR_READOUT_PROFILE_EVERY=50 \
+bash scripts/train/06_build_behavior_bank.sh
+```
+
+可单独调整批大小和工作进程数，二卡 8 workers/rank 共 16 个 CPU worker；32 核不应默认全部给 DataLoader，CPU/共享视频存储、`/dev/shm` 和 PPU 才能决定最优配置。`ZEVA_BEHAVIOR_READOUT_BATCH_SIZE` 默认 2、`ZEVA_BEHAVIOR_READOUT_WORKERS` 默认 2，`ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY` / `ZEVA_BEHAVIOR_READOUT_FAST_COLLATE` 默认 0。先在 batch 4 下比较吞吐；如果 PPU 处理时间占主导且显存允许，再测试 batch 8。不要单靠减少 batch 数推算加速倍数。
+
+启用首帧路径时，当前 rank 在 CTE prototypes 之前自动对 `ZEVA_BEHAVIOR_READOUT_VERIFY_SAMPLES` 个真实 episode 执行旧路径/新路径对照，确保 frame image、文本上下文、mask 与各类身份标识**逐元素完全一致**，否则 fail-closed。检查通过输出 `[rank N] first-frame readout equivalence PASSED`。无需自动混合有差异的两种缓存。`ZEVA_BEHAVIOR_READOUT_PROFILE_EVERY=50` 会报告 `wait_data`、`h2d_forward_d2h` 和 `throughput`（episode/s），用于确认数据等待和 FastWAM 前向谁是瓶颈。首帧优化针对 CPU 解码/预处理，不保证 FastWAM 本身的 forward 变快；真实速度须在目标 PPU 实测。
+
+如果已有 06 作业仍在 readout 阶段：不要在同一产物路径再开一个作业；更换这些设置后必须停止旧作业重新运行 06，其 CTE prototypes 和先前 readout 都会重新计算，因为正式 bank/readout 产物只在该阶段结束时发布。过去 03/04/05 的产物不会重算。若只想调整数据读取并不想使用首帧快路径，设置 `ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY=0` 即可。
 ## 03 的双卡吞吐优化与测量
 
 主线 VAE latent 的来源、PyAV 帧选择、数值转换、缓存数组和进度协议不改变。此优化**没有**重新引入磁盘预分配，也不能解决用户/项目 quota 限制。

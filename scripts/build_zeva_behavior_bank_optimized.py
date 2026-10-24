@@ -22,6 +22,7 @@ import os
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -99,10 +100,74 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be boolean, got {value!r}")
 
 
+@contextmanager
+def _only_initial_video_timestamps(base_dataset):
+    """Temporarily request timestamp zero for each image stream, not 33 frames.
+
+    Readout generation is an independent DataLoader. Restoring these settings
+    after each sample prevents state leaking into any ordinary RGB/action
+    dataset access. With multiple workers, each process owns its own copy.
+    """
+    lerobot = base_dataset.lerobot_dataset
+    processor = lerobot.processor
+    if processor is None or not hasattr(processor, "num_image_steps"):
+        raise ValueError("first-frame readout requires the normal FastWAM image processor")
+    modifications = []
+    try:
+        for source in lerobot.multi_dataset._datasets:
+            if source.delta_indices is None:
+                raise ValueError("first-frame readout requires LeRobot delta indices")
+            for camera in source.meta.video_keys:
+                if camera not in source.delta_indices:
+                    raise ValueError(f"missing video delta indices for {camera}")
+                offsets = source.delta_indices[camera]
+                if len(offsets) < 1 or int(offsets[0]) != 0:
+                    raise ValueError(f"first video offset must be 0 for {camera}")
+                modifications.append((source, camera, offsets))
+                source.delta_indices[camera] = offsets[:1]
+        old_num_steps = int(processor.num_image_steps)
+        processor.num_image_steps = 1
+        try:
+            yield
+        finally:
+            processor.num_image_steps = old_num_steps
+    finally:
+        for source, camera, offsets in modifications:
+            source.delta_indices[camera] = offsets
+
+
+def _readout_tensor_collate(items):
+    if not items:
+        raise ValueError("initial readout batch must not be empty")
+    return {
+        "images": torch.stack([item["image"] for item in items]),
+        "contexts": torch.stack([item["context"] for item in items]),
+        "masks": torch.stack([item["context_mask"] for item in items]),
+        "episode_ids": [item["episode_id"] for item in items],
+        "task_ids": [item["task_id"] for item in items],
+        "instructions": [item["instruction"] for item in items],
+    }
+
+
+def _readout_wait_times(loader):
+    iterator = iter(loader)
+    while True:
+        before = time.perf_counter()
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            return
+        yield batch, time.perf_counter() - before
+
+
 class _InitialReadoutDataset(Dataset):
-    def __init__(self, dataset: ZevaRobotWinDataset, plans: list[EpisodePlan]) -> None:
+    def __init__(
+        self, dataset: ZevaRobotWinDataset, plans: list[EpisodePlan], *,
+        first_frame_only: bool = False,
+    ) -> None:
         self.dataset = dataset
         self.plans = plans
+        self.first_frame_only = bool(first_frame_only)
 
     def __len__(self) -> int:
         return len(self.plans)
@@ -110,18 +175,35 @@ class _InitialReadoutDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         plan = self.plans[int(index)]
         source_index = int(plan.dataset_start)
-        sample = self.dataset[source_index]
+        if self.first_frame_only:
+            # Preserve the exact FastWAM RobotVideoDataset image transforms and
+            # text cache path; only video query timestamps are shortened.
+            base_dataset = self.dataset.base_dataset
+            with _only_initial_video_timestamps(base_dataset):
+                sample = base_dataset._get(source_index, initial_image_only=True)
+            episode_id = str(sample.get("episode_id", ""))
+            episode_step = int(sample.get("episode_step", -1))
+            task_id = str(sample.get("task_id", ""))
+            instruction = str(sample.get("prompt", ""))
+            expected_time = 1
+        else:
+            sample = self.dataset[source_index]
+            episode = sample["episode"]
+            episode_id = str(episode.episode_id)
+            episode_step = int(episode.episode_step)
+            task_id = str(episode.task_id)
+            instruction = str(episode.instruction)
+            expected_time = 9
         if int(sample.get("dataset_index", source_index)) != source_index:
             raise RuntimeError("initial-readout dataset requires deterministic source indexing")
-        episode = sample["episode"]
-        if str(episode.episode_id) != str(plan.episode_id) or int(episode.episode_step) != 0:
+        if episode_id != str(plan.episode_id) or episode_step != 0:
             raise ValueError(
                 f"initial-readout episode mismatch: plan={plan.episode_id}, "
-                f"sample=({episode.episode_id}, step={episode.episode_step})"
+                f"sample=({episode_id}, step={episode_step})"
             )
-        if str(episode.task_id) != str(plan.task_id):
+        if task_id != str(plan.task_id):
             raise ValueError(
-                f"initial-readout semantic task mismatch: plan={plan.task_id}, sample={episode.task_id}"
+                f"initial-readout semantic task mismatch: plan={plan.task_id}, sample={task_id}"
             )
         if "context" not in sample or "context_mask" not in sample:
             raise KeyError(
@@ -129,13 +211,15 @@ class _InitialReadoutDataset(Dataset):
                 "use the Stage-2 task config with data.train.use_text_embed_cache=true"
             )
         video = sample["video"]
-        if video.ndim != 4 or tuple(video.shape[:2]) != (3, 9):
-            raise ValueError(f"initial readout expects video [3,9,H,W], got {tuple(video.shape)}")
+        if video.ndim != 4 or tuple(video.shape[:2]) != (3, expected_time):
+            raise ValueError(
+                f"initial readout expects video [3,{expected_time},H,W], got {tuple(video.shape)}"
+            )
         return {
-            "episode_id": str(plan.episode_id),
-            "task_id": str(plan.task_id),
-            "dataset_start": int(plan.dataset_start),
-            "instruction": str(episode.instruction),
+            "episode_id": episode_id,
+            "task_id": task_id,
+            "dataset_start": source_index,
+            "instruction": instruction,
             "image": video[:, 0].float(),
             "context": sample["context"].float(),
             "context_mask": sample["context_mask"].bool(),
@@ -204,14 +288,19 @@ def _build_readouts(
     batch_size: int,
     num_workers: int,
     rank: int,
+    first_frame_only: bool = False,
+    fast_collate: bool = False,
+    profile_every: int = 0,
 ) -> tuple[list[str], list[str], list[str], torch.Tensor]:
-    source = _InitialReadoutDataset(dataset, plans)
+    source = _InitialReadoutDataset(dataset, plans, first_frame_only=first_frame_only)
+    if profile_every < 0:
+        raise ValueError("ZEVA_BEHAVIOR_READOUT_PROFILE_EVERY must be >= 0")
     kwargs: dict[str, Any] = {
         "dataset": source,
         "batch_size": max(1, int(batch_size)),
         "shuffle": False,
         "num_workers": max(0, int(num_workers)),
-        "collate_fn": _identity_collate,
+        "collate_fn": _readout_tensor_collate if fast_collate else _identity_collate,
         "pin_memory": True,
     }
     if num_workers > 0:
@@ -221,21 +310,56 @@ def _build_readouts(
     task_ids: list[str] = []
     instructions: list[str] = []
     readouts: list[torch.Tensor] = []
-    progress = tqdm(loader, desc=f"FastWAM readout rank {rank}", unit="batch", position=rank, dynamic_ncols=True)
+    timed = _readout_wait_times(loader) if profile_every else ((batch, 0.0) for batch in loader)
+    progress = tqdm(
+        timed, total=len(loader), desc=f"FastWAM readout rank {rank}",
+        unit="batch", position=rank, dynamic_ncols=True,
+    )
+    timing = {"wait": 0.0, "forward": 0.0, "episodes": 0}
+    batches = 0
     with torch.inference_mode():
-        for items in progress:
-            images = torch.stack([item["image"] for item in items]).to(device, non_blocking=True)
-            contexts = torch.stack([item["context"] for item in items]).to(device, non_blocking=True)
-            masks = torch.stack([item["context_mask"] for item in items]).to(device, non_blocking=True)
+        for items, wait_seconds in progress:
+            started = time.perf_counter() if profile_every else 0.0
+            if fast_collate:
+                images = items["images"].to(device, non_blocking=True)
+                contexts = items["contexts"].to(device, non_blocking=True)
+                masks = items["masks"].to(device, non_blocking=True)
+                this_episode_ids = items["episode_ids"]
+                this_task_ids = items["task_ids"]
+                this_instructions = items["instructions"]
+            else:
+                images = torch.stack([item["image"] for item in items]).to(device, non_blocking=True)
+                contexts = torch.stack([item["context"] for item in items]).to(device, non_blocking=True)
+                masks = torch.stack([item["context_mask"] for item in items]).to(device, non_blocking=True)
+                this_episode_ids = [str(item["episode_id"]) for item in items]
+                this_task_ids = [str(item["task_id"]) for item in items]
+                this_instructions = [str(item["instruction"]) for item in items]
             readout = policy.extract_task_context_readout(images, contexts, masks)
-            if readout.ndim != 2 or readout.shape[0] != len(items):
+            if readout.ndim != 2 or readout.shape[0] != len(this_episode_ids):
                 raise RuntimeError(f"FastWAM readout shape mismatch: {tuple(readout.shape)}")
             if not bool(torch.isfinite(readout).all()):
                 raise FloatingPointError("FastWAM clean readout contains NaN/Inf")
             readouts.extend(readout.float().cpu().unbind(0))
-            episode_ids.extend(str(item["episode_id"]) for item in items)
-            task_ids.extend(str(item["task_id"]) for item in items)
-            instructions.extend(str(item["instruction"]) for item in items)
+            episode_ids.extend(this_episode_ids)
+            task_ids.extend(this_task_ids)
+            instructions.extend(this_instructions)
+            if profile_every:
+                batches += 1
+                timing["wait"] += wait_seconds
+                timing["forward"] += time.perf_counter() - started
+                timing["episodes"] += len(this_episode_ids)
+                if batches % profile_every == 0:
+                    avg_wait = timing["wait"] / profile_every
+                    avg_forward = timing["forward"] / profile_every
+                    total = timing["wait"] + timing["forward"]
+                    print(
+                        f"[behavior readout rank {rank}] last {profile_every} batches "
+                        f"wait_data={avg_wait:.3f}s/batch "
+                        f"h2d_forward_d2h={avg_forward:.3f}s/batch "
+                        f"throughput={timing['episodes']/max(total, 1.e-9):.2f} episodes/s",
+                        flush=True,
+                    )
+                    timing = {"wait": 0.0, "forward": 0.0, "episodes": 0}
     return episode_ids, task_ids, instructions, torch.stack(readouts)
 
 
@@ -412,6 +536,28 @@ def main(cfg: DictConfig) -> None:
             if not bool(torch.isfinite(probe_readout).all()):
                 raise FloatingPointError("FastWAM batched readout preflight produced NaN/Inf")
             print(f"[rank {info.rank}] batched readout preflight PASSED: {tuple(probe_readout.shape)}")
+        if _env_bool("ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY", False) and local_plans:
+            # Compare the *real* first frames and frozen text-cache values,
+            # before any expensive CTE tail/prototype/readout work. Failure
+            # is fail-closed, not silently tolerated.
+            count = min(max(1, _env_int("ZEVA_BEHAVIOR_READOUT_VERIFY_SAMPLES", 2)), len(local_plans))
+            original = _InitialReadoutDataset(dataset, local_plans[:count])
+            optimized = _InitialReadoutDataset(dataset, local_plans[:count], first_frame_only=True)
+            for idx in range(count):
+                reference, observed = original[idx], optimized[idx]
+                for key in ("episode_id", "task_id", "dataset_start", "instruction"):
+                    if reference[key] != observed[key]:
+                        raise RuntimeError(
+                            f"initial-readout first-frame identity mismatch at {idx}: {key}"
+                        )
+                for key in ("image", "context", "context_mask"):
+                    if not torch.equal(reference[key], observed[key]):
+                        error = float((reference[key].float() - observed[key].float()).abs().max())
+                        raise RuntimeError(
+                            f"initial-readout first-frame difference at {idx}: {key} max_abs={error}; "
+                            "resume with ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY=0"
+                        )
+            print(f"[rank {info.rank}] first-frame readout equivalence PASSED: {count} samples", flush=True)
         _barrier(info)
 
         tail_plans = [plan for plan in local_plans if _tail_required(plan, latent_cache)]
@@ -459,6 +605,9 @@ def main(cfg: DictConfig) -> None:
             batch_size=readout_batch,
             num_workers=readout_workers,
             rank=info.rank,
+            first_frame_only=_env_bool("ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY", False),
+            fast_collate=_env_bool("ZEVA_BEHAVIOR_READOUT_FAST_COLLATE", False),
+            profile_every=_env_int("ZEVA_BEHAVIOR_READOUT_PROFILE_EVERY", 0),
         )
         if episode_ids != [plan.episode_id for plan in local_plans]:
             raise RuntimeError("FastWAM readout order differs from local episode plan order")

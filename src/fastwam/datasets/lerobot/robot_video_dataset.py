@@ -188,7 +188,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.lerobot_dataset)
 
-    def _get(self, idx):
+    def _get(self, idx, *, initial_image_only: bool = False):
         sample_idx = idx
         sample = None
         for attempt in range(self.max_padding_retry + 1):
@@ -219,15 +219,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         num_cameras = 1
         if video.ndim == 5:
             if not self.lerobot_dataset.presample_images:
-                video = video[:, self.video_sample_indices, :, :, :]
+                video = video[:, :1, :, :, :] if initial_image_only else video[:, self.video_sample_indices, :, :, :]
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
             if not self.lerobot_dataset.presample_images:
-                video = video[self.video_sample_indices, :, :, :]
+                video = video[:1, :, :, :] if initial_image_only else video[self.video_sample_indices, :, :, :]
             T_video, C, H, W = video.shape
         if not self.lerobot_dataset.presample_images:
-            image_is_pad = image_is_pad[self.video_sample_indices]
+            image_is_pad = image_is_pad[:1] if initial_image_only else image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)
         if self.concat_multi_camera == "robotwin":
@@ -275,12 +275,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         action = sample["action"]
         proprio = sample["proprio"][:-1, :]
-        if video.shape[1] <= 1:
-            raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
-            raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
-            )
+        if initial_image_only:
+            if video.shape[1] != 1:
+                raise ValueError(f"initial-image readout requires exactly 1 frame, got {tuple(video.shape)}")
+        else:
+            if video.shape[1] <= 1:
+                raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
+            if action.shape[0] % (video.shape[1] - 1) != 0:
+                raise ValueError(
+                    f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
+                )
 
         task = sample["instruction"]
         if self.override_instruction is not None:
