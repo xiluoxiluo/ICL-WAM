@@ -126,6 +126,22 @@ bash scripts/train/06_build_behavior_bank.sh
 启用首帧路径时，当前 rank 在 CTE prototypes 之前自动对 `ZEVA_BEHAVIOR_READOUT_VERIFY_SAMPLES` 个真实 episode 执行旧路径/新路径对照，确保 frame image、文本上下文、mask 与各类身份标识**逐元素完全一致**，否则 fail-closed。检查通过输出 `[rank N] first-frame readout equivalence PASSED`。无需自动混合有差异的两种缓存。`ZEVA_BEHAVIOR_READOUT_PROFILE_EVERY=50` 会报告 `wait_data`、`h2d_forward_d2h` 和 `throughput`（episode/s），用于确认数据等待和 FastWAM 前向谁是瓶颈。首帧优化针对 CPU 解码/预处理，不保证 FastWAM 本身的 forward 变快；真实速度须在目标 PPU 实测。
 
 如果已有 06 作业仍在 readout 阶段：不要在同一产物路径再开一个作业。停止后，若还没有完整 rank 快照，该 rank 的 CTE prototypes/readout 仍会重新计算；已有且经验证的完整 rank 快照则能在恢复模式中跳过。过去 03/04/05 的产物不会重算。若只想调整数据读取并不想使用首帧快路径，设置 `ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY=0` 即可。
+## 08：Static Context 批量与在线检索索引不一致（2026-10-24）
+
+08 原版一次对 512 条 readout 做静态查询，但 main_observed 的在线检索是 **BF16 autocast 下单次一条查询**，随后 FP32 计算 cosine、torch.topk、softmax。不同 GEMM batch shape 的舍入误差可能在多个高相似候选之间改变 Top-K 索引。该错误常见为 `static retrieval indices mismatch at episode ...`，不能简单扩大误差容忍度或跳过索引检查，因为缓存应与实际在线检索候选相同。
+
+修复后 main_observed **默认** 使用 `ZEVA_STATIC_CONTEXT_MODE=serving_exact`：复用一次装入 GPU 的 bank keys/values、按索引直接排除当前 episode，保留线上单条查询的数值计算图与 `torch.topk` 排序。每 `ZEVA_STATIC_CONTEXT_BATCH_SIZE` 条才把结果传回 CPU，减少传输开销；脚本仍随机抽检 64 条真实 query，逐一与 `StaticTaskContextRetriever.retrieve()` 比较 Top-K index、score、value。legacy/非 main profile 默认保留 vectorized，可通过模式开关显式选择；`vectorized` 不保证主线中近似同分候选的索引一致，仅作性能调试。
+
+08 在出错前没有发布最终 `static_context.pt`，原有 06 Bank 与 07 retrieval checkpoint **保持不变，无需重新生成或重训**：
+
+```bash
+cd /data/share/1919650160032350208/zjj/ICL-WAM
+git pull --ff-only origin main
+ZEVA_STATIC_CONTEXT_MODE=serving_exact ZEVA_STATIC_CONTEXT_BATCH_SIZE=256 \
+  bash scripts/train/08_build_static_context.sh 2>&1 | tee /tmp/zeva_08_static_exact.log
+```
+
+看到 `STATIC EPISODE CONTEXT CACHE: PASSED` 再运行 `bash scripts/train/09_build_pim_cache.sh`。如果之前 08 已意外留下正式产物，请先核查来源和完整性，不要直接覆盖。`ZEVA_STATIC_CONTEXT_BATCH_SIZE` 只是结果分批写回 CPU 的大小，不会改变为在线单查询的精度策略。此修复未修改 07 checkpoint 或部署时 online retriever 语义。
 ## 06：末尾 NCCL 超时、O(N²) 修复与按 rank 恢复
 
 2026-10-24 双卡日志：两个 FastWAM readout 都达到 100%，随后 rank 1 的 ALLREDUCE 超过默认 600 秒超时，rank 0 还没有进入同一 collective。已定位到 split_main_behavior_artifacts() 中的 O(N²) 模式：每个训练样本下标都调用一次会复制全体条目的 TaskContextBank.entries。新版本只读取一次 entries，再线性划分训练/验证，且把长时间 CPU 合并阶段的 NCCL barrier 换成定期打印等待状态的文件同步。不改 CTE、FastWAM 权重、视频帧数据或最终 bank/readout 格式。

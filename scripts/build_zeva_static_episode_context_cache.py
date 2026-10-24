@@ -23,6 +23,7 @@ from fastwam.zeva import TaskContextBank
 from fastwam.zeva.checkpoint import checkpoint_sha256
 from fastwam.zeva.main_data import inherit_main_artifact, is_main_profile, validate_main_source
 from fastwam.zeva.prepared_stage2 import STATIC_CONTEXT_FORMAT
+from fastwam.zeva.static_context_exact import build_serving_exact_static_contexts
 from fastwam.zeva.schemas import sha256_file
 from fastwam.zeva.static_task_context import (
     StaticTaskContextRetriever,
@@ -96,32 +97,63 @@ def main(cfg: DictConfig) -> None:
     if not 1 <= top_k < len(bank):
         raise ValueError("leave-one-out static retrieval requires 1 <= top_k < bank size")
     batch_size = _env_int("ZEVA_STATIC_CONTEXT_BATCH_SIZE", 512)
+    if batch_size < 1:
+        raise ValueError("ZEVA_STATIC_CONTEXT_BATCH_SIZE must be positive")
+    # Main policy serves one query at a time under BF16 feature autocast.
+    # Its [1,D] query GEMM and [1,N_bank] similarity GEMM need not choose
+    # exactly the same top-K among nearly tied prototypes as [512,D].
+    # The fast batched algorithm is retained only as an explicit opt-in for
+    # performance experiments; formal main cache matches serving semantics.
+    mode = os.environ.get(
+        "ZEVA_STATIC_CONTEXT_MODE",
+        "serving_exact" if is_main_profile(cfg) else "vectorized",
+    ).strip().lower()
+    if mode not in {"serving_exact", "vectorized"}:
+        raise ValueError(
+            "ZEVA_STATIC_CONTEXT_MODE must be serving_exact or vectorized"
+        )
+    print(f"[static context] retrieval mode={mode} "
+          f"queries={num_queries:,}, bank={len(bank):,}, device={device}", flush=True)
 
-    contexts = torch.empty((num_queries, bank.value_dim), dtype=torch.float32)
-    indices_all = torch.empty((num_queries, top_k), dtype=torch.int64)
-    scores_all = torch.empty((num_queries, top_k), dtype=torch.float32)
-    iterator = range(0, num_queries, batch_size)
-    progress = tqdm(iterator, total=(num_queries + batch_size - 1) // batch_size, desc="static context", unit="batch")
-    with torch.inference_mode():
-        for start in progress:
-            end = min(num_queries, start + batch_size)
-            q = retriever.query(readouts[start:end])
-            if is_main_profile(cfg):
-                q = F.normalize(q.float(), dim=-1)
-            scores = q @ keys.T
-            local_rows = torch.arange(end - start, device=device)
-            global_rows = torch.arange(start, end, device=device)
-            # Only training queries have a matching bank row. Held-out
-            # episodes are queries only and have no retrievable prototype.
-            has_self = global_rows < len(bank)
-            scores[local_rows[has_self], global_rows[has_self]] = -torch.inf
-            top_scores, top_indices = torch.topk(scores, top_k, dim=-1, largest=True, sorted=True)
-            weights = F.softmax(top_scores / float(bank.temperature), dim=-1)
-            selected = values[top_indices]
-            context = torch.einsum("bk,bkd->bd", weights, selected)
-            contexts[start:end] = context.float().cpu()
-            indices_all[start:end] = top_indices.cpu()
-            scores_all[start:end] = top_scores.float().cpu()
+    if mode == "serving_exact":
+        # The exact path uses retriever.bank._keys/_values on device, skips
+        # repeated Python exclusion lists, and copies results per chunk.
+        # Every query and top-K is nevertheless computed with online B=1
+        # math so Torch topk tie-order remains the serving contract.
+        contexts, indices_all, scores_all = build_serving_exact_static_contexts(
+            retriever, readouts, episode_ids, batch_size=batch_size
+        )
+    else:
+        contexts = torch.empty((num_queries, bank.value_dim), dtype=torch.float32)
+        indices_all = torch.empty((num_queries, top_k), dtype=torch.int64)
+        scores_all = torch.empty((num_queries, top_k), dtype=torch.float32)
+        iterator = range(0, num_queries, batch_size)
+        progress = tqdm(
+            iterator, total=(num_queries + batch_size - 1) // batch_size,
+            desc="static context (vectorized)", unit="batch"
+        )
+        with torch.inference_mode():
+            for start in progress:
+                end = min(num_queries, start + batch_size)
+                q = retriever.query(readouts[start:end])
+                if is_main_profile(cfg):
+                    q = F.normalize(q.float(), dim=-1)
+                scores = q @ keys.T
+                local_rows = torch.arange(end - start, device=device)
+                global_rows = torch.arange(start, end, device=device)
+                # Only training queries have a matching bank row. Held-out
+                # episodes are queries only and have no retrievable prototype.
+                has_self = global_rows < len(bank)
+                scores[local_rows[has_self], global_rows[has_self]] = -torch.inf
+                top_scores, top_indices = torch.topk(
+                    scores, top_k, dim=-1, largest=True, sorted=True
+                )
+                weights = F.softmax(top_scores / float(bank.temperature), dim=-1)
+                selected = values[top_indices]
+                context = torch.einsum("bk,bkd->bd", weights, selected)
+                contexts[start:end] = context.float().cpu()
+                indices_all[start:end] = top_indices.cpu()
+                scores_all[start:end] = top_scores.float().cpu()
 
     if not bool(torch.isfinite(contexts).all() and torch.isfinite(scores_all).all()):
         raise FloatingPointError("static episode-context cache contains NaN/Inf")
@@ -161,6 +193,7 @@ def main(cfg: DictConfig) -> None:
         "validation_samples": validation_samples,
         "validation_worst_value_abs": worst_value,
         "validation_worst_score_abs": worst_score,
+        "retrieval_compute_mode": mode,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
