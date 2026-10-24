@@ -108,7 +108,7 @@ STAGE2A_FOUNDATION_MODE=joint STAGE2B_FOUNDATION_MODE=frozen \
 
 阶段 06 的 CTE prototypes 使用已有 CTE latent 缓存，主要瓶颈通常是 FastWAM 初始 readout。每个 episode 的 readout 只需要第一张三相机观测（`video[:,0]`），但旧数据管线仍通过原始 33 帧图像查询和 9 帧重采样执行完整视频解码及预处理。**新优化在仅用于 06 的路径里把三个视频查询缩减为第 0 帧**，剩余 Action/State、FastWAMProcessor、三相机拼接、resize/crop/normalize、文本 cache、预训练模型前向和输出格式均保持不变。
 
-默认关闭，不影响 CTE、Stage2 或普通 RoboTwin 读取。建议先检查 `df -h /dev/shm`，然后在当前 06 任务停止之后、**确认接受 06 从头计算（本阶段还没有真正的中途断点恢复）**，用下述两卡/32 核配置测试：
+默认关闭，不影响 CTE、Stage2 或普通 RoboTwin 读取。建议先检查 `df -h /dev/shm`，然后在当前 06 任务停止之后启动。**新版本支持复用已经完整保存的 rank 快照，但尚未写出完整 rank 快照之前的 batch 仍不能逐 batch 恢复**。首次任务用下述两卡/32 核配置测试：
 
 ```bash
 PREP_GPU_IDS=0,1 PREP_NPROC_PER_NODE=2 \
@@ -125,7 +125,35 @@ bash scripts/train/06_build_behavior_bank.sh
 
 启用首帧路径时，当前 rank 在 CTE prototypes 之前自动对 `ZEVA_BEHAVIOR_READOUT_VERIFY_SAMPLES` 个真实 episode 执行旧路径/新路径对照，确保 frame image、文本上下文、mask 与各类身份标识**逐元素完全一致**，否则 fail-closed。检查通过输出 `[rank N] first-frame readout equivalence PASSED`。无需自动混合有差异的两种缓存。`ZEVA_BEHAVIOR_READOUT_PROFILE_EVERY=50` 会报告 `wait_data`、`h2d_forward_d2h` 和 `throughput`（episode/s），用于确认数据等待和 FastWAM 前向谁是瓶颈。首帧优化针对 CPU 解码/预处理，不保证 FastWAM 本身的 forward 变快；真实速度须在目标 PPU 实测。
 
-如果已有 06 作业仍在 readout 阶段：不要在同一产物路径再开一个作业；更换这些设置后必须停止旧作业重新运行 06，其 CTE prototypes 和先前 readout 都会重新计算，因为正式 bank/readout 产物只在该阶段结束时发布。过去 03/04/05 的产物不会重算。若只想调整数据读取并不想使用首帧快路径，设置 `ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY=0` 即可。
+如果已有 06 作业仍在 readout 阶段：不要在同一产物路径再开一个作业。停止后，若还没有完整 rank 快照，该 rank 的 CTE prototypes/readout 仍会重新计算；已有且经验证的完整 rank 快照则能在恢复模式中跳过。过去 03/04/05 的产物不会重算。若只想调整数据读取并不想使用首帧快路径，设置 `ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY=0` 即可。
+## 06：末尾 NCCL 超时、O(N²) 修复与按 rank 恢复
+
+2026-10-24 双卡日志：两个 FastWAM readout 都达到 100%，随后 rank 1 的 ALLREDUCE 超过默认 600 秒超时，rank 0 还没有进入同一 collective。已定位到 split_main_behavior_artifacts() 中的 O(N²) 模式：每个训练样本下标都调用一次会复制全体条目的 TaskContextBank.entries。新版本只读取一次 entries，再线性划分训练/验证，且把长时间 CPU 合并阶段的 NCCL barrier 换成定期打印等待状态的文件同步。不改 CTE、FastWAM 权重、视频帧数据或最终 bank/readout 格式。
+
+**先确认旧快照有无保留：**
+
+~~~bash
+cd /data/share/1919650160032350208/zjj/ICL-WAM
+source scripts/train/_common.sh
+ls -lh "$ARTIFACT_ROOT/.behavior_bank.building"/rank_*.pt
+ls -lh "$BEHAVIOR_BANK" "$READOUT_CACHE" 2>/dev/null || true
+~~~
+
+旧版在等待 NCCL 最后一轮 barrier 之前已经分别写出 rank 文件，但旧格式没有 CTE/base/data 来源哈希。如果两个快照存在，并确认它们来自**同一轮**数据及 checkpoint，显式允许对旧快照做严格结构与 episode 身份检查：
+
+~~~bash
+ZEVA_BEHAVIOR_RESUME=1 \
+ZEVA_BEHAVIOR_ACCEPT_LEGACY_RANK=1 \
+PREP_GPU_IDS=0,1 PREP_NPROC_PER_NODE=2 \
+bash scripts/train/06_build_behavior_bank.sh
+~~~
+
+若显示 [rank 0/1] RESUME: reused ... ，说明相应 rank 直接复用了自己的 13,750 个 prototypes 和 initial readouts。只有一个合法 rank 文件时，只重算缺失的 rank（仍可开启仅首帧读取和 worker batching）。**旧快照的 source hash 无法追溯，所以必须由实验人员确认来源一致；文件结构、内容和 episode 顺序仍会自动验证。** 不要改动原 rank 文件，也不要同时启动两个 06 作业。
+
+新生成快照的 resume_contract 绑定 checkpoint SHA、latent manifest、stats、semantic map、success lineage、episode 坐标及视频/文本参数，之后可只用 ZEVA_BEHAVIOR_RESUME=1 自动校验复用。每张卡先写临时 rank 文件，重读验证，再原子替换；CPU 合并阶段不再进行等待 600 秒的 NCCL collective。等待状态每 30 秒打印，最长时长由 ZEVA_BEHAVIOR_FILE_WAIT_SECONDS（默认 3600 秒）指定。若 rank 0 本身发生磁盘错误或被系统杀死，rank 1 的等待也不能修复该错误。
+
+BEHAVIOR BANK: PASSED 及两个正式产物出现后，才可以运行 07。
+
 ## 03 的双卡吞吐优化与测量
 
 主线 VAE latent 的来源、PyAV 帧选择、数值转换、缓存数组和进度协议不改变。此优化**没有**重新引入磁盘预分配，也不能解决用户/项目 quota 限制。

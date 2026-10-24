@@ -73,6 +73,9 @@ from fastwam.zeva.static_task_context import (  # noqa: E402
 )
 from fastwam.zeva.task_context import TaskContextBank  # noqa: E402
 from fastwam.zeva.vae_adapter import FastWAMCTELatentEncoder, validate_vae_metadata  # noqa: E402
+from fastwam.zeva.behavior_rank_resume import (  # noqa: E402
+    rank_contract, validate_rank_snapshot, atomic_save_rank_snapshot, wait_for_files,
+)
 
 
 def _cfg_dict(value: Any) -> dict[str, Any]:
@@ -560,100 +563,201 @@ def main(cfg: DictConfig) -> None:
             print(f"[rank {info.rank}] first-frame readout equivalence PASSED: {count} samples", flush=True)
         _barrier(info)
 
-        tail_plans = [plan for plan in local_plans if _tail_required(plan, latent_cache)]
-        tail_batch_size = _env_int("ZEVA_BEHAVIOR_TAIL_BATCH_SIZE", 4)
-        tail_workers = _env_int("ZEVA_BEHAVIOR_TAIL_WORKERS", 2)
-        tails = _precompute_tail_supplements(
-            plans=tail_plans,
-            dataset=dataset,
-            encoder=frame_encoder,
-            device=device,
-            batch_size=tail_batch_size,
-            num_workers=tail_workers,
-            prefetch_factor=2,
-            rank=info.rank,
-            expected_latent_shape=latent_cache.latent_shape,
-        )
-
-        # Full-prefix CTE prototypes.  This is small relative to the FastWAM
-        # readout path and is kept episode-local to avoid variable-length padding.
-        prototypes: dict[str, tuple[torch.Tensor, torch.Tensor, int]] = {}
-        progress = tqdm(
-            local_plans,
-            desc=f"CTE prototypes rank {info.rank}/{info.world_size}",
-            unit="episode",
-            position=info.rank,
-            dynamic_ncols=True,
-        )
-        with torch.inference_mode():
-            for plan in progress:
-                prototypes[plan.episode_id] = _compute_cte_prototype(
-                    plan,
-                    latent_cache=latent_cache,
-                    tail=tails.get(plan.episode_id),
-                    cte=cte,
-                    device=device,
-                )
-
-        readout_batch = _env_int("ZEVA_BEHAVIOR_READOUT_BATCH_SIZE", 2)
-        readout_workers = _env_int("ZEVA_BEHAVIOR_READOUT_WORKERS", 2)
-        episode_ids, task_ids, instructions, readouts = _build_readouts(
-            dataset=dataset,
-            plans=local_plans,
-            policy=policy,
-            device=device,
-            batch_size=readout_batch,
-            num_workers=readout_workers,
-            rank=info.rank,
-            first_frame_only=_env_bool("ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY", False),
-            fast_collate=_env_bool("ZEVA_BEHAVIOR_READOUT_FAST_COLLATE", False),
-            profile_every=_env_int("ZEVA_BEHAVIOR_READOUT_PROFILE_EVERY", 0),
-        )
-        if episode_ids != [plan.episode_id for plan in local_plans]:
-            raise RuntimeError("FastWAM readout order differs from local episode plan order")
-        if task_ids != [str(plan.task_id) for plan in local_plans]:
-            raise RuntimeError("FastWAM readout task IDs differ from local episode plan order")
-
-        local_entries = []
-        for plan, episode_id, task_id, instruction in zip(
-            local_plans, episode_ids, task_ids, instructions, strict=True
-        ):
-            key, value, transitions = prototypes[episode_id]
-            local_entries.append(
-                {
-                    "retrieval_key": key,
-                    "behavior_value": value,
-                    "episode_id": episode_id,
-                    "task_id": task_id,
-                    "instruction": instruction,
-                    "num_transitions": int(transitions),
-                    "dataset_start": int(plan.dataset_start),
-                }
-            )
-
+        # Stage 06 used to perform a 600-second NCCL barrier after per-rank
+        # readouts while rank 0 ran CPU-only serialization/merging. A main
+        # split loop also re-copied the entire bank for each episode; one
+        # waiting rank timed out even when the other rank was still working.
+        #
+        # Keep complete rank snapshots and replace long post-readout NCCL
+        # barriers with observable filesystem synchronization.
+        resume_enabled = _env_bool("ZEVA_BEHAVIOR_RESUME", False)
+        allow_legacy = _env_bool("ZEVA_BEHAVIOR_ACCEPT_LEGACY_RANK", False)
+        sync_timeout = _env_int("ZEVA_BEHAVIOR_FILE_WAIT_SECONDS", 3600)
+        if sync_timeout < 1:
+            raise ValueError("ZEVA_BEHAVIOR_FILE_WAIT_SECONDS must be positive")
         work_root = bank_path.parent / f".{bank_path.stem}.building"
         if info.rank == 0:
-            if work_root.exists():
-                shutil.rmtree(work_root)
+            if work_root.exists() and not resume_enabled:
+                raise FileExistsError(
+                    f"unfinished behavior-bank rank snapshots found in {work_root}. "
+                    "Set ZEVA_BEHAVIOR_RESUME=1 to validate/reuse them; "
+                    "do not delete this directory before checking its contents."
+                )
             work_root.mkdir(parents=True, exist_ok=True)
         _barrier(info)
+
+        # V1 snapshots store this contract, so changing CTE/base/data/split
+        # can never silently reuse numerically stale behavior readouts.
+        source_contract = {
+            "cte_checkpoint_sha256": checkpoint_sha256(cte_path),
+            "base_checkpoint_sha256": checkpoint_sha256(base_ckpt),
+            "dataset_stats_sha256": stats_sha,
+            "semantic_task_map_sha256": semantic_sha,
+            "latent_cache_manifest_sha256": sha256_file(latent_path / "manifest.json"),
+            "video_size": list(video_size),
+            "text_embedding_cache_dir": str(cfg.data.train.text_embedding_cache_dir),
+            "context_len": int(cfg.model.tokenizer_max_len),
+            "mixed_precision": str(cfg.mixed_precision),
+            "success_data_identity": dict(main_metadata.get("success_data_identity", {})),
+        }
+        local_contract = rank_contract(
+            plans=local_plans, source=source_contract,
+            rank=info.rank, world_size=info.world_size,
+        )
+        readout_dim = int(cfg.model.video_dit_config.hidden_dim)
         rank_file = work_root / f"rank_{info.rank:03d}.pt"
-        torch.save(
-            {
+        rank_validate = {
+            "plans": local_plans,
+            "contract": local_contract,
+            "key_dim": cte.cfg.retrieval_dim,
+            "value_dim": cte.cfg.hidden_dim,
+            "readout_dim": readout_dim,
+            "allow_legacy": allow_legacy,
+        }
+        saved = None
+        if rank_file.exists():
+            if not resume_enabled:
+                raise FileExistsError(
+                    f"rank snapshot already exists: {rank_file}; "
+                    "set ZEVA_BEHAVIOR_RESUME=1 after verifying its origin"
+                )
+            print(f"[rank {info.rank}] checking existing completed snapshot {rank_file}", flush=True)
+            saved = validate_rank_snapshot(
+                torch.load(rank_file, map_location="cpu", weights_only=False),
+                **rank_validate,
+            )
+            label = "LEGACY (explicitly trusted)" if "resume_contract" not in saved else "source-bound"
+            print(
+                f"[rank {info.rank}] RESUME: reused {len(local_plans):,} "
+                f"CTE prototypes and FastWAM readouts; {label}", flush=True,
+            )
+        if saved is None:
+            print(f"[rank {info.rank}] computing {len(local_plans):,} behavior episodes", flush=True)
+
+            tail_plans = [plan for plan in local_plans if _tail_required(plan, latent_cache)]
+            tail_batch_size = _env_int("ZEVA_BEHAVIOR_TAIL_BATCH_SIZE", 4)
+            tail_workers = _env_int("ZEVA_BEHAVIOR_TAIL_WORKERS", 2)
+            tails = _precompute_tail_supplements(
+                plans=tail_plans,
+                dataset=dataset,
+                encoder=frame_encoder,
+                device=device,
+                batch_size=tail_batch_size,
+                num_workers=tail_workers,
+                prefetch_factor=2,
+                rank=info.rank,
+                expected_latent_shape=latent_cache.latent_shape,
+            )
+
+            # Full-prefix CTE prototypes.  This is small relative to the FastWAM
+            # readout path and is kept episode-local to avoid variable-length padding.
+            prototypes: dict[str, tuple[torch.Tensor, torch.Tensor, int]] = {}
+            progress = tqdm(
+                local_plans,
+                desc=f"CTE prototypes rank {info.rank}/{info.world_size}",
+                unit="episode",
+                position=info.rank,
+                dynamic_ncols=True,
+            )
+            with torch.inference_mode():
+                for plan in progress:
+                    prototypes[plan.episode_id] = _compute_cte_prototype(
+                        plan,
+                        latent_cache=latent_cache,
+                        tail=tails.get(plan.episode_id),
+                        cte=cte,
+                        device=device,
+                    )
+
+            readout_batch = _env_int("ZEVA_BEHAVIOR_READOUT_BATCH_SIZE", 2)
+            readout_workers = _env_int("ZEVA_BEHAVIOR_READOUT_WORKERS", 2)
+            episode_ids, task_ids, instructions, readouts = _build_readouts(
+                dataset=dataset,
+                plans=local_plans,
+                policy=policy,
+                device=device,
+                batch_size=readout_batch,
+                num_workers=readout_workers,
+                rank=info.rank,
+                first_frame_only=_env_bool("ZEVA_BEHAVIOR_READOUT_FIRST_FRAME_ONLY", False),
+                fast_collate=_env_bool("ZEVA_BEHAVIOR_READOUT_FAST_COLLATE", False),
+                profile_every=_env_int("ZEVA_BEHAVIOR_READOUT_PROFILE_EVERY", 0),
+            )
+            if episode_ids != [plan.episode_id for plan in local_plans]:
+                raise RuntimeError("FastWAM readout order differs from local episode plan order")
+            if task_ids != [str(plan.task_id) for plan in local_plans]:
+                raise RuntimeError("FastWAM readout task IDs differ from local episode plan order")
+
+            local_entries = []
+            for plan, episode_id, task_id, instruction in zip(
+                local_plans, episode_ids, task_ids, instructions, strict=True
+            ):
+                key, value, transitions = prototypes[episode_id]
+                local_entries.append(
+                    {
+                        "retrieval_key": key,
+                        "behavior_value": value,
+                        "episode_id": episode_id,
+                        "task_id": task_id,
+                        "instruction": instruction,
+                        "num_transitions": int(transitions),
+                        "dataset_start": int(plan.dataset_start),
+                    }
+                )
+            payload_rank = {
                 "entries": local_entries,
                 "episode_ids": episode_ids,
                 "readouts": readouts.float().cpu(),
                 "tail_windows": len(tails),
-            },
-            rank_file,
-        )
-        _barrier(info)
+                "resume_contract": local_contract,
+            }
+            validate_rank_snapshot(payload_rank, **rank_validate)
+            print(
+                f"[rank {info.rank}] saving completed snapshot: "
+                f"{rank_file} ({len(local_entries):,} episodes)",
+                flush=True,
+            )
+            started_save = time.monotonic()
+            atomic_save_rank_snapshot(rank_file, payload_rank)
+            print(
+                f"[rank {info.rank}] rank checkpoint committed in "
+                f"{time.monotonic() - started_save:.1f}s: {rank_file}",
+                flush=True,
+            )
 
         if info.rank == 0:
+            print("[rank 0] waiting for all completed rank checkpoints", flush=True)
+            wait_for_files(
+                [work_root / f"rank_{i:03d}.pt" for i in range(info.world_size)],
+                phase="rank checkpoints", timeout_seconds=sync_timeout,
+            )
+            print("[rank 0] rank checkpoint files ready; validating and merging", flush=True)
+        else:
+            # No GPU collective here: rank 0 can need substantial CPU time
+            # to split and publish the completed bank on shared storage.
+            print(f"[rank {info.rank}] waiting for bank/readout publication", flush=True)
+            wait_for_files(
+                [bank_path, readout_path],
+                phase="behavior bank publication", timeout_seconds=sync_timeout,
+            )
+        if info.rank == 0:
+            merge_started = time.monotonic()
             merged: list[tuple[dict[str, Any], torch.Tensor]] = []
             total_tail = 0
             for rank in range(info.world_size):
                 payload_rank = torch.load(work_root / f"rank_{rank:03d}.pt", map_location="cpu", weights_only=False)
+                validate_rank_snapshot(
+                    payload_rank,
+                    plans=buckets[rank],
+                    contract=rank_contract(
+                        plans=buckets[rank], source=source_contract,
+                        rank=rank, world_size=info.world_size,
+                    ),
+                    key_dim=cte.cfg.retrieval_dim,
+                    value_dim=cte.cfg.hidden_dim,
+                    readout_dim=readout_dim,
+                    allow_legacy=allow_legacy,
+                )
                 entries = payload_rank["entries"]
                 values = payload_rank["readouts"]
                 if values.ndim != 2 or values.shape[0] != len(entries):
@@ -675,11 +779,11 @@ def main(cfg: DictConfig) -> None:
             metadata = {
                 **main_metadata,
                 "builder": "build_zeva_behavior_bank_optimized.py",
-                "base_checkpoint_sha256": checkpoint_sha256(base_ckpt),
-                "cte_checkpoint_sha256": checkpoint_sha256(cte_path),
+                "base_checkpoint_sha256": source_contract["base_checkpoint_sha256"],
+                "cte_checkpoint_sha256": source_contract["cte_checkpoint_sha256"],
                 "dataset_stats_sha256": stats_sha,
                 "semantic_task_map_sha256": semantic_sha,
-                "latent_cache_manifest_sha256": sha256_file(latent_path / "manifest.json"),
+                "latent_cache_manifest_sha256": source_contract["latent_cache_manifest_sha256"],
                 "video_size": list(video_size),
                 "context_len": int(cfg.model.tokenizer_max_len),
                 "dataset_dirs": [str(v) for v in cfg.data.train.dataset_dirs],
@@ -692,6 +796,10 @@ def main(cfg: DictConfig) -> None:
                 "num_episodes": len(entries),
                 "semantic_task_count": len(task_set),
             }
+            print(
+                f"[rank 0] rank files merged in {time.monotonic()-merge_started:.1f}s; "
+                "constructing behavior bank and train/validation split", flush=True,
+            )
             bank = TaskContextBank(
                 entries,
                 key_dim=cte.cfg.retrieval_dim,
@@ -700,6 +808,10 @@ def main(cfg: DictConfig) -> None:
                 metadata=metadata,
             )
             bank, all_readouts, validation_readouts = split_main_behavior_artifacts(bank, all_readouts)
+            print(
+                f"[rank 0] train/validation split ready after "
+                f"{time.monotonic()-merge_started:.1f}s; saving final outputs", flush=True,
+            )
             if main_metadata:
                 main_metadata = {**main_metadata, "data_role": "train"}
             entries = list(bank.entries)
@@ -751,7 +863,10 @@ def main(cfg: DictConfig) -> None:
             print(f"readouts: {readout_path}")
             print("BEHAVIOR BANK: PASSED")
             shutil.rmtree(work_root)
-        _barrier(info)
+            print(
+                f"[rank 0] all behavior-bank work completed in "
+                f"{time.monotonic()-merge_started:.1f}s after checkpoint merge", flush=True,
+            )
     finally:
         _destroy_process_group(info)
 

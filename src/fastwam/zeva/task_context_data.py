@@ -115,16 +115,21 @@ def split_main_behavior_artifacts(bank: TaskContextBank, readouts: torch.Tensor)
     if bank.metadata.get("profile") != "main_observed":
         return bank, readouts, {}
     validate_main_artifact(bank.metadata)
-    validate_main_episode_ids(bank.metadata, (entry["episode_id"] for entry in bank.entries))
+    # TaskContextBank.entries intentionally returns fresh cloned tensors.
+    # Calling it inside train-index loops cloned the *entire* 27,500-row
+    # bank once PER row (quadratic time, >600s NCCL wait in stage 06).
+    # Materialize one snapshot, then use O(1) indexed accesses.
+    all_entries = bank.entries
+    validate_main_episode_ids(bank.metadata, (entry["episode_id"] for entry in all_entries))
     train_ids = set(bank.metadata["episode_splits"]["train"])
-    train_indices = [i for i, entry in enumerate(bank.entries) if entry["episode_id"] in train_ids]
-    validation_indices = [i for i, entry in enumerate(bank.entries) if entry["episode_id"] not in train_ids]
-    entries = [bank.entries[i] for i in train_indices]
+    train_indices = [i for i, entry in enumerate(all_entries) if entry["episode_id"] in train_ids]
+    validation_indices = [i for i, entry in enumerate(all_entries) if entry["episode_id"] not in train_ids]
+    entries = [all_entries[i] for i in train_indices]
     train_bank = TaskContextBank(entries, key_dim=bank.key_dim, value_dim=bank.value_dim,
         temperature=bank.temperature, metadata={**bank.metadata, "data_role": "train", "num_episodes": len(entries)})
     validation = {
-        "validation_episode_ids": [bank.entries[i]["episode_id"] for i in validation_indices],
-        "validation_task_ids": [str(bank.entries[i]["task_id"]) for i in validation_indices],
+        "validation_episode_ids": [all_entries[i]["episode_id"] for i in validation_indices],
+        "validation_task_ids": [str(all_entries[i]["task_id"]) for i in validation_indices],
         "validation_readouts": readouts[validation_indices].clone(),
     }
     return train_bank, readouts[train_indices].clone(), validation
